@@ -29,10 +29,14 @@ void sdpa_full_self_attention_nax(
   using namespace mlx::steel;
 
   int bd = q.shape(-1);
-  int wm = bd <= 128 ? 4 : 2;
-  int wn = 1;
-  int bq = bd <= 128 ? 64 : 32;
-  int bk = bd <= 128 ? 32 : 16;
+  int wm, wn, bq, bk;
+  if (bd <= 128) {
+    wm = 4; wn = 1; bq = 64; bk = 32;
+  } else if (bd <= 256) {
+    wm = 2; wn = 1; bq = 32; bk = 16;
+  } else {
+    wm = 1; wn = 1; bq = 8; bk = 8;
+  }
 
   int B = q.shape(0);
   int H = q.shape(1);
@@ -191,10 +195,18 @@ void sdpa_full_self_attention_metal(
   using namespace mlx::steel;
 
   int bd = q.shape(-1);
-  int wm = bd <= 128 ? 4 : 2;
-  int wn = 1;
-  int bq = bd <= 128 ? 32 : 16;
-  int bk = bd < 128 ? 32 : 16;
+  // Tile sizes tuned per head dimension:
+  //   BD≤128: BQ=32 BK=16 WM=4 (standard, good occupancy)
+  //   BD=256:  BQ=16 BK=16 WM=2 (smaller tiles, moderate occupancy)
+  //   BD=512:  BQ=8  BK=8  WM=1 (minimal tiles, low occupancy but avoids L×L materialization)
+  int wm, wn, bq, bk;
+  if (bd <= 128) {
+    wm = 4; wn = 1; bq = 32; bk = 16;
+  } else if (bd <= 256) {
+    wm = 2; wn = 1; bq = 16; bk = 16;
+  } else {
+    wm = 1; wn = 1; bq = 8; bk = 8;
+  }
 
   int B = q.shape(0);
   int H = q.shape(1);
@@ -613,16 +625,27 @@ bool ScaledDotProductAttention::use_fallback(
   const int num_kv_heads = k.shape(1);
   const int gqa_factor = num_query_heads / num_kv_heads;
 
+  // BD=256/512 Steel kernels only exist for float16/bfloat16 — float32 exceeds
+  // the 32KB threadgroup memory limit (41KB for BD=256, 49KB for BD=512 at 4B/elem).
+  const bool is_half = q.dtype() == float16 || q.dtype() == bfloat16;
+
   const bool sdpa_vector_supported_head_dim =
       query_head_dim == value_head_dim &&
       (query_head_dim == 64 || query_head_dim == 96 || query_head_dim == 128 ||
-       query_head_dim == 256);
-  // BD=256 Steel full attention is compiled but disabled — matmul fallback is faster
-  // on M1 Max for all tested context lengths (1K-32K). The Steel kernel avoids L×L
-  // score materialization but can't beat Apple's optimized matmul at these sizes.
-  // Vector/decode mode at BD=256 works well and is enabled separately.
+       query_head_dim == 256 ||
+       (query_head_dim == 512 && is_half));
+
+  // Steel full attention avoids materializing L×L attention score matrices.
+  // BD≤128: works for all dtypes.
+  // BD=256/512: float16/bfloat16 only (threadgroup memory constraint).
+  // BD=512: high register pressure (~6% occupancy on M1 Max, better on M5 Max).
+  //   Gated behind MLX_SDPA_NO_BD512=1 env var.
+  static const bool allow_bd512 =
+      ::mlx::core::env::get_var("MLX_SDPA_NO_BD512", 0) == 0;
   const bool sdpa_full_supported_head_dim = query_head_dim == value_head_dim &&
-      (query_head_dim == 64 || query_head_dim == 80 || query_head_dim == 128);
+      (query_head_dim == 64 || query_head_dim == 80 || query_head_dim == 128 ||
+       (query_head_dim == 256 && is_half) ||
+       (query_head_dim == 512 && is_half && allow_bd512));
 
   const bool sdpa_full_supported_mask = !has_mask || has_arr_mask ||
       (query_sequence_length <= key_sequence_length && do_causal);
