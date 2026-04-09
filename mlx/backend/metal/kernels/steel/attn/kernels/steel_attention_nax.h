@@ -389,9 +389,16 @@ template <
     STEEL_PRAGMA_UNROLL
     for (short iq = 0; iq < TQ; iq++) {
       STEEL_PRAGMA_UNROLL
-      for (short id = 0; id < TD; id += 2) {
-        if constexpr (BD == 128) {
-          if (id == 4) {
+      // NOTE (EK): Upstream mainline implementation
+      // for (short id = 0; id < TD; id += 2) {
+      //   if constexpr (BD == 128) {
+      //     if (id == 4) {
+      //       threadgroup_barrier(mem_flags::mem_none);
+      //     }
+      //   }
+      for (short id = 0; id < TD; id++) {
+        if constexpr (BD >= 128) {
+          if (id == TD / 2) {
             threadgroup_barrier(mem_flags::mem_none);
           }
         }
