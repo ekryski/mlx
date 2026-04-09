@@ -71,6 +71,45 @@ class RMSNorm : public Custom {
   float eps_;
 };
 
+class RMSNormRoPE : public Custom {
+ public:
+  RMSNormRoPE(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      float eps,
+      int n_heads,
+      int seq_len,
+      int offset)
+      : Custom(stream, std::move(fallback)),
+        eps_(eps),
+        n_heads_(n_heads),
+        seq_len_(seq_len),
+        offset_(offset) {}
+
+  static bool use_fallback(Stream stream);
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("NYI");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(RMSNormRoPE)
+  bool is_equivalent(const Primitive& other) const override;
+  DEFINE_INPUT_OUTPUT_SHAPE()
+
+  auto state() const {
+    return std::make_tuple(nullptr, eps_, n_heads_, seq_len_, offset_);
+  }
+
+ private:
+  float eps_;
+  int n_heads_;
+  int seq_len_;
+  int offset_;
+};
+
 class RMSNormVJP : public Custom {
  public:
   RMSNormVJP(

@@ -92,6 +92,76 @@ void RMSNorm::eval_gpu(
   }
 }
 
+bool RMSNormRoPE::use_fallback(Stream s) {
+  return s.device == Device::cpu;
+}
+
+void RMSNormRoPE::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  auto& out = outputs[0];
+
+  // Ensure input is contiguous in last dim
+  const array& x_in = inputs[0];
+  bool no_copy = x_in.flags().contiguous && x_in.strides()[x_in.ndim() - 1] == 1;
+  if (no_copy && x_in.ndim() > 1) {
+    auto st = x_in.strides()[x_in.ndim() - 2];
+    no_copy &= (st == 0 || st == x_in.shape().back() || x_in.shape(-2) == 1);
+  }
+  array x = no_copy ? x_in : contiguous_copy_gpu(x_in, s);
+  if (x.is_donatable()) {
+    out.copy_shared_buffer(x);
+  } else {
+    out.set_data(
+        allocator::malloc(x.data_size() * x.itemsize()),
+        x.data_size(),
+        x.strides(),
+        x.flags());
+  }
+
+  const array& w = inputs[1];
+  const array& inv_freqs = inputs[2];
+
+  auto axis_size = static_cast<uint32_t>(x.shape().back());
+  int n_rows = x.data_size() / axis_size;
+  uint32_t half_dim = axis_size / 2;
+
+  // Thread count: one thread per rotation pair (half_dim threads per row)
+  const int simd_size = 32;
+  size_t threadgroup_needed = half_dim;
+  size_t simds_needed = (threadgroup_needed + simd_size - 1) / simd_size;
+  size_t threadgroup_size = simd_size * simds_needed;
+
+  std::string kname = "rms_norm_rope_" + type_to_name(out);
+  auto kernel = d.get_kernel(kname);
+
+  assert(threadgroup_size <= kernel->maxTotalThreadsPerThreadgroup());
+  size_t n_threads = n_rows * threadgroup_size;
+
+  auto& compute_encoder = d.get_command_encoder(s.index);
+  compute_encoder.set_compute_pipeline_state(kernel);
+  compute_encoder.set_input_array(x, 0);
+  compute_encoder.set_input_array(w, 1);
+  compute_encoder.set_input_array(inv_freqs, 2);
+  compute_encoder.set_output_array(out, 3);
+  compute_encoder.set_bytes(eps_, 4);
+  compute_encoder.set_bytes(axis_size, 5);
+  compute_encoder.set_bytes(offset_, 6);
+  compute_encoder.set_bytes(n_heads_, 7);
+  compute_encoder.set_bytes(seq_len_, 8);
+  compute_encoder.dispatch_threads(
+      MTL::Size(n_threads, 1, 1),
+      MTL::Size(threadgroup_size, 1, 1));
+}
+
+bool RMSNormRoPE::is_equivalent(const Primitive& other) const {
+  const RMSNormRoPE& r = static_cast<const RMSNormRoPE&>(other);
+  return eps_ == r.eps_ && n_heads_ == r.n_heads_ &&
+         seq_len_ == r.seq_len_ && offset_ == r.offset_;
+}
+
 void RMSNormVJP::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {

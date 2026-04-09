@@ -120,6 +120,64 @@ array rms_norm(
   return fallback({x, passed_weight})[0];
 }
 
+array rms_norm_rope(
+    const array& x,
+    const array& weight,
+    const array& inv_freqs,
+    float eps,
+    int offset,
+    int n_heads,
+    int seq_len,
+    StreamOrDevice s_ /* = {} */) {
+  if (x.ndim() < 2) {
+    throw std::invalid_argument(
+        "[rms_norm_rope] Input must have at least 2 dimensions");
+  }
+
+  auto out_type = result_type(x, weight);
+  if (!issubdtype(out_type, floating)) {
+    throw std::invalid_argument(
+        "[rms_norm_rope] Input must be floating point");
+  }
+
+  auto s = to_stream(s_);
+
+  auto fallback = [eps, offset, n_heads, seq_len, s](
+                      const std::vector<array>& inputs) {
+    // Fallback: separate rms_norm + rope via MLX ops
+    auto normed = rms_norm(inputs[0], inputs[1], eps, s);
+    // Transpose [B, L, H, D] -> [B, H, L, D] for RoPE, then back
+    auto transposed = transpose(normed, {0, 2, 1, 3}, s);
+    // RoPE with custom frequencies
+    auto rotated = rope(
+        transposed,
+        transposed.shape(-1),
+        false,  // non-traditional
+        0.0f,   // base (unused when freqs provided)
+        1.0f,   // scale
+        offset,
+        inputs[2],  // inv_freqs as freqs (RoPE will invert them)
+        s);
+    auto result = transpose(rotated, {0, 2, 1, 3}, s);
+    return std::vector<array>{result};
+  };
+
+  if (!RMSNormRoPE::use_fallback(s)) {
+    return array(
+        x.shape(),
+        out_type,
+        std::make_shared<RMSNormRoPE>(
+            s, fallback, eps, n_heads, seq_len, offset),
+        {astype(x, out_type, s),
+         astype(weight, out_type, s),
+         astype(inv_freqs, float32, s)});
+  }
+  return fallback(
+      {astype(x, out_type, s),
+       astype(weight, out_type, s),
+       astype(inv_freqs, float32, s)})[0];
+}
+
 std::vector<array> RMSNorm::vjp(
     const std::vector<array>& primals,
     const std::vector<array>& cotangents,

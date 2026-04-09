@@ -16,6 +16,16 @@ MLX_API array rms_norm(
     float eps,
     StreamOrDevice s = {});
 
+MLX_API array rms_norm_rope(
+    const array& x,
+    const array& weight,
+    const array& inv_freqs,
+    float eps,
+    int offset,
+    int n_heads,
+    int seq_len,
+    StreamOrDevice s = {});
+
 MLX_API array layer_norm(
     const array& x,
     const std::optional<array>& weight,
