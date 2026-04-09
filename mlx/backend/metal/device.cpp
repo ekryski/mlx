@@ -495,11 +495,15 @@ Device::Device() : device_(load_device()), residency_set_(device_.get()) {
       max_mb_per_buffer_ = 40;
       break;
     case 's': // max
-      max_ops_per_buffer_ = 50;
+      // Note: ops_per_buffer=300 gives +11% decode speed but increases peak
+      // memory during prefill (more intermediates alive simultaneously).
+      // Keep default at 100; users can set MLX_MAX_OPS_PER_BUFFER=300 for
+      // decode-heavy workloads where memory isn't tight.
+      max_ops_per_buffer_ = 100;
       max_mb_per_buffer_ = 50;
       break;
     case 'd': // ultra
-      max_ops_per_buffer_ = 50;
+      max_ops_per_buffer_ = 100;
       max_mb_per_buffer_ = 50;
       break;
     default: // default to medium
