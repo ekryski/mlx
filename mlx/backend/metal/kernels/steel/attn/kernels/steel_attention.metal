@@ -34,4 +34,22 @@ instantiate_attn_mask_helper(bfloat16, bfloat16_t);
 instantiate_attn_mask_helper_bd256(bfloat16, bfloat16_t);
 
 instantiate_attn_mask_helper(float32, float);
+// BD=256 and BD=512 are NOT instantiated for float32 — threadgroup memory
+// exceeds 32KB limit (41KB for BD=256, 49KB for BD=512 at 4 bytes/element).
+// Only float16/bfloat16 (2 bytes/element) fit. Dispatch gates on dtype.
+
+// BD=512: BQ=8, BK=8, WM=1, WN=1 — minimal tile for large head dimensions.
+// High register pressure (512 regs/thread for Otile) limits occupancy to ~6%
+// on M1 Max, but avoids materializing L×L attention score matrices during prefill.
+// Potentially viable on M5 Max with larger register files. Gated behind runtime check
+// in scaled_dot_product_attention.cpp.
+#define instantiate_attn_shapes_helper_bd512(iname, itype, mname, mtype)  \
+    instantiate_attn(iname, itype, 8, 8, 512, 1, 1, mname, mtype)
+
+#define instantiate_attn_mask_helper_bd512(iname, itype) \
+    instantiate_attn_shapes_helper_bd512(iname, itype, iname, itype) \
+    instantiate_attn_shapes_helper_bd512(iname, itype, bool_, bool)
+
+instantiate_attn_mask_helper_bd512(float16, half);
+instantiate_attn_mask_helper_bd512(bfloat16, bfloat16_t);
 // clang-format on
