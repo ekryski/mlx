@@ -28,11 +28,10 @@ void sdpa_full_self_attention_nax(
     const std::optional<array>& sinks) {
   using namespace mlx::steel;
 
-  int wm = 4;
-  int wn = 1;
-
   int bd = q.shape(-1);
-  int bq = 64;
+  int wm = bd <= 128 ? 4 : 2;
+  int wn = 1;
+  int bq = bd <= 128 ? 64 : 32;
   int bk = bd <= 128 ? 32 : 16;
 
   int B = q.shape(0);
@@ -191,11 +190,10 @@ void sdpa_full_self_attention_metal(
 
   using namespace mlx::steel;
 
-  int wm = 4;
-  int wn = 1;
-
   int bd = q.shape(-1);
-  int bq = 32;
+  int wm = bd <= 128 ? 4 : 2;
+  int wn = 1;
+  int bq = bd <= 128 ? 32 : 16;
   int bk = bd < 128 ? 32 : 16;
 
   int B = q.shape(0);
@@ -619,6 +617,10 @@ bool ScaledDotProductAttention::use_fallback(
       query_head_dim == value_head_dim &&
       (query_head_dim == 64 || query_head_dim == 96 || query_head_dim == 128 ||
        query_head_dim == 256);
+  // BD=256 Steel full attention is compiled but disabled — matmul fallback is faster
+  // on M1 Max for all tested context lengths (1K-32K). The Steel kernel avoids L×L
+  // score materialization but can't beat Apple's optimized matmul at these sizes.
+  // Vector/decode mode at BD=256 works well and is enabled separately.
   const bool sdpa_full_supported_head_dim = query_head_dim == value_head_dim &&
       (query_head_dim == 64 || query_head_dim == 80 || query_head_dim == 128);
 

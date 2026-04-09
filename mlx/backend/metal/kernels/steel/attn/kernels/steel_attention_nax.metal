@@ -17,9 +17,9 @@
     instantiate_attn(iname, itype, 64, 64, 128, 4, 1, mname, mtype) \
     instantiate_attn(iname, itype, 64, 64,  64, 4, 1, mname, mtype)
 
-// BD=256 only for half/bfloat16 — float32 exceeds 32KB threadgroup memory limit
+// BD=256: BQ=32, WM=2 for smaller output tile + better occupancy, float16/bfloat16 only
 #define instantiate_attn_shapes_helper_bd256(iname, itype, mname, mtype)  \
-    instantiate_attn(iname, itype, 64, 16, 256, 4, 1, mname, mtype)
+    instantiate_attn(iname, itype, 32, 16, 256, 2, 1, mname, mtype)
 
 #define instantiate_attn_mask_helper(iname, itype) \
     instantiate_attn_shapes_helper(iname, itype, iname, itype) \
