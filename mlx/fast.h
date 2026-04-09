@@ -26,6 +26,16 @@ MLX_API array rms_norm_rope(
     int seq_len,
     StreamOrDevice s = {});
 
+MLX_API array rms_norm_qgemv(
+    const array& x,
+    const array& norm_weight,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    float eps,
+    int group_size,
+    StreamOrDevice s = {});
+
 MLX_API array layer_norm(
     const array& x,
     const std::optional<array>& weight,

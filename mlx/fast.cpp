@@ -178,6 +178,58 @@ array rms_norm_rope(
        astype(inv_freqs, float32, s)})[0];
 }
 
+array rms_norm_qgemv(
+    const array& x,
+    const array& norm_weight,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    float eps,
+    int group_size,
+    StreamOrDevice s_ /* = {} */) {
+  if (x.ndim() < 1) {
+    throw std::invalid_argument(
+        "[rms_norm_qgemv] Input must have at least 1 dimension");
+  }
+
+  int K = x.shape().back();
+  int N = w.shape(0);
+  auto out_type = x.dtype();
+
+  auto s = to_stream(s_);
+
+  // Fallback: separate rms_norm + quantized_matmul
+  auto fallback = [eps, group_size, s](const std::vector<array>& inputs) {
+    auto normed = rms_norm(inputs[0], inputs[1], eps, s);
+    auto result = quantized_matmul(
+        normed, inputs[2], inputs[3], inputs[4],
+        true, group_size, 4, "affine", s);
+    return std::vector<array>{result};
+  };
+
+  // Output shape: replace last dim K with N
+  auto out_shape = x.shape();
+  out_shape.back() = N;
+
+  if (!RMSNormQuantizedGEMV::use_fallback(s)) {
+    return array(
+        std::move(out_shape),
+        out_type,
+        std::make_shared<RMSNormQuantizedGEMV>(s, fallback, eps, group_size),
+        {astype(x, out_type, s),
+         astype(norm_weight, out_type, s),
+         w,
+         astype(scales, out_type, s),
+         astype(biases, out_type, s)});
+  }
+  return fallback(
+      {astype(x, out_type, s),
+       astype(norm_weight, out_type, s),
+       w,
+       astype(scales, out_type, s),
+       astype(biases, out_type, s)})[0];
+}
+
 std::vector<array> RMSNorm::vjp(
     const std::vector<array>& primals,
     const std::vector<array>& cotangents,

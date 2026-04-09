@@ -92,6 +92,59 @@ void RMSNorm::eval_gpu(
   }
 }
 
+bool RMSNormQuantizedGEMV::use_fallback(Stream s) {
+  return s.device == Device::cpu;
+}
+
+void RMSNormQuantizedGEMV::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  auto& out = outputs[0];
+
+  const array& x = inputs[0];
+  const array& norm_weight = inputs[1];
+  const array& w = inputs[2];
+  const array& scales = inputs[3];
+  const array& biases = inputs[4];
+
+  auto K = static_cast<int>(x.shape().back());
+  auto N = static_cast<int>(out.shape().back());
+
+  out.set_data(allocator::malloc(out.nbytes()));
+
+  // Kernel name: rms_norm_qgemv_<type>_gs<group_size>
+  std::string kname = "rms_norm_qgemv_" + type_to_name(out) + "_gs" +
+      std::to_string(group_size_);
+  auto kernel = d.get_kernel(kname);
+
+  // Same grid as qmv_impl: 8 outputs per threadgroup (2 simdgroups × 4 rows)
+  constexpr int outputs_per_tg = 8;
+  int n_tg_y = (N + outputs_per_tg - 1) / outputs_per_tg;
+
+  auto& compute_encoder = d.get_command_encoder(s.index);
+  compute_encoder.set_compute_pipeline_state(kernel);
+  compute_encoder.set_input_array(x, 0);
+  compute_encoder.set_input_array(norm_weight, 1);
+  compute_encoder.set_input_array(w, 2);
+  compute_encoder.set_input_array(scales, 3);
+  compute_encoder.set_input_array(biases, 4);
+  compute_encoder.set_output_array(out, 5);
+  compute_encoder.set_bytes(eps_, 6);
+  compute_encoder.set_bytes(K, 7);
+  compute_encoder.set_bytes(N, 8);
+  compute_encoder.dispatch_threadgroups(
+      MTL::Size(1, n_tg_y, 1),
+      MTL::Size(64, 1, 1));  // 2 simdgroups × 32 threads
+}
+
+bool RMSNormQuantizedGEMV::is_equivalent(const Primitive& other) const {
+  const RMSNormQuantizedGEMV& r =
+      static_cast<const RMSNormQuantizedGEMV&>(other);
+  return eps_ == r.eps_ && group_size_ == r.group_size_;
+}
+
 bool RMSNormRoPE::use_fallback(Stream s) {
   return s.device == Device::cpu;
 }

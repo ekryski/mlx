@@ -101,10 +101,10 @@ template <typename T, int group_size>
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  // Compute sum((x * weight)²) for RMSNorm
+  // Compute sum(x²) for RMSNorm (weight applied AFTER norm, not inside)
   float sum_sq = 0;
   for (uint i = thread_id; i < uint(in_vec_size); i += total_threads) {
-    float v = float(shared_x[i]) * float(norm_weight[i]);
+    float v = float(shared_x[i]);
     sum_sq += v * v;
   }
 
@@ -145,14 +145,25 @@ template <typename T, int group_size>
 
   uint x_offset = simd_lid * values_per_thread;
   int k = 0;
+
+  // 4-bit pre-scaling: matches load_vector<T,U,8,4> from quantized.h.
+  // qdot_4bit multiplies x_thread by un-shifted uint16 mask bits.
+  // Masks 0x000f, 0x00f0, 0x0f00, 0xf000 produce values ×1, ×16, ×256, ×4096.
+  // x_thread[i] is pre-divided to compensate, repeating per uint16 pack.
+  constexpr float qdot_prescale[8] = {
+      1.0f, 1.0f/16.0f, 1.0f/256.0f, 1.0f/4096.0f,
+      1.0f, 1.0f/16.0f, 1.0f/256.0f, 1.0f/4096.0f
+  };
+
   for (; k < in_vec_size - block_size; k += block_size) {
-    // Load normed x from shared memory (fused: x * weight * inv_rms)
+    // Load normed x from shared memory with qdot pre-scaling
     float sum = 0;
     for (int i = 0; i < values_per_thread; i++) {
       float raw = float(shared_x[x_offset + i]);
       float nw = float(norm_weight[x_offset + i]);
-      x_thread[i] = raw * nw * inv_rms;
-      sum += x_thread[i];
+      float normed = raw * nw * inv_rms;
+      sum += normed;
+      x_thread[i] = normed * qdot_prescale[i];
     }
 
     for (int row = 0; row < results_per_simdgroup; row++) {
@@ -178,8 +189,9 @@ template <typename T, int group_size>
       if (i < remaining) {
         float raw = float(shared_x[x_offset + i]);
         float nw = float(norm_weight[x_offset + i]);
-        x_thread[i] = raw * nw * inv_rms;
-        sum += x_thread[i];
+        float normed = raw * nw * inv_rms;
+        sum += normed;
+        x_thread[i] = normed * qdot_prescale[i];
       } else {
         x_thread[i] = 0;
       }
