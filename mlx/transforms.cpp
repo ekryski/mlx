@@ -261,31 +261,9 @@ array eval_impl(std::vector<array> outputs, bool async) {
       cpu::eval(arr);
     }
 
-    // One-shot log of memory limits at first GPU eval
-    {
-      static int eval_count = 0;
-      if (eval_count < 3) {
-        FILE* f = fopen("/tmp/mlx_limits.txt", "a");
-        if (f) {
-          fprintf(f, "[MLX-LIMITS] eval#%d memory_limit=%zuMB active=%zuMB cache=%zuMB tasks=%d\n",
-              eval_count, get_memory_limit() >> 20, get_active_memory() >> 20,
-              get_cache_memory() >> 20, scheduler::n_active_tasks());
-          fclose(f);
-        }
-        eval_count++;
-      }
-    }
     if (scheduler::n_active_tasks() > MAX_ACTIVE_TASKS ||
         (get_active_memory() > get_memory_limit() &&
          scheduler::n_active_tasks() > 0)) {
-      static int mem_log = 0;
-      if (mem_log < 20) {
-        fprintf(stderr, "[MLX-BACKOFF] active=%zuMB limit=%zuMB tasks=%d cache=%zuMB\n",
-            get_active_memory() >> 20, get_memory_limit() >> 20,
-            scheduler::n_active_tasks(),
-            get_cache_memory() >> 20);
-        mem_log++;
-      }
       // Commit any open streams
       for (auto& s : open_streams) {
         if (s.device == Device::gpu) {
