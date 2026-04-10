@@ -123,7 +123,7 @@ void RMSNormQuantizedGEMV::eval_gpu(
   constexpr int outputs_per_tg = 8;
   int n_tg_y = (N + outputs_per_tg - 1) / outputs_per_tg;
 
-  auto& compute_encoder = d.get_command_encoder(s.index);
+  auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
   compute_encoder.set_input_array(x, 0);
   compute_encoder.set_input_array(norm_weight, 1);
@@ -193,7 +193,7 @@ void RMSNormRoPE::eval_gpu(
   assert(threadgroup_size <= kernel->maxTotalThreadsPerThreadgroup());
   size_t n_threads = n_rows * threadgroup_size;
 
-  auto& compute_encoder = d.get_command_encoder(s.index);
+  auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
   compute_encoder.set_input_array(x, 0);
   compute_encoder.set_input_array(w, 1);
