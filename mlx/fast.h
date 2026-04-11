@@ -16,6 +16,13 @@ MLX_API array rms_norm(
     float eps,
     StreamOrDevice s = {});
 
+MLX_API array rms_norm_residual(
+    const array& x,
+    const array& residual,
+    const array& weight,
+    float eps,
+    StreamOrDevice s = {});
+
 MLX_API array rms_norm_rope(
     const array& x,
     const array& weight,

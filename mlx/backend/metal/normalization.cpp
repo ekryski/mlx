@@ -145,6 +145,73 @@ bool RMSNormQuantizedGEMV::is_equivalent(const Primitive& other) const {
   return eps_ == r.eps_ && group_size_ == r.group_size_;
 }
 
+bool RMSNormResidual::use_fallback(Stream s) {
+  return s.device == Device::cpu;
+}
+
+void RMSNormResidual::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  auto& out = outputs[0];
+
+  // Ensure x is contiguous in last dim
+  const array& x_in = inputs[0];
+  bool no_copy = x_in.flags().contiguous && x_in.strides()[x_in.ndim() - 1] == 1;
+  if (no_copy && x_in.ndim() > 1) {
+    auto st = x_in.strides()[x_in.ndim() - 2];
+    no_copy &= (st == 0 || st == x_in.shape().back() || x_in.shape(-2) == 1);
+  }
+  array x = no_copy ? x_in : contiguous_copy_gpu(x_in, s);
+
+  // Ensure residual is contiguous in last dim
+  const array& r_in = inputs[1];
+  bool r_no_copy = r_in.flags().contiguous && r_in.strides()[r_in.ndim() - 1] == 1;
+  if (r_no_copy && r_in.ndim() > 1) {
+    auto st = r_in.strides()[r_in.ndim() - 2];
+    r_no_copy &= (st == 0 || st == r_in.shape().back() || r_in.shape(-2) == 1);
+  }
+  array residual = r_no_copy ? r_in : contiguous_copy_gpu(r_in, s);
+
+  // Output allocation — must be fresh because kernel reads x and residual
+  // while writing output (in-place would cause read-after-write hazard).
+  out.set_data(
+      allocator::malloc(x.data_size() * x.itemsize()),
+      x.data_size(),
+      x.strides(),
+      x.flags());
+
+  const array& w = inputs[2];
+
+  auto axis_size = static_cast<uint32_t>(x.shape().back());
+  int n_rows = x.data_size() / axis_size;
+
+  std::string kname = "rms_norm_residual_" + type_to_name(out);
+  auto kernel = d.get_kernel(kname);
+
+  // Use max threadgroup size — kernel loops over elements when axis_size > threadgroup
+  size_t threadgroup_size = kernel->maxTotalThreadsPerThreadgroup();
+  size_t n_threads = n_rows * threadgroup_size;
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.set_compute_pipeline_state(kernel);
+  compute_encoder.set_input_array(x, 0);
+  compute_encoder.set_input_array(residual, 1);
+  compute_encoder.set_input_array(w, 2);
+  compute_encoder.set_output_array(out, 3);
+  compute_encoder.set_bytes(eps_, 4);
+  compute_encoder.set_bytes(axis_size, 5);
+  compute_encoder.dispatch_threads(
+      MTL::Size(n_threads, 1, 1),
+      MTL::Size(threadgroup_size, 1, 1));
+}
+
+bool RMSNormResidual::is_equivalent(const Primitive& other) const {
+  const RMSNormResidual& r = static_cast<const RMSNormResidual&>(other);
+  return eps_ == r.eps_;
+}
+
 bool RMSNormRoPE::use_fallback(Stream s) {
   return s.device == Device::cpu;
 }

@@ -104,6 +104,36 @@ class RMSNormQuantizedGEMV : public Custom {
   int group_size_;
 };
 
+class RMSNormResidual : public Custom {
+ public:
+  RMSNormResidual(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      float eps)
+      : Custom(stream, std::move(fallback)),
+        eps_(eps) {}
+
+  static bool use_fallback(Stream stream);
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("NYI");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(RMSNormResidual)
+  bool is_equivalent(const Primitive& other) const override;
+  DEFINE_INPUT_OUTPUT_SHAPE()
+
+  auto state() const {
+    return std::make_tuple(nullptr, eps_);
+  }
+
+ private:
+  float eps_;
+};
+
 class RMSNormRoPE : public Custom {
  public:
   RMSNormRoPE(

@@ -120,6 +120,46 @@ array rms_norm(
   return fallback({x, passed_weight})[0];
 }
 
+array rms_norm_residual(
+    const array& x,
+    const array& residual,
+    const array& weight,
+    float eps,
+    StreamOrDevice s_ /* = {} */) {
+  if (x.ndim() < 1) {
+    throw std::invalid_argument(
+        "[rms_norm_residual] Input must have at least 1 dimension");
+  }
+
+  auto out_type = result_type(x, weight);
+  if (!issubdtype(out_type, floating)) {
+    throw std::invalid_argument(
+        "[rms_norm_residual] Input must be floating point");
+  }
+
+  auto s = to_stream(s_);
+
+  auto fallback = [eps, s](const std::vector<array>& inputs) {
+    auto normed = rms_norm(inputs[0], inputs[2], eps, s);
+    auto result = add(inputs[1], normed, s);
+    return std::vector<array>{result};
+  };
+
+  if (!RMSNormResidual::use_fallback(s)) {
+    return array(
+        x.shape(),
+        out_type,
+        std::make_shared<RMSNormResidual>(s, fallback, eps),
+        {astype(x, out_type, s),
+         astype(residual, out_type, s),
+         astype(weight, out_type, s)});
+  }
+  return fallback(
+      {astype(x, out_type, s),
+       astype(residual, out_type, s),
+       astype(weight, out_type, s)})[0];
+}
+
 array rms_norm_rope(
     const array& x,
     const array& weight,
