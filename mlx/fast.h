@@ -127,4 +127,151 @@ MLX_API std::vector<array> precompiled_cuda_kernel(
     bool ensure_row_contiguous = false,
     StreamOrDevice s = {});
 
+// ============================================================================
+// TurboQuant: compressed-domain attention primitives
+// ============================================================================
+
+/// Compute Q*K scores from packed codebook-quantized keys.
+MLX_API array turbo_score(
+    const array& q_rot,
+    const array& packed,
+    const array& norms,
+    const array& codebook,
+    int token_count,
+    int repeat_count,
+    int bits,
+    int dim,
+    StreamOrDevice s = {});
+
+/// Fused norm+rotate+quantize+pack (dense rotation variant).
+/// Returns {packed_out, norms_out}.
+MLX_API std::vector<array> turbo_encode(
+    const array& input,
+    const array& rotation,
+    const array& boundaries,
+    const array& codebook,
+    int bits,
+    int dim,
+    StreamOrDevice s = {});
+
+/// Fused norm+WHT+quantize+pack (Walsh-Hadamard variant).
+/// Returns {packed_out, norms_out}.
+MLX_API std::vector<array> turbo_encode_wht(
+    const array& input,
+    const array& wht_signs,
+    const array& boundaries,
+    int bits,
+    int dim,
+    StreamOrDevice s = {});
+
+/// TurboFlash attention pass 1 (non-causal, single decode token).
+/// Returns {o_partials, m_partials, l_partials}.
+MLX_API std::vector<array> turbo_flash_pass1(
+    const array& q_rot,
+    const array& key_packed,
+    const array& key_norms,
+    const array& key_codebook,
+    const array& val_packed,
+    const array& val_norms,
+    const array& val_codebook,
+    int token_count,
+    int repeat_count,
+    int num_blocks,
+    int block_size,
+    int key_bits,
+    int value_bits,
+    int dim,
+    StreamOrDevice s = {});
+
+/// TurboFlash attention pass 1 (causal, L>1 prefill).
+/// Returns {o_partials, m_partials, l_partials}.
+MLX_API std::vector<array> turbo_flash_pass1_causal(
+    const array& q_rot,
+    const array& key_packed,
+    const array& key_norms,
+    const array& key_codebook,
+    const array& val_packed,
+    const array& val_norms,
+    const array& val_codebook,
+    int token_count,
+    int repeat_count,
+    int num_blocks,
+    int block_size,
+    int L,
+    int q_offset,
+    int key_bits,
+    int value_bits,
+    int dim,
+    StreamOrDevice s = {});
+
+/// TurboFlash attention pass 2: cross-block online softmax reduction.
+MLX_API array turbo_flash_pass2(
+    const array& o_partials,
+    const array& m_partials,
+    const array& l_partials,
+    int num_blocks,
+    int dim,
+    StreamOrDevice s = {});
+
+/// TurboFlash attention pass 2 with fused output rotation.
+MLX_API array turbo_flash_pass2_fused(
+    const array& o_partials,
+    const array& m_partials,
+    const array& l_partials,
+    const array& val_rotation,
+    int num_blocks,
+    int dim,
+    StreamOrDevice s = {});
+
+/// Weighted sum of codebook-quantized values (V aggregation).
+MLX_API array turbo_value(
+    const array& weights,
+    const array& packed,
+    const array& norms,
+    const array& codebook,
+    int token_count,
+    int repeat_count,
+    float sparse_threshold,
+    int bits,
+    int dim,
+    StreamOrDevice s = {});
+
+// ============================================================================
+// GatedDeltaNet / SSM recurrence primitives
+// ============================================================================
+
+/// GatedDelta recurrence step (standard or fused variant).
+/// Returns {y [B, T, Hv, Dv], state_out [B, Hv, Dv, Dk]}.
+MLX_API std::vector<array> gated_delta_step(
+    const array& q,
+    const array& k,
+    const array& v,
+    const array& g,
+    const array& beta,
+    const array& state,
+    const std::optional<array>& mask,
+    int T,
+    bool fused,
+    int Dk,
+    int Dv,
+    int Hk,
+    int Hv,
+    StreamOrDevice s = {});
+
+/// SSM (Selective State Space Model) recurrence step.
+/// Returns {out [N, Dh], state_out [N, Dh, Ds]}.
+MLX_API std::vector<array> ssm_step(
+    const array& X,
+    const array& A_log,
+    const array& B,
+    const array& C,
+    const array& D,
+    const array& dt,
+    const array& state,
+    int Dh,
+    int Ds,
+    int H,
+    int G,
+    StreamOrDevice s = {});
+
 } // namespace mlx::core::fast

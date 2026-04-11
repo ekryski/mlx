@@ -1105,4 +1105,389 @@ bool ConvertFP8::is_equivalent(const Primitive& other) const {
   return to_fp8_ == a_other.to_fp8_;
 }
 
+// ============================================================================
+// TurboQuant API implementations
+// ============================================================================
+
+namespace {
+
+inline int turbo_packed_width(int dim, int bits) {
+  return (dim * bits + 31) / 32;
+}
+
+} // namespace
+
+array turbo_score(
+    const array& q_rot,
+    const array& packed,
+    const array& norms,
+    const array& codebook,
+    int token_count,
+    int repeat_count,
+    int bits,
+    int dim,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+
+  int total_q = q_rot.shape(0);
+
+  // Fallback: no CPU implementation
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[turbo_score] Only runs on GPU");
+  };
+
+  return array(
+      {total_q, token_count},
+      float32,
+      std::make_shared<TurboScore>(s, fallback, bits, dim),
+      {astype(q_rot, float32, s),
+       packed,
+       astype(norms, float32, s),
+       astype(codebook, float32, s)});
+}
+
+std::vector<array> turbo_encode(
+    const array& input,
+    const array& rotation,
+    const array& boundaries,
+    const array& codebook,
+    int bits,
+    int dim,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+
+  int num_rows = input.shape(0);
+  int pw = turbo_packed_width(dim, bits);
+
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[turbo_encode] Only runs on GPU");
+  };
+
+  return array::make_arrays(
+      {{num_rows, pw}, {num_rows}},
+      {uint32, float32},
+      std::make_shared<TurboEncode>(s, fallback, bits, dim, /*use_wht=*/false),
+      {astype(input, float32, s),
+       astype(rotation, float32, s),
+       astype(boundaries, float32, s),
+       astype(codebook, float32, s)});
+}
+
+std::vector<array> turbo_encode_wht(
+    const array& input,
+    const array& wht_signs,
+    const array& boundaries,
+    int bits,
+    int dim,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+
+  int num_rows = input.shape(0);
+  int pw = turbo_packed_width(dim, bits);
+
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[turbo_encode_wht] Only runs on GPU");
+  };
+
+  return array::make_arrays(
+      {{num_rows, pw}, {num_rows}},
+      {uint32, float32},
+      std::make_shared<TurboEncode>(s, fallback, bits, dim, /*use_wht=*/true),
+      {astype(input, float32, s),
+       astype(wht_signs, float32, s),
+       astype(boundaries, float32, s)});
+}
+
+std::vector<array> turbo_flash_pass1(
+    const array& q_rot,
+    const array& key_packed,
+    const array& key_norms,
+    const array& key_codebook,
+    const array& val_packed,
+    const array& val_norms,
+    const array& val_codebook,
+    int token_count,
+    int repeat_count,
+    int num_blocks,
+    int block_size,
+    int key_bits,
+    int value_bits,
+    int dim,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+
+  int total_q = q_rot.shape(0);
+
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[turbo_flash_pass1] Only runs on GPU");
+  };
+
+  // Pack scalar constants as 0-d int32 arrays so they become graph inputs
+  return array::make_arrays(
+      {{total_q * num_blocks, dim},
+       {total_q, num_blocks},
+       {total_q, num_blocks}},
+      {float32, float32, float32},
+      std::make_shared<TurboFlashPass1>(
+          s, fallback, key_bits, value_bits, dim, /*causal=*/false),
+      {astype(q_rot, float32, s),
+       key_packed,
+       astype(key_norms, float32, s),
+       astype(key_codebook, float32, s),
+       val_packed,
+       astype(val_norms, float32, s),
+       astype(val_codebook, float32, s),
+       array(token_count, int32),
+       array(repeat_count, int32),
+       array(num_blocks, int32),
+       array(block_size, int32)});
+}
+
+std::vector<array> turbo_flash_pass1_causal(
+    const array& q_rot,
+    const array& key_packed,
+    const array& key_norms,
+    const array& key_codebook,
+    const array& val_packed,
+    const array& val_norms,
+    const array& val_codebook,
+    int token_count,
+    int repeat_count,
+    int num_blocks,
+    int block_size,
+    int L,
+    int q_offset,
+    int key_bits,
+    int value_bits,
+    int dim,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+
+  int total_q = q_rot.shape(0);
+
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[turbo_flash_pass1_causal] Only runs on GPU");
+  };
+
+  return array::make_arrays(
+      {{total_q * num_blocks, dim},
+       {total_q, num_blocks},
+       {total_q, num_blocks}},
+      {float32, float32, float32},
+      std::make_shared<TurboFlashPass1>(
+          s, fallback, key_bits, value_bits, dim, /*causal=*/true),
+      {astype(q_rot, float32, s),
+       key_packed,
+       astype(key_norms, float32, s),
+       astype(key_codebook, float32, s),
+       val_packed,
+       astype(val_norms, float32, s),
+       astype(val_codebook, float32, s),
+       array(token_count, int32),
+       array(repeat_count, int32),
+       array(num_blocks, int32),
+       array(block_size, int32),
+       array(L, int32),
+       array(q_offset, int32)});
+}
+
+array turbo_flash_pass2(
+    const array& o_partials,
+    const array& m_partials,
+    const array& l_partials,
+    int num_blocks,
+    int dim,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+
+  int total_q = m_partials.shape(0);
+
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[turbo_flash_pass2] Only runs on GPU");
+  };
+
+  return array(
+      {total_q, dim},
+      float32,
+      std::make_shared<TurboFlashPass2>(
+          s, fallback, dim, /*fused_rotation=*/false),
+      {astype(o_partials, float32, s),
+       astype(m_partials, float32, s),
+       astype(l_partials, float32, s)});
+}
+
+array turbo_flash_pass2_fused(
+    const array& o_partials,
+    const array& m_partials,
+    const array& l_partials,
+    const array& val_rotation,
+    int num_blocks,
+    int dim,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+
+  int total_q = m_partials.shape(0);
+
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[turbo_flash_pass2_fused] Only runs on GPU");
+  };
+
+  return array(
+      {total_q, dim},
+      float32,
+      std::make_shared<TurboFlashPass2>(
+          s, fallback, dim, /*fused_rotation=*/true),
+      {astype(o_partials, float32, s),
+       astype(m_partials, float32, s),
+       astype(l_partials, float32, s),
+       astype(val_rotation, float32, s)});
+}
+
+array turbo_value(
+    const array& weights,
+    const array& packed,
+    const array& norms,
+    const array& codebook,
+    int token_count,
+    int repeat_count,
+    float sparse_threshold,
+    int bits,
+    int dim,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+
+  int total_heads = weights.shape(0);
+
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[turbo_value] Only runs on GPU");
+  };
+
+  return array(
+      {total_heads, dim},
+      float32,
+      std::make_shared<TurboValue>(s, fallback, bits, dim),
+      {astype(weights, float32, s),
+       packed,
+       astype(norms, float32, s),
+       astype(codebook, float32, s),
+       array(sparse_threshold, float32)});
+}
+
+// ============================================================================
+// GatedDeltaNet / SSM recurrence primitives
+// ============================================================================
+
+std::vector<array> gated_delta_step(
+    const array& q,
+    const array& k,
+    const array& v,
+    const array& g,
+    const array& beta,
+    const array& state,
+    const std::optional<array>& mask,
+    int T,
+    bool fused,
+    int Dk,
+    int Dv,
+    int Hk,
+    int Hv,
+    StreamOrDevice s_ /* = {} */) {
+  auto s = to_stream(s_);
+  auto out_type = q.dtype();
+  bool has_mask = mask.has_value();
+
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[gated_delta_step] Only runs on GPU");
+  };
+
+  // Compute output shapes
+  // y: [B, T, Hv, Dv]
+  int B = static_cast<int>(state.shape(0));
+  Shape y_shape = {B, T, Hv, Dv};
+  // state_out: [B, Hv, Dv, Dk]
+  Shape state_shape = state.shape();
+
+  // Build inputs vector matching Metal buffer order.
+  //
+  // Standard path (fused=false):
+  //   API args map 1:1 -> q(0), k(1), v(2), g(3), beta(4), state_in(5),
+  //                        [mask(6)]
+  //
+  // Fused path (fused=true):
+  //   The fused kernel expects 8 input arrays:
+  //     q_raw(0), k_raw(1), v(2), a(3), b_input(4), a_log(5), dt_bias(6),
+  //     state_in(7), [mask(8)]
+  //   This API re-purposes the 6 positional args as:
+  //     q -> q_raw, k -> k_raw, v -> v, g -> a, beta -> b_input
+  //     state -> state_in
+  //   a_log and dt_bias are model constants that the Swift caller must
+  //   inject by constructing the GatedDeltaStep primitive directly with
+  //   all 8 inputs. This API function only supports the standard path.
+  if (fused) {
+    throw std::invalid_argument(
+        "[gated_delta_step] Fused variant requires 8 input arrays. "
+        "Construct the GatedDeltaStep primitive directly.");
+  }
+
+  std::vector<array> inputs = {
+      astype(q, out_type, s),
+      astype(k, out_type, s),
+      astype(v, out_type, s),
+      astype(g, out_type, s),
+      astype(beta, out_type, s),
+      astype(state, out_type, s)};
+  if (has_mask) {
+    inputs.push_back(*mask);
+  }
+
+  return array::make_arrays(
+      {std::move(y_shape), std::move(state_shape)},
+      {out_type, out_type},
+      std::make_shared<GatedDeltaStep>(
+          s, fallback, fused, has_mask, T, Dk, Dv, Hk, Hv),
+      std::move(inputs));
+}
+
+std::vector<array> ssm_step(
+    const array& X,
+    const array& A_log,
+    const array& B,
+    const array& C,
+    const array& D,
+    const array& dt,
+    const array& state,
+    int Dh,
+    int Ds,
+    int H,
+    int G,
+    StreamOrDevice s_ /* = {} */) {
+  auto s = to_stream(s_);
+  auto out_type = X.dtype();
+
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[ssm_step] Only runs on GPU");
+  };
+
+  // Output shapes
+  // out: same shape as X [N, Dh]
+  Shape out_shape = X.shape();
+  // state_out: same shape as state [N, Dh, Ds]
+  Shape state_shape = state.shape();
+
+  std::vector<array> inputs = {
+      astype(X, out_type, s),
+      astype(A_log, out_type, s),
+      astype(B, out_type, s),
+      astype(C, out_type, s),
+      astype(D, out_type, s),
+      astype(dt, out_type, s),
+      astype(state, out_type, s)};
+
+  return array::make_arrays(
+      {std::move(out_shape), std::move(state_shape)},
+      {out_type, out_type},
+      std::make_shared<SSMStep>(s, fallback, Dh, Ds, H, G),
+      std::move(inputs));
+}
+
 } // namespace mlx::core::fast
