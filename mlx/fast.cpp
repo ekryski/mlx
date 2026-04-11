@@ -1448,6 +1448,56 @@ std::vector<array> gated_delta_step(
       std::move(inputs));
 }
 
+std::vector<array> gated_delta_step_fused(
+    const array& q_raw,
+    const array& k_raw,
+    const array& v,
+    const array& a,
+    const array& b_input,
+    const array& a_log,
+    const array& dt_bias,
+    const array& state,
+    const std::optional<array>& mask,
+    int T,
+    int Dk,
+    int Dv,
+    int Hk,
+    int Hv,
+    StreamOrDevice s_ /* = {} */) {
+  auto s = to_stream(s_);
+  auto out_type = q_raw.dtype();
+  bool has_mask = mask.has_value();
+
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[gated_delta_step_fused] Only runs on GPU");
+  };
+
+  int B = static_cast<int>(state.shape(0));
+  Shape y_shape = {B, T, Hv, Dv};
+  Shape state_shape = state.shape();
+
+  // Fused path: q_raw, k_raw, v, a, b_input, a_log, dt_bias, state [, mask]
+  std::vector<array> inputs = {
+      astype(q_raw, out_type, s),
+      astype(k_raw, out_type, s),
+      astype(v, out_type, s),
+      astype(a, out_type, s),
+      astype(b_input, out_type, s),
+      astype(a_log, out_type, s),
+      astype(dt_bias, out_type, s),
+      astype(state, out_type, s)};
+  if (has_mask) {
+    inputs.push_back(*mask);
+  }
+
+  return array::make_arrays(
+      {std::move(y_shape), std::move(state_shape)},
+      {out_type, out_type},
+      std::make_shared<GatedDeltaStep>(
+          s, fallback, /*fused=*/true, has_mask, T, Dk, Dv, Hk, Hv),
+      std::move(inputs));
+}
+
 std::vector<array> ssm_step(
     const array& X,
     const array& A_log,

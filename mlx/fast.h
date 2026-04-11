@@ -240,7 +240,7 @@ MLX_API array turbo_value(
 // GatedDeltaNet / SSM recurrence primitives
 // ============================================================================
 
-/// GatedDelta recurrence step (standard or fused variant).
+/// GatedDelta recurrence step (standard variant).
 /// Returns {y [B, T, Hv, Dv], state_out [B, Hv, Dv, Dk]}.
 MLX_API std::vector<array> gated_delta_step(
     const array& q,
@@ -252,6 +252,25 @@ MLX_API std::vector<array> gated_delta_step(
     const std::optional<array>& mask,
     int T,
     bool fused,
+    int Dk,
+    int Dv,
+    int Hk,
+    int Hv,
+    StreamOrDevice s = {});
+
+/// GatedDelta fused recurrence step (fused norm+gate+beta inside kernel).
+/// Returns {y [B, T, Hv, Dv], state_out [B, Hv, Dv, Dk]}.
+MLX_API std::vector<array> gated_delta_step_fused(
+    const array& q_raw,
+    const array& k_raw,
+    const array& v,
+    const array& a,
+    const array& b_input,
+    const array& a_log,
+    const array& dt_bias,
+    const array& state,
+    const std::optional<array>& mask,
+    int T,
     int Dk,
     int Dv,
     int Hk,

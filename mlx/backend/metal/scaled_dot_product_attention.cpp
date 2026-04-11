@@ -629,6 +629,7 @@ bool ScaledDotProductAttention::use_fallback(
   // the 32KB threadgroup memory limit (41KB for BD=256, 49KB for BD=512 at 4B/elem).
   const bool is_half = q.dtype() == float16 || q.dtype() == bfloat16;
 
+
   const bool sdpa_vector_supported_head_dim =
       query_head_dim == value_head_dim &&
       (query_head_dim == 64 || query_head_dim == 96 || query_head_dim == 128 ||
