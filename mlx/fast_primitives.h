@@ -627,6 +627,46 @@ class TurboFlashPass1 : public Custom {
   bool causal_;
 };
 
+class TurboFlashPass1NR0 : public Custom {
+ public:
+  TurboFlashPass1NR0(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int key_bits,
+      int value_bits,
+      int dim,
+      int nr0,
+      bool causal)
+      : Custom(stream, std::move(fallback)),
+        key_bits_(key_bits),
+        value_bits_(value_bits),
+        dim_(dim),
+        nr0_(nr0),
+        causal_(causal) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("TurboFlashPass1NR0 only runs on GPU");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(TurboFlashPass1NR0)
+  bool is_equivalent(const Primitive& other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
+  auto state() const {
+    return std::make_tuple(
+        nullptr, key_bits_, value_bits_, dim_, nr0_, causal_);
+  }
+
+ private:
+  int key_bits_;
+  int value_bits_;
+  int dim_;
+  int nr0_;
+  bool causal_;
+};
+
 class TurboFlashPass2 : public Custom {
  public:
   TurboFlashPass2(

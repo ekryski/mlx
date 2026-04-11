@@ -204,6 +204,48 @@ MLX_API std::vector<array> turbo_flash_pass1_causal(
     int dim,
     StreamOrDevice s = {});
 
+/// TurboFlash attention pass 1 NR0 (non-causal, multi-row amortized KV dequant).
+/// Returns {o_partials, m_partials, l_partials}.
+MLX_API std::vector<array> turbo_flash_pass1_nr0(
+    const array& q_rot,
+    const array& key_packed,
+    const array& key_norms,
+    const array& key_codebook,
+    const array& val_packed,
+    const array& val_norms,
+    const array& val_codebook,
+    int token_count,
+    int repeat_count,
+    int num_blocks,
+    int block_size,
+    int key_bits,
+    int value_bits,
+    int dim,
+    int nr0,
+    StreamOrDevice s = {});
+
+/// TurboFlash attention pass 1 NR0 (causal, multi-row amortized KV dequant).
+/// Returns {o_partials, m_partials, l_partials}.
+MLX_API std::vector<array> turbo_flash_pass1_nr0_causal(
+    const array& q_rot,
+    const array& key_packed,
+    const array& key_norms,
+    const array& key_codebook,
+    const array& val_packed,
+    const array& val_norms,
+    const array& val_codebook,
+    int token_count,
+    int repeat_count,
+    int num_blocks,
+    int block_size,
+    int L,
+    int q_offset,
+    int key_bits,
+    int value_bits,
+    int dim,
+    int nr0,
+    StreamOrDevice s = {});
+
 /// TurboFlash attention pass 2: cross-block online softmax reduction.
 MLX_API array turbo_flash_pass2(
     const array& o_partials,

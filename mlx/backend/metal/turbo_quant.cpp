@@ -244,6 +244,99 @@ std::vector<Shape> TurboFlashPass1::output_shapes(
 }
 
 // ============================================================================
+// TurboFlashPass1NR0
+// ============================================================================
+
+void TurboFlashPass1NR0::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+
+  auto& o_partials = outputs[0];
+  auto& m_partials = outputs[1];
+  auto& l_partials = outputs[2];
+
+  auto q_rot = ensure_contiguous(inputs[0], s);
+  auto key_packed = ensure_contiguous(inputs[1], s);
+  auto key_norms = ensure_contiguous(inputs[2], s);
+  auto key_codebook = ensure_contiguous(inputs[3], s);
+  auto val_packed = ensure_contiguous(inputs[4], s);
+  auto val_norms = ensure_contiguous(inputs[5], s);
+  auto val_codebook = ensure_contiguous(inputs[6], s);
+
+  int total_q = q_rot.shape(0);
+
+  // Constants passed via inputs[7..] as scalar arrays
+  int token_count = inputs[7].item<int>();
+  int repeat_count = inputs[8].item<int>();
+  int num_blocks = inputs[9].item<int>();
+  int block_size = inputs[10].item<int>();
+
+  // Allocate outputs
+  o_partials.set_data(allocator::malloc(o_partials.nbytes()));
+  m_partials.set_data(allocator::malloc(m_partials.nbytes()));
+  l_partials.set_data(allocator::malloc(l_partials.nbytes()));
+
+  std::string kname;
+  if (causal_) {
+    kname = "turbo_flash_p1_nr0_causal_" + std::to_string(key_bits_) + "_" +
+        std::to_string(value_bits_) + "_" + std::to_string(dim_) + "_" +
+        std::to_string(nr0_);
+  } else {
+    kname = "turbo_flash_p1_nr0_" + std::to_string(key_bits_) + "_" +
+        std::to_string(value_bits_) + "_" + std::to_string(dim_) + "_" +
+        std::to_string(nr0_);
+  }
+  auto kernel = d.get_kernel(kname);
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.set_compute_pipeline_state(kernel);
+  compute_encoder.set_input_array(q_rot, 0);
+  compute_encoder.set_input_array(key_packed, 1);
+  compute_encoder.set_input_array(key_norms, 2);
+  compute_encoder.set_input_array(key_codebook, 3);
+  compute_encoder.set_input_array(val_packed, 4);
+  compute_encoder.set_input_array(val_norms, 5);
+  compute_encoder.set_input_array(val_codebook, 6);
+  compute_encoder.set_output_array(o_partials, 7);
+  compute_encoder.set_output_array(m_partials, 8);
+  compute_encoder.set_output_array(l_partials, 9);
+  compute_encoder.set_bytes(token_count, 10);
+  compute_encoder.set_bytes(repeat_count, 11);
+  compute_encoder.set_bytes(num_blocks, 12);
+  compute_encoder.set_bytes(block_size, 13);
+
+  if (causal_) {
+    int L = inputs[11].item<int>();
+    int q_offset = inputs[12].item<int>();
+    compute_encoder.set_bytes(L, 14);
+    compute_encoder.set_bytes(q_offset, 15);
+  }
+
+  // Grid Y: totalQ / nr0 (each threadgroup processes NR0 queries)
+  auto grid = MTL::Size(32, total_q / nr0_, num_blocks);
+  auto group = MTL::Size(32, 1, 1);
+  compute_encoder.dispatch_threads(grid, group);
+}
+
+bool TurboFlashPass1NR0::is_equivalent(const Primitive& other) const {
+  const TurboFlashPass1NR0& o = static_cast<const TurboFlashPass1NR0&>(other);
+  return key_bits_ == o.key_bits_ && value_bits_ == o.value_bits_ &&
+      dim_ == o.dim_ && nr0_ == o.nr0_ && causal_ == o.causal_;
+}
+
+std::vector<Shape> TurboFlashPass1NR0::output_shapes(
+    const std::vector<array>& inputs) {
+  int total_q = inputs[0].shape(0);
+  int num_blocks = inputs[9].item<int>();
+  return {
+      {total_q * num_blocks, dim_},
+      {total_q, num_blocks},
+      {total_q, num_blocks}};
+}
+
+// ============================================================================
 // TurboFlashPass2
 // ============================================================================
 

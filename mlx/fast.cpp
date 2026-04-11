@@ -1291,6 +1291,100 @@ std::vector<array> turbo_flash_pass1_causal(
        array(q_offset, int32)});
 }
 
+std::vector<array> turbo_flash_pass1_nr0(
+    const array& q_rot,
+    const array& key_packed,
+    const array& key_norms,
+    const array& key_codebook,
+    const array& val_packed,
+    const array& val_norms,
+    const array& val_codebook,
+    int token_count,
+    int repeat_count,
+    int num_blocks,
+    int block_size,
+    int key_bits,
+    int value_bits,
+    int dim,
+    int nr0,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+
+  int total_q = q_rot.shape(0);
+
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[turbo_flash_pass1_nr0] Only runs on GPU");
+  };
+
+  return array::make_arrays(
+      {{total_q * num_blocks, dim},
+       {total_q, num_blocks},
+       {total_q, num_blocks}},
+      {float32, float32, float32},
+      std::make_shared<TurboFlashPass1NR0>(
+          s, fallback, key_bits, value_bits, dim, nr0, /*causal=*/false),
+      {astype(q_rot, float32, s),
+       key_packed,
+       astype(key_norms, float32, s),
+       astype(key_codebook, float32, s),
+       val_packed,
+       astype(val_norms, float32, s),
+       astype(val_codebook, float32, s),
+       array(token_count, int32),
+       array(repeat_count, int32),
+       array(num_blocks, int32),
+       array(block_size, int32)});
+}
+
+std::vector<array> turbo_flash_pass1_nr0_causal(
+    const array& q_rot,
+    const array& key_packed,
+    const array& key_norms,
+    const array& key_codebook,
+    const array& val_packed,
+    const array& val_norms,
+    const array& val_codebook,
+    int token_count,
+    int repeat_count,
+    int num_blocks,
+    int block_size,
+    int L,
+    int q_offset,
+    int key_bits,
+    int value_bits,
+    int dim,
+    int nr0,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+
+  int total_q = q_rot.shape(0);
+
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[turbo_flash_pass1_nr0_causal] Only runs on GPU");
+  };
+
+  return array::make_arrays(
+      {{total_q * num_blocks, dim},
+       {total_q, num_blocks},
+       {total_q, num_blocks}},
+      {float32, float32, float32},
+      std::make_shared<TurboFlashPass1NR0>(
+          s, fallback, key_bits, value_bits, dim, nr0, /*causal=*/true),
+      {astype(q_rot, float32, s),
+       key_packed,
+       astype(key_norms, float32, s),
+       astype(key_codebook, float32, s),
+       val_packed,
+       astype(val_norms, float32, s),
+       astype(val_codebook, float32, s),
+       array(token_count, int32),
+       array(repeat_count, int32),
+       array(num_blocks, int32),
+       array(block_size, int32),
+       array(L, int32),
+       array(q_offset, int32)});
+}
+
 array turbo_flash_pass2(
     const array& o_partials,
     const array& m_partials,
