@@ -145,6 +145,84 @@ bool RMSNormQuantizedGEMV::is_equivalent(const Primitive& other) const {
   return eps_ == r.eps_ && group_size_ == r.group_size_;
 }
 
+// ============================================================================
+// BatchedQKVQuantizedGEMV
+// ============================================================================
+
+bool BatchedQKVQuantizedGEMV::use_fallback(Stream stream) {
+  return stream.device == Device::cpu;
+}
+
+void BatchedQKVQuantizedGEMV::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+
+  // Inputs: x, w_q, scales_q, biases_q, w_k, scales_k, biases_k, w_v, scales_v, biases_v
+  const array& x = inputs[0];
+  const array& w_q = inputs[1];
+  const array& scales_q = inputs[2];
+  const array& biases_q = inputs[3];
+  const array& w_k = inputs[4];
+  const array& scales_k = inputs[5];
+  const array& biases_k = inputs[6];
+  const array& w_v = inputs[7];
+  const array& scales_v = inputs[8];
+  const array& biases_v = inputs[9];
+
+  // Single output: concatenated [N_q + N_k + N_v]
+  auto& out = outputs[0];
+  auto K = static_cast<int>(x.shape().back());
+
+  out.set_data(allocator::malloc(out.nbytes()));
+
+  std::string kname = "batched_qkv_qgemv_" + type_to_name(out) + "_gs" +
+      std::to_string(group_size_);
+  auto kernel = d.get_kernel(kname);
+
+  // Grid covers the largest output dim across Q/K/V
+  constexpr int outputs_per_tg = 8;
+  int max_n = std::max({n_q_, n_k_, n_v_});
+  int n_tg_y = (max_n + outputs_per_tg - 1) / outputs_per_tg;
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  compute_encoder.set_input_array(x, 0);
+  // Q weights
+  compute_encoder.set_input_array(w_q, 1);
+  compute_encoder.set_input_array(scales_q, 2);
+  compute_encoder.set_input_array(biases_q, 3);
+  // K weights
+  compute_encoder.set_input_array(w_k, 4);
+  compute_encoder.set_input_array(scales_k, 5);
+  compute_encoder.set_input_array(biases_k, 6);
+  // V weights
+  compute_encoder.set_input_array(w_v, 7);
+  compute_encoder.set_input_array(scales_v, 8);
+  compute_encoder.set_input_array(biases_v, 9);
+  // Output (single contiguous buffer)
+  compute_encoder.set_output_array(out, 10);
+  // Dimensions
+  compute_encoder.set_bytes(n_q_, 11);
+  compute_encoder.set_bytes(n_k_, 12);
+  compute_encoder.set_bytes(n_v_, 13);
+  compute_encoder.set_bytes(K, 14);
+
+  // z=3: one z-slice per matrix (Q, K, V), all run in parallel
+  compute_encoder.dispatch_threadgroups(
+      MTL::Size(1, n_tg_y, 3),
+      MTL::Size(64, 1, 1));
+}
+
+bool BatchedQKVQuantizedGEMV::is_equivalent(const Primitive& other) const {
+  const BatchedQKVQuantizedGEMV& r =
+      static_cast<const BatchedQKVQuantizedGEMV&>(other);
+  return group_size_ == r.group_size_ &&
+         n_q_ == r.n_q_ && n_k_ == r.n_k_ && n_v_ == r.n_v_;
+}
+
 bool RMSNormResidual::use_fallback(Stream s) {
   return s.device == Device::cpu;
 }

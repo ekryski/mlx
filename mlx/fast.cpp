@@ -270,6 +270,64 @@ array rms_norm_qgemv(
        astype(biases, out_type, s)})[0];
 }
 
+array batched_qkv_qgemv(
+    const array& x,
+    const array& w_q,
+    const array& scales_q,
+    const array& biases_q,
+    const array& w_k,
+    const array& scales_k,
+    const array& biases_k,
+    const array& w_v,
+    const array& scales_v,
+    const array& biases_v,
+    int group_size,
+    StreamOrDevice s_) {
+
+  int K = x.shape().back();
+  int N_q = w_q.shape(0);
+  int N_k = w_k.shape(0);
+  int N_v = w_v.shape(0);
+  auto out_type = x.dtype();
+  auto s = to_stream(s_);
+
+  // Fallback: 3 separate quantized_matmul, concatenated
+  auto fallback = [group_size, N_q, N_k, N_v, s](const std::vector<array>& inputs) {
+    auto q = quantized_matmul(
+        inputs[0], inputs[1], inputs[2], inputs[3],
+        true, group_size, 4, "affine", s);
+    auto k = quantized_matmul(
+        inputs[0], inputs[4], inputs[5], inputs[6],
+        true, group_size, 4, "affine", s);
+    auto v = quantized_matmul(
+        inputs[0], inputs[7], inputs[8], inputs[9],
+        true, group_size, 4, "affine", s);
+    return std::vector<array>{concatenate({q, k, v}, -1, s)};
+  };
+
+  // Output shape: [..., N_q + N_k + N_v]
+  auto out_shape = x.shape();
+  out_shape.back() = N_q + N_k + N_v;
+
+  if (!BatchedQKVQuantizedGEMV::use_fallback(s)) {
+    return array(
+        std::move(out_shape),
+        out_type,
+        std::make_shared<BatchedQKVQuantizedGEMV>(
+            s, fallback, group_size, N_q, N_k, N_v),
+        {astype(x, out_type, s),
+         w_q, astype(scales_q, out_type, s), astype(biases_q, out_type, s),
+         w_k, astype(scales_k, out_type, s), astype(biases_k, out_type, s),
+         w_v, astype(scales_v, out_type, s), astype(biases_v, out_type, s)});
+  }
+
+  return fallback(
+      {astype(x, out_type, s),
+       w_q, astype(scales_q, out_type, s), astype(biases_q, out_type, s),
+       w_k, astype(scales_k, out_type, s), astype(biases_k, out_type, s),
+       w_v, astype(scales_v, out_type, s), astype(biases_v, out_type, s)})[0];
+}
+
 std::vector<array> RMSNorm::vjp(
     const std::vector<array>& primals,
     const std::vector<array>& cotangents,

@@ -104,6 +104,43 @@ class RMSNormQuantizedGEMV : public Custom {
   int group_size_;
 };
 
+class BatchedQKVQuantizedGEMV : public Custom {
+ public:
+  BatchedQKVQuantizedGEMV(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int group_size,
+      int n_q,
+      int n_k,
+      int n_v)
+      : Custom(stream, std::move(fallback)),
+        group_size_(group_size),
+        n_q_(n_q),
+        n_k_(n_k),
+        n_v_(n_v) {}
+
+  static bool use_fallback(Stream stream);
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("NYI");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(BatchedQKVQuantizedGEMV)
+  bool is_equivalent(const Primitive& other) const override;
+  DEFINE_INPUT_OUTPUT_SHAPE()
+
+  auto state() const {
+    return std::make_tuple(nullptr, group_size_, n_q_, n_k_, n_v_);
+  }
+
+ private:
+  int group_size_;
+  int n_q_, n_k_, n_v_;
+};
+
 class RMSNormResidual : public Custom {
  public:
   RMSNormResidual(

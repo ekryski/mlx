@@ -43,6 +43,20 @@ MLX_API array rms_norm_qgemv(
     int group_size,
     StreamOrDevice s = {});
 
+MLX_API array batched_qkv_qgemv(
+    const array& x,
+    const array& w_q,
+    const array& scales_q,
+    const array& biases_q,
+    const array& w_k,
+    const array& scales_k,
+    const array& biases_k,
+    const array& w_v,
+    const array& scales_v,
+    const array& biases_v,
+    int group_size,
+    StreamOrDevice s = {});
+
 MLX_API array layer_norm(
     const array& x,
     const std::optional<array>& weight,

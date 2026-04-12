@@ -17,9 +17,9 @@
     instantiate_attn(iname, itype, 64, 64, 128, 4, 1, mname, mtype) \
     instantiate_attn(iname, itype, 64, 64,  64, 4, 1, mname, mtype)
 
-// BD=256: BQ=32, WM=2 for smaller output tile + better occupancy, float16/bfloat16 only
+// BD=256: BQ=32, BK=16, WM=4 — matches BD≤128 parallelism. 28.5KB tgp mem fits 32KB.
 #define instantiate_attn_shapes_helper_bd256(iname, itype, mname, mtype)  \
-    instantiate_attn(iname, itype, 32, 16, 256, 2, 1, mname, mtype)
+    instantiate_attn(iname, itype, 32, 16, 256, 4, 1, mname, mtype)
 
 #define instantiate_attn_mask_helper(iname, itype) \
     instantiate_attn_shapes_helper(iname, itype, iname, itype) \

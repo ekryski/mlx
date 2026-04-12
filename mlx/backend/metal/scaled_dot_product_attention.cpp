@@ -33,7 +33,7 @@ void sdpa_full_self_attention_nax(
   if (bd <= 128) {
     wm = 4; wn = 1; bq = 64; bk = 32;
   } else if (bd <= 256) {
-    wm = 2; wn = 1; bq = 32; bk = 16;
+    wm = 4; wn = 1; bq = 32; bk = 16;
   } else {
     wm = 1; wn = 1; bq = 8; bk = 8;
   }
@@ -197,13 +197,13 @@ void sdpa_full_self_attention_metal(
   int bd = q.shape(-1);
   // Tile sizes tuned per head dimension:
   //   BD≤128: BQ=32 BK=16 WM=4 (standard, good occupancy)
-  //   BD=256:  BQ=16 BK=16 WM=2 (smaller tiles, moderate occupancy)
+  //   BD=256:  BQ=32 BK=16 WM=4 (same ratios as BD≤128; 28.5KB tgp mem fits 32KB limit)
   //   BD=512:  BQ=8  BK=8  WM=1 (minimal tiles, low occupancy but avoids L×L materialization)
   int wm, wn, bq, bk;
   if (bd <= 128) {
     wm = 4; wn = 1; bq = 32; bk = 16;
   } else if (bd <= 256) {
-    wm = 2; wn = 1; bq = 16; bk = 16;
+    wm = 4; wn = 1; bq = 32; bk = 16;
   } else {
     wm = 1; wn = 1; bq = 8; bk = 8;
   }
