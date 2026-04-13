@@ -223,6 +223,119 @@ bool BatchedQKVQuantizedGEMV::is_equivalent(const Primitive& other) const {
          n_q_ == r.n_q_ && n_k_ == r.n_k_ && n_v_ == r.n_v_;
 }
 
+// ============================================================================
+// WarpMoeGateUp
+// ============================================================================
+
+bool WarpMoeGateUp::use_fallback(Stream s) { return s.device == Device::cpu; }
+
+void WarpMoeGateUp::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+
+  // Inputs: x, w, scales, biases, indices
+  const array& x = inputs[0];       // [inputDims] flattened
+  const array& w = inputs[1];       // [numExperts, 2*H, K_packed]
+  const array& sc = inputs[2];      // [numExperts, 2*H, K/gs]
+  const array& bi = inputs[3];      // [numExperts, 2*H, K/gs]
+  const array& indices = inputs[4]; // [topK]
+
+  auto& out = outputs[0];  // [topK, hiddenDims]
+  out.set_data(allocator::malloc(out.nbytes()));
+
+  int in_vec_size = static_cast<int>(x.size());
+  int top_k = static_cast<int>(indices.size());
+
+  std::string kname = "warp_moe_gate_up_" + type_to_name(out) + "_gs" +
+      std::to_string(group_size_) + "_act" + std::to_string(activation_type_);
+  auto kernel = d.get_kernel(kname);
+
+  constexpr int outputs_per_tg = 8;
+  int n_tg_y = (hidden_dims_ + outputs_per_tg - 1) / outputs_per_tg;
+
+  auto& ce = metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+  ce.set_input_array(x, 0);
+  ce.set_input_array(w, 1);
+  ce.set_input_array(sc, 2);
+  ce.set_input_array(bi, 3);
+  ce.set_input_array(indices, 4);
+  ce.set_output_array(out, 5);
+  ce.set_bytes(in_vec_size, 6);
+  ce.set_bytes(hidden_dims_, 7);
+  ce.set_bytes(top_k, 8);
+
+  ce.dispatch_threadgroups(
+      MTL::Size(1, n_tg_y, top_k),  // z = topK experts in parallel
+      MTL::Size(64, 1, 1));
+}
+
+bool WarpMoeGateUp::is_equivalent(const Primitive& other) const {
+  const WarpMoeGateUp& r = static_cast<const WarpMoeGateUp&>(other);
+  return group_size_ == r.group_size_ &&
+         hidden_dims_ == r.hidden_dims_ &&
+         activation_type_ == r.activation_type_;
+}
+
+// ============================================================================
+// WarpMoeDown
+// ============================================================================
+
+bool WarpMoeDown::use_fallback(Stream s) { return s.device == Device::cpu; }
+
+void WarpMoeDown::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+
+  // Inputs: activated, w, scales, biases, indices, scores
+  const array& activated = inputs[0]; // [topK, hiddenDims]
+  const array& w = inputs[1];         // [numExperts, outDims, H_packed]
+  const array& sc = inputs[2];
+  const array& bi = inputs[3];
+  const array& indices = inputs[4];   // [topK]
+  const array& scores = inputs[5];    // [topK]
+
+  auto& out = outputs[0];  // [outDims]
+  out.set_data(allocator::malloc(out.nbytes()));
+
+  int top_k = static_cast<int>(indices.size());
+
+  std::string kname = "warp_moe_down_" + type_to_name(out) + "_gs" +
+      std::to_string(group_size_);
+  auto kernel = d.get_kernel(kname);
+
+  constexpr int outputs_per_tg = 8;
+  int n_tg_y = (out_dims_ + outputs_per_tg - 1) / outputs_per_tg;
+
+  auto& ce = metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+  ce.set_input_array(activated, 0);
+  ce.set_input_array(w, 1);
+  ce.set_input_array(sc, 2);
+  ce.set_input_array(bi, 3);
+  ce.set_input_array(indices, 4);
+  ce.set_input_array(scores, 5);
+  ce.set_output_array(out, 6);
+  ce.set_bytes(hidden_dims_, 7);
+  ce.set_bytes(out_dims_, 8);
+  ce.set_bytes(top_k, 9);
+
+  ce.dispatch_threadgroups(
+      MTL::Size(1, n_tg_y, 1),
+      MTL::Size(64, 1, 1));
+}
+
+bool WarpMoeDown::is_equivalent(const Primitive& other) const {
+  const WarpMoeDown& r = static_cast<const WarpMoeDown&>(other);
+  return group_size_ == r.group_size_ &&
+         hidden_dims_ == r.hidden_dims_ &&
+         out_dims_ == r.out_dims_;
+}
+
 bool RMSNormResidual::use_fallback(Stream s) {
   return s.device == Device::cpu;
 }

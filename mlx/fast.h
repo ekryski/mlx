@@ -57,6 +57,29 @@ MLX_API array batched_qkv_qgemv(
     int group_size,
     StreamOrDevice s = {});
 
+MLX_API array warp_moe_gate_up(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    const array& indices,
+    int group_size,
+    int hidden_dims,
+    int activation_type,
+    StreamOrDevice s = {});
+
+MLX_API array warp_moe_down(
+    const array& activated,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    const array& indices,
+    const array& scores,
+    int group_size,
+    int hidden_dims,
+    int out_dims,
+    StreamOrDevice s = {});
+
 MLX_API array layer_norm(
     const array& x,
     const std::optional<array>& weight,

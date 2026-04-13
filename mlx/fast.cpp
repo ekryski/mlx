@@ -328,6 +328,88 @@ array batched_qkv_qgemv(
        w_v, astype(scales_v, out_type, s), astype(biases_v, out_type, s)})[0];
 }
 
+// ============================================================================
+// Warp MoE Gate+Up (fused gate+up projection with activation)
+// ============================================================================
+array warp_moe_gate_up(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    const array& indices,
+    int group_size,
+    int hidden_dims,
+    int activation_type,
+    StreamOrDevice s_) {
+
+  auto out_type = x.dtype();
+  auto s = to_stream(s_);
+  int top_k = indices.shape(0);
+
+  auto fallback = [group_size, hidden_dims, activation_type, s](
+      const std::vector<array>& inputs) -> std::vector<array> {
+    // Fallback: use gatherQuantizedMM + split + activation
+    throw std::runtime_error("WarpMoeGateUp fallback NYI — use gatherQuantizedMM path");
+  };
+
+  Shape out_shape = {top_k, hidden_dims};
+
+  if (!WarpMoeGateUp::use_fallback(s)) {
+    return array(
+        std::move(out_shape),
+        out_type,
+        std::make_shared<WarpMoeGateUp>(
+            s, fallback, group_size, hidden_dims, activation_type),
+        {flatten(astype(x, out_type, s)),
+         w, astype(scales, out_type, s), astype(biases, out_type, s),
+         astype(indices, int32, s)});
+  }
+  return fallback({flatten(astype(x, out_type, s)),
+      w, astype(scales, out_type, s), astype(biases, out_type, s),
+      astype(indices, int32, s)})[0];
+}
+
+// ============================================================================
+// Warp MoE Down (fused down projection with routing weight folding)
+// ============================================================================
+array warp_moe_down(
+    const array& activated,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    const array& indices,
+    const array& scores,
+    int group_size,
+    int hidden_dims,
+    int out_dims,
+    StreamOrDevice s_) {
+
+  auto out_type = activated.dtype();
+  auto s = to_stream(s_);
+
+  auto fallback = [group_size, hidden_dims, out_dims, s](
+      const std::vector<array>& inputs) -> std::vector<array> {
+    throw std::runtime_error("WarpMoeDown fallback NYI — use gatherQuantizedMM path");
+  };
+
+  Shape out_shape = {out_dims};
+
+  if (!WarpMoeDown::use_fallback(s)) {
+    return array(
+        std::move(out_shape),
+        out_type,
+        std::make_shared<WarpMoeDown>(
+            s, fallback, group_size, hidden_dims, out_dims),
+        {astype(activated, out_type, s),
+         w, astype(scales, out_type, s), astype(biases, out_type, s),
+         astype(indices, int32, s),
+         astype(scores, out_type, s)});
+  }
+  return fallback({astype(activated, out_type, s),
+      w, astype(scales, out_type, s), astype(biases, out_type, s),
+      astype(indices, int32, s), astype(scores, out_type, s)})[0];
+}
+
 std::vector<array> RMSNorm::vjp(
     const std::vector<array>& primals,
     const std::vector<array>& cotangents,

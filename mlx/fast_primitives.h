@@ -141,6 +141,62 @@ class BatchedQKVQuantizedGEMV : public Custom {
   int n_q_, n_k_, n_v_;
 };
 
+class WarpMoeGateUp : public Custom {
+ public:
+  WarpMoeGateUp(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int group_size,
+      int hidden_dims,
+      int activation_type)
+      : Custom(stream, std::move(fallback)),
+        group_size_(group_size),
+        hidden_dims_(hidden_dims),
+        activation_type_(activation_type) {}
+
+  static bool use_fallback(Stream stream);
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs) override {
+    throw std::runtime_error("NYI");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) override;
+  DEFINE_NAME(WarpMoeGateUp)
+  bool is_equivalent(const Primitive& other) const override;
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  auto state() const { return std::make_tuple(nullptr, group_size_, hidden_dims_, activation_type_); }
+ private:
+  int group_size_;
+  int hidden_dims_;
+  int activation_type_;
+};
+
+class WarpMoeDown : public Custom {
+ public:
+  WarpMoeDown(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int group_size,
+      int hidden_dims,
+      int out_dims)
+      : Custom(stream, std::move(fallback)),
+        group_size_(group_size),
+        hidden_dims_(hidden_dims),
+        out_dims_(out_dims) {}
+
+  static bool use_fallback(Stream stream);
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs) override {
+    throw std::runtime_error("NYI");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) override;
+  DEFINE_NAME(WarpMoeDown)
+  bool is_equivalent(const Primitive& other) const override;
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  auto state() const { return std::make_tuple(nullptr, group_size_, hidden_dims_, out_dims_); }
+ private:
+  int group_size_;
+  int hidden_dims_;
+  int out_dims_;
+};
+
 class RMSNormResidual : public Custom {
  public:
   RMSNormResidual(
