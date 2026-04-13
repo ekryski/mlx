@@ -20,9 +20,20 @@ void SSMStep::eval_gpu(
   auto& out = outputs[0];
   auto& state_out = outputs[1];
 
-  // Allocate output buffers
+  // Allocate main output
   out.set_data(allocator::malloc(out.nbytes()));
-  state_out.set_data(allocator::malloc(state_out.nbytes()));
+
+  // The kernel reads i_state[idx] then writes o_state[idx] per element
+  // with unique indices per thread, so the two can safely alias.
+  // Donate state_in's buffer to avoid a second allocation.
+  const auto& state_in = inputs[6];
+  if (state_in.is_donatable() &&
+      state_in.flags().row_contiguous &&
+      state_in.size() == state_out.size()) {
+    state_out.copy_shared_buffer(state_in);
+  } else {
+    state_out.set_data(allocator::malloc(state_out.nbytes()));
+  }
 
   // Build kernel name: ssm_step_{type}_{Dh}_{Ds}_{H}_{G}
   std::string tname = type_to_name(out.dtype());
@@ -41,7 +52,6 @@ void SSMStep::eval_gpu(
   const auto& C = inputs[3];
   const auto& D_arr = inputs[4];
   const auto& dt = inputs[5];
-  const auto& state_in = inputs[6];
 
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);

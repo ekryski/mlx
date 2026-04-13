@@ -1674,12 +1674,17 @@ std::vector<array> gated_delta_step(
     inputs.push_back(*mask);
   }
 
-  return array::make_arrays(
+  auto outputs = array::make_arrays(
       {std::move(y_shape), std::move(state_shape)},
       {out_type, out_type},
       std::make_shared<GatedDeltaStep>(
           s, fallback, fused, has_mask, T, Dk, Dv, Hk, Hv),
       std::move(inputs));
+  // Break sibling bond: state_out pins T-proportional y, causing
+  // peak ∝ layers × context.  Async eval detaches both outputs
+  // without blocking the CPU.
+  async_eval(outputs);
+  return outputs;
 }
 
 std::vector<array> gated_delta_step_fused(
@@ -1724,12 +1729,15 @@ std::vector<array> gated_delta_step_fused(
     inputs.push_back(*mask);
   }
 
-  return array::make_arrays(
+  auto outputs = array::make_arrays(
       {std::move(y_shape), std::move(state_shape)},
       {out_type, out_type},
       std::make_shared<GatedDeltaStep>(
           s, fallback, /*fused=*/true, has_mask, T, Dk, Dv, Hk, Hv),
       std::move(inputs));
+  // Break sibling bond (see gated_delta_step comment above).
+  async_eval(outputs);
+  return outputs;
 }
 
 std::vector<array> ssm_step(
@@ -1767,11 +1775,14 @@ std::vector<array> ssm_step(
       astype(dt, out_type, s),
       astype(state, out_type, s)};
 
-  return array::make_arrays(
+  auto outputs = array::make_arrays(
       {std::move(out_shape), std::move(state_shape)},
       {out_type, out_type},
       std::make_shared<SSMStep>(s, fallback, Dh, Ds, H, G),
       std::move(inputs));
+  // Break sibling bond (see gated_delta_step comment above).
+  async_eval(outputs);
+  return outputs;
 }
 
 } // namespace mlx::core::fast

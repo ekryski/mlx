@@ -20,9 +20,21 @@ void GatedDeltaStep::eval_gpu(
   auto& y = outputs[0];
   auto& state_out = outputs[1];
 
-  // Allocate output buffers
+  // Allocate y output
   y.set_data(allocator::malloc(y.nbytes()));
-  state_out.set_data(allocator::malloc(state_out.nbytes()));
+
+  // The kernel loads state_in fully into registers before the T-loop
+  // and writes state_out from registers after it, so the two can safely
+  // alias the same device buffer.  Donate state_in when possible to
+  // avoid a second state-sized allocation per layer per token.
+  const auto& state_in = inputs[fused_ ? 7 : 5];
+  if (state_in.is_donatable() &&
+      state_in.flags().row_contiguous &&
+      state_in.size() == state_out.size()) {
+    state_out.copy_shared_buffer(state_in);
+  } else {
+    state_out.set_data(allocator::malloc(state_out.nbytes()));
+  }
 
   // Build kernel name from template parameters
   std::string tname = type_to_name(y.dtype());

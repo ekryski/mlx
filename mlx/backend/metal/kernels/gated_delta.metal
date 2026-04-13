@@ -253,3 +253,13 @@ instantiate_gdn(half, float16, 128, 128, 8, 8)
 instantiate_gdn(bfloat16_t, bfloat16, 128, 128, 8, 8)
 instantiate_gdn(half, float16, 64, 64, 8, 8)
 instantiate_gdn(bfloat16_t, bfloat16, 64, 64, 8, 8)
+
+// Qwen3.5-35B: Dk=128, Dv=128, numHeads=16, numKVHeads=2
+instantiate_gdn(half, float16, 128, 128, 16, 32)
+instantiate_gdn(bfloat16_t, bfloat16, 128, 128, 16, 32)
+
+// Qwen3.5 dense models: Dk=128, Dv=128, Hk=16, Hv=16 (0.8B-9B), Hv=48 (27B)
+instantiate_gdn(half, float16, 128, 128, 16, 16)
+instantiate_gdn(bfloat16_t, bfloat16, 128, 128, 16, 16)
+instantiate_gdn(half, float16, 128, 128, 16, 48)
+instantiate_gdn(bfloat16_t, bfloat16, 128, 128, 16, 48)
