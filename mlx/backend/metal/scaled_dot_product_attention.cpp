@@ -178,6 +178,7 @@ void sdpa_full_self_attention_metal(
     const std::optional<array>& mask,
     const std::optional<array>& sinks) {
   if (metal::is_nax_available() && q.shape(3) != 80 &&
+      q.shape(3) <= 128 &&  // NAX BD=256 has zero-length array bug in NAXTile
       (env::enable_tf32() || q.dtype() != float32)) {
     return sdpa_full_self_attention_nax(
         /* const Stream& s = */ s,
