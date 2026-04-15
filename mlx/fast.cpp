@@ -120,6 +120,296 @@ array rms_norm(
   return fallback({x, passed_weight})[0];
 }
 
+array rms_norm_residual(
+    const array& x,
+    const array& residual,
+    const array& weight,
+    float eps,
+    StreamOrDevice s_ /* = {} */) {
+  if (x.ndim() < 1) {
+    throw std::invalid_argument(
+        "[rms_norm_residual] Input must have at least 1 dimension");
+  }
+
+  auto out_type = result_type(x, weight);
+  if (!issubdtype(out_type, floating)) {
+    throw std::invalid_argument(
+        "[rms_norm_residual] Input must be floating point");
+  }
+
+  auto s = to_stream(s_);
+
+  auto fallback = [eps, s](const std::vector<array>& inputs) {
+    auto normed = rms_norm(inputs[0], inputs[2], eps, s);
+    auto result = add(inputs[1], normed, s);
+    return std::vector<array>{result};
+  };
+
+  if (!RMSNormResidual::use_fallback(s)) {
+    return array(
+        x.shape(),
+        out_type,
+        std::make_shared<RMSNormResidual>(s, fallback, eps),
+        {astype(x, out_type, s),
+         astype(residual, out_type, s),
+         astype(weight, out_type, s)});
+  }
+  return fallback(
+      {astype(x, out_type, s),
+       astype(residual, out_type, s),
+       astype(weight, out_type, s)})[0];
+}
+
+array rms_norm_rope(
+    const array& x,
+    const array& weight,
+    const array& inv_freqs,
+    float eps,
+    int offset,
+    int n_heads,
+    int seq_len,
+    StreamOrDevice s_ /* = {} */) {
+  if (x.ndim() < 2) {
+    throw std::invalid_argument(
+        "[rms_norm_rope] Input must have at least 2 dimensions");
+  }
+
+  auto out_type = result_type(x, weight);
+  if (!issubdtype(out_type, floating)) {
+    throw std::invalid_argument(
+        "[rms_norm_rope] Input must be floating point");
+  }
+
+  auto s = to_stream(s_);
+
+  auto fallback = [eps, offset, n_heads, seq_len, s](
+                      const std::vector<array>& inputs) {
+    // Fallback: separate rms_norm + rope via MLX ops
+    auto normed = rms_norm(inputs[0], inputs[1], eps, s);
+    // Transpose [B, L, H, D] -> [B, H, L, D] for RoPE, then back
+    auto transposed = transpose(normed, {0, 2, 1, 3}, s);
+    // RoPE with custom frequencies
+    auto rotated = rope(
+        transposed,
+        transposed.shape(-1),
+        false,  // non-traditional
+        0.0f,   // base (unused when freqs provided)
+        1.0f,   // scale
+        offset,
+        inputs[2],  // inv_freqs as freqs (RoPE will invert them)
+        s);
+    auto result = transpose(rotated, {0, 2, 1, 3}, s);
+    return std::vector<array>{result};
+  };
+
+  if (!RMSNormRoPE::use_fallback(s)) {
+    return array(
+        x.shape(),
+        out_type,
+        std::make_shared<RMSNormRoPE>(
+            s, fallback, eps, n_heads, seq_len, offset),
+        {astype(x, out_type, s),
+         astype(weight, out_type, s),
+         astype(inv_freqs, float32, s)});
+  }
+  return fallback(
+      {astype(x, out_type, s),
+       astype(weight, out_type, s),
+       astype(inv_freqs, float32, s)})[0];
+}
+
+array rms_norm_qgemv(
+    const array& x,
+    const array& norm_weight,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    float eps,
+    int group_size,
+    StreamOrDevice s_ /* = {} */) {
+  if (x.ndim() < 1) {
+    throw std::invalid_argument(
+        "[rms_norm_qgemv] Input must have at least 1 dimension");
+  }
+
+  int K = x.shape().back();
+  int N = w.shape(0);
+  auto out_type = x.dtype();
+
+  auto s = to_stream(s_);
+
+  // Fallback: separate rms_norm + quantized_matmul
+  auto fallback = [eps, group_size, s](const std::vector<array>& inputs) {
+    auto normed = rms_norm(inputs[0], inputs[1], eps, s);
+    auto result = quantized_matmul(
+        normed, inputs[2], inputs[3], inputs[4],
+        true, group_size, 4, "affine", s);
+    return std::vector<array>{result};
+  };
+
+  // Output shape: replace last dim K with N
+  auto out_shape = x.shape();
+  out_shape.back() = N;
+
+  if (!RMSNormQuantizedGEMV::use_fallback(s)) {
+    return array(
+        std::move(out_shape),
+        out_type,
+        std::make_shared<RMSNormQuantizedGEMV>(s, fallback, eps, group_size),
+        {astype(x, out_type, s),
+         astype(norm_weight, out_type, s),
+         w,
+         astype(scales, out_type, s),
+         astype(biases, out_type, s)});
+  }
+  return fallback(
+      {astype(x, out_type, s),
+       astype(norm_weight, out_type, s),
+       w,
+       astype(scales, out_type, s),
+       astype(biases, out_type, s)})[0];
+}
+
+array batched_qkv_qgemv(
+    const array& x,
+    const array& w_q,
+    const array& scales_q,
+    const array& biases_q,
+    const array& w_k,
+    const array& scales_k,
+    const array& biases_k,
+    const array& w_v,
+    const array& scales_v,
+    const array& biases_v,
+    int group_size,
+    StreamOrDevice s_) {
+
+  int K = x.shape().back();
+  int N_q = w_q.shape(0);
+  int N_k = w_k.shape(0);
+  int N_v = w_v.shape(0);
+  auto out_type = x.dtype();
+  auto s = to_stream(s_);
+
+  // Fallback: 3 separate quantized_matmul, concatenated
+  auto fallback = [group_size, N_q, N_k, N_v, s](const std::vector<array>& inputs) {
+    auto q = quantized_matmul(
+        inputs[0], inputs[1], inputs[2], inputs[3],
+        true, group_size, 4, "affine", s);
+    auto k = quantized_matmul(
+        inputs[0], inputs[4], inputs[5], inputs[6],
+        true, group_size, 4, "affine", s);
+    auto v = quantized_matmul(
+        inputs[0], inputs[7], inputs[8], inputs[9],
+        true, group_size, 4, "affine", s);
+    return std::vector<array>{concatenate({q, k, v}, -1, s)};
+  };
+
+  // Output shape: [..., N_q + N_k + N_v]
+  auto out_shape = x.shape();
+  out_shape.back() = N_q + N_k + N_v;
+
+  if (!BatchedQKVQuantizedGEMV::use_fallback(s)) {
+    return array(
+        std::move(out_shape),
+        out_type,
+        std::make_shared<BatchedQKVQuantizedGEMV>(
+            s, fallback, group_size, N_q, N_k, N_v),
+        {astype(x, out_type, s),
+         w_q, astype(scales_q, out_type, s), astype(biases_q, out_type, s),
+         w_k, astype(scales_k, out_type, s), astype(biases_k, out_type, s),
+         w_v, astype(scales_v, out_type, s), astype(biases_v, out_type, s)});
+  }
+
+  return fallback(
+      {astype(x, out_type, s),
+       w_q, astype(scales_q, out_type, s), astype(biases_q, out_type, s),
+       w_k, astype(scales_k, out_type, s), astype(biases_k, out_type, s),
+       w_v, astype(scales_v, out_type, s), astype(biases_v, out_type, s)})[0];
+}
+
+// ============================================================================
+// Warp MoE Gate+Up (fused gate+up projection with activation)
+// ============================================================================
+array warp_moe_gate_up(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    const array& indices,
+    int group_size,
+    int hidden_dims,
+    int activation_type,
+    StreamOrDevice s_) {
+
+  auto out_type = x.dtype();
+  auto s = to_stream(s_);
+  int top_k = indices.shape(0);
+
+  auto fallback = [group_size, hidden_dims, activation_type, s](
+      const std::vector<array>& inputs) -> std::vector<array> {
+    // Fallback: use gatherQuantizedMM + split + activation
+    throw std::runtime_error("WarpMoeGateUp fallback NYI — use gatherQuantizedMM path");
+  };
+
+  Shape out_shape = {top_k, hidden_dims};
+
+  if (!WarpMoeGateUp::use_fallback(s)) {
+    return array(
+        std::move(out_shape),
+        out_type,
+        std::make_shared<WarpMoeGateUp>(
+            s, fallback, group_size, hidden_dims, activation_type),
+        {flatten(astype(x, out_type, s)),
+         w, astype(scales, out_type, s), astype(biases, out_type, s),
+         astype(indices, int32, s)});
+  }
+  return fallback({flatten(astype(x, out_type, s)),
+      w, astype(scales, out_type, s), astype(biases, out_type, s),
+      astype(indices, int32, s)})[0];
+}
+
+// ============================================================================
+// Warp MoE Down (fused down projection with routing weight folding)
+// ============================================================================
+array warp_moe_down(
+    const array& activated,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    const array& indices,
+    const array& scores,
+    int group_size,
+    int hidden_dims,
+    int out_dims,
+    StreamOrDevice s_) {
+
+  auto out_type = activated.dtype();
+  auto s = to_stream(s_);
+
+  auto fallback = [group_size, hidden_dims, out_dims, s](
+      const std::vector<array>& inputs) -> std::vector<array> {
+    throw std::runtime_error("WarpMoeDown fallback NYI — use gatherQuantizedMM path");
+  };
+
+  Shape out_shape = {out_dims};
+
+  if (!WarpMoeDown::use_fallback(s)) {
+    return array(
+        std::move(out_shape),
+        out_type,
+        std::make_shared<WarpMoeDown>(
+            s, fallback, group_size, hidden_dims, out_dims),
+        {astype(activated, out_type, s),
+         w, astype(scales, out_type, s), astype(biases, out_type, s),
+         astype(indices, int32, s),
+         astype(scores, out_type, s)});
+  }
+  return fallback({astype(activated, out_type, s),
+      w, astype(scales, out_type, s), astype(biases, out_type, s),
+      astype(indices, int32, s), astype(scores, out_type, s)})[0];
+}
+
 std::vector<array> RMSNorm::vjp(
     const std::vector<array>& primals,
     const std::vector<array>& cotangents,
@@ -953,6 +1243,546 @@ std::vector<Shape> Quantize::output_shapes(const std::vector<array>& inputs) {
 bool ConvertFP8::is_equivalent(const Primitive& other) const {
   const ConvertFP8& a_other = static_cast<const ConvertFP8&>(other);
   return to_fp8_ == a_other.to_fp8_;
+}
+
+// ============================================================================
+// TurboQuant API implementations
+// ============================================================================
+
+namespace {
+
+inline int turbo_packed_width(int dim, int bits) {
+  return (dim * bits + 31) / 32;
+}
+
+} // namespace
+
+array turbo_score(
+    const array& q_rot,
+    const array& packed,
+    const array& norms,
+    const array& codebook,
+    int token_count,
+    int repeat_count,
+    int bits,
+    int dim,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+
+  int total_q = q_rot.shape(0);
+
+  // Fallback: no CPU implementation
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[turbo_score] Only runs on GPU");
+  };
+
+  return array(
+      {total_q, token_count},
+      float32,
+      std::make_shared<TurboScore>(s, fallback, bits, dim),
+      {astype(q_rot, float32, s),
+       packed,
+       astype(norms, float32, s),
+       astype(codebook, float32, s)});
+}
+
+std::vector<array> turbo_encode(
+    const array& input,
+    const array& rotation,
+    const array& boundaries,
+    const array& codebook,
+    int bits,
+    int dim,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+
+  int num_rows = input.shape(0);
+  int pw = turbo_packed_width(dim, bits);
+
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[turbo_encode] Only runs on GPU");
+  };
+
+  return array::make_arrays(
+      {{num_rows, pw}, {num_rows}},
+      {uint32, float32},
+      std::make_shared<TurboEncode>(s, fallback, bits, dim, /*use_wht=*/false),
+      {astype(input, float32, s),
+       astype(rotation, float32, s),
+       astype(boundaries, float32, s),
+       astype(codebook, float32, s)});
+}
+
+std::vector<array> turbo_encode_wht(
+    const array& input,
+    const array& wht_signs,
+    const array& boundaries,
+    int bits,
+    int dim,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+
+  int num_rows = input.shape(0);
+  int pw = turbo_packed_width(dim, bits);
+
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[turbo_encode_wht] Only runs on GPU");
+  };
+
+  return array::make_arrays(
+      {{num_rows, pw}, {num_rows}},
+      {uint32, float32},
+      std::make_shared<TurboEncode>(s, fallback, bits, dim, /*use_wht=*/true),
+      {astype(input, float32, s),
+       astype(wht_signs, float32, s),
+       astype(boundaries, float32, s)});
+}
+
+std::vector<array> turbo_flash_pass1(
+    const array& q_rot,
+    const array& key_packed,
+    const array& key_norms,
+    const array& key_codebook,
+    const array& val_packed,
+    const array& val_norms,
+    const array& val_codebook,
+    int token_count,
+    int repeat_count,
+    int num_blocks,
+    int block_size,
+    int key_bits,
+    int value_bits,
+    int dim,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+
+  int total_q = q_rot.shape(0);
+
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[turbo_flash_pass1] Only runs on GPU");
+  };
+
+  // Pack scalar constants as 0-d int32 arrays so they become graph inputs
+  return array::make_arrays(
+      {{total_q * num_blocks, dim},
+       {total_q, num_blocks},
+       {total_q, num_blocks}},
+      {float32, float32, float32},
+      std::make_shared<TurboFlashPass1>(
+          s, fallback, key_bits, value_bits, dim, /*causal=*/false),
+      {astype(q_rot, float32, s),
+       key_packed,
+       astype(key_norms, float32, s),
+       astype(key_codebook, float32, s),
+       val_packed,
+       astype(val_norms, float32, s),
+       astype(val_codebook, float32, s),
+       array(token_count, int32),
+       array(repeat_count, int32),
+       array(num_blocks, int32),
+       array(block_size, int32)});
+}
+
+std::vector<array> turbo_flash_pass1_causal(
+    const array& q_rot,
+    const array& key_packed,
+    const array& key_norms,
+    const array& key_codebook,
+    const array& val_packed,
+    const array& val_norms,
+    const array& val_codebook,
+    int token_count,
+    int repeat_count,
+    int num_blocks,
+    int block_size,
+    int L,
+    int q_offset,
+    int key_bits,
+    int value_bits,
+    int dim,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+
+  int total_q = q_rot.shape(0);
+
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[turbo_flash_pass1_causal] Only runs on GPU");
+  };
+
+  return array::make_arrays(
+      {{total_q * num_blocks, dim},
+       {total_q, num_blocks},
+       {total_q, num_blocks}},
+      {float32, float32, float32},
+      std::make_shared<TurboFlashPass1>(
+          s, fallback, key_bits, value_bits, dim, /*causal=*/true),
+      {astype(q_rot, float32, s),
+       key_packed,
+       astype(key_norms, float32, s),
+       astype(key_codebook, float32, s),
+       val_packed,
+       astype(val_norms, float32, s),
+       astype(val_codebook, float32, s),
+       array(token_count, int32),
+       array(repeat_count, int32),
+       array(num_blocks, int32),
+       array(block_size, int32),
+       array(L, int32),
+       array(q_offset, int32)});
+}
+
+std::vector<array> turbo_flash_pass1_nr0(
+    const array& q_rot,
+    const array& key_packed,
+    const array& key_norms,
+    const array& key_codebook,
+    const array& val_packed,
+    const array& val_norms,
+    const array& val_codebook,
+    int token_count,
+    int repeat_count,
+    int num_blocks,
+    int block_size,
+    int key_bits,
+    int value_bits,
+    int dim,
+    int nr0,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+
+  int total_q = q_rot.shape(0);
+
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[turbo_flash_pass1_nr0] Only runs on GPU");
+  };
+
+  return array::make_arrays(
+      {{total_q * num_blocks, dim},
+       {total_q, num_blocks},
+       {total_q, num_blocks}},
+      {float32, float32, float32},
+      std::make_shared<TurboFlashPass1NR0>(
+          s, fallback, key_bits, value_bits, dim, nr0, /*causal=*/false),
+      {astype(q_rot, float32, s),
+       key_packed,
+       astype(key_norms, float32, s),
+       astype(key_codebook, float32, s),
+       val_packed,
+       astype(val_norms, float32, s),
+       astype(val_codebook, float32, s),
+       array(token_count, int32),
+       array(repeat_count, int32),
+       array(num_blocks, int32),
+       array(block_size, int32)});
+}
+
+std::vector<array> turbo_flash_pass1_nr0_causal(
+    const array& q_rot,
+    const array& key_packed,
+    const array& key_norms,
+    const array& key_codebook,
+    const array& val_packed,
+    const array& val_norms,
+    const array& val_codebook,
+    int token_count,
+    int repeat_count,
+    int num_blocks,
+    int block_size,
+    int L,
+    int q_offset,
+    int key_bits,
+    int value_bits,
+    int dim,
+    int nr0,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+
+  int total_q = q_rot.shape(0);
+
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[turbo_flash_pass1_nr0_causal] Only runs on GPU");
+  };
+
+  return array::make_arrays(
+      {{total_q * num_blocks, dim},
+       {total_q, num_blocks},
+       {total_q, num_blocks}},
+      {float32, float32, float32},
+      std::make_shared<TurboFlashPass1NR0>(
+          s, fallback, key_bits, value_bits, dim, nr0, /*causal=*/true),
+      {astype(q_rot, float32, s),
+       key_packed,
+       astype(key_norms, float32, s),
+       astype(key_codebook, float32, s),
+       val_packed,
+       astype(val_norms, float32, s),
+       astype(val_codebook, float32, s),
+       array(token_count, int32),
+       array(repeat_count, int32),
+       array(num_blocks, int32),
+       array(block_size, int32),
+       array(L, int32),
+       array(q_offset, int32)});
+}
+
+array turbo_flash_pass2(
+    const array& o_partials,
+    const array& m_partials,
+    const array& l_partials,
+    int num_blocks,
+    int dim,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+
+  int total_q = m_partials.shape(0);
+
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[turbo_flash_pass2] Only runs on GPU");
+  };
+
+  return array(
+      {total_q, dim},
+      float32,
+      std::make_shared<TurboFlashPass2>(
+          s, fallback, dim, /*fused_rotation=*/false),
+      {astype(o_partials, float32, s),
+       astype(m_partials, float32, s),
+       astype(l_partials, float32, s)});
+}
+
+array turbo_flash_pass2_fused(
+    const array& o_partials,
+    const array& m_partials,
+    const array& l_partials,
+    const array& val_rotation,
+    int num_blocks,
+    int dim,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+
+  int total_q = m_partials.shape(0);
+
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[turbo_flash_pass2_fused] Only runs on GPU");
+  };
+
+  return array(
+      {total_q, dim},
+      float32,
+      std::make_shared<TurboFlashPass2>(
+          s, fallback, dim, /*fused_rotation=*/true),
+      {astype(o_partials, float32, s),
+       astype(m_partials, float32, s),
+       astype(l_partials, float32, s),
+       astype(val_rotation, float32, s)});
+}
+
+array turbo_value(
+    const array& weights,
+    const array& packed,
+    const array& norms,
+    const array& codebook,
+    int token_count,
+    int repeat_count,
+    float sparse_threshold,
+    int bits,
+    int dim,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+
+  int total_heads = weights.shape(0);
+
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[turbo_value] Only runs on GPU");
+  };
+
+  return array(
+      {total_heads, dim},
+      float32,
+      std::make_shared<TurboValue>(s, fallback, bits, dim),
+      {astype(weights, float32, s),
+       packed,
+       astype(norms, float32, s),
+       astype(codebook, float32, s),
+       array(sparse_threshold, float32)});
+}
+
+// ============================================================================
+// GatedDeltaNet / SSM recurrence primitives
+// ============================================================================
+
+std::vector<array> gated_delta_step(
+    const array& q,
+    const array& k,
+    const array& v,
+    const array& g,
+    const array& beta,
+    const array& state,
+    const std::optional<array>& mask,
+    int T,
+    bool fused,
+    int Dk,
+    int Dv,
+    int Hk,
+    int Hv,
+    StreamOrDevice s_ /* = {} */) {
+  auto s = to_stream(s_);
+  auto out_type = q.dtype();
+  bool has_mask = mask.has_value();
+
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[gated_delta_step] Only runs on GPU");
+  };
+
+  // Compute output shapes
+  // y: [B, T, Hv, Dv]
+  int B = static_cast<int>(state.shape(0));
+  Shape y_shape = {B, T, Hv, Dv};
+  // state_out: [B, Hv, Dv, Dk]
+  Shape state_shape = state.shape();
+
+  // Build inputs vector matching Metal buffer order.
+  //
+  // Standard path (fused=false):
+  //   API args map 1:1 -> q(0), k(1), v(2), g(3), beta(4), state_in(5),
+  //                        [mask(6)]
+  //
+  // Fused path (fused=true):
+  //   The fused kernel expects 8 input arrays:
+  //     q_raw(0), k_raw(1), v(2), a(3), b_input(4), a_log(5), dt_bias(6),
+  //     state_in(7), [mask(8)]
+  //   This API re-purposes the 6 positional args as:
+  //     q -> q_raw, k -> k_raw, v -> v, g -> a, beta -> b_input
+  //     state -> state_in
+  //   a_log and dt_bias are model constants that the Swift caller must
+  //   inject by constructing the GatedDeltaStep primitive directly with
+  //   all 8 inputs. This API function only supports the standard path.
+  if (fused) {
+    throw std::invalid_argument(
+        "[gated_delta_step] Fused variant requires 8 input arrays. "
+        "Construct the GatedDeltaStep primitive directly.");
+  }
+
+  std::vector<array> inputs = {
+      astype(q, out_type, s),
+      astype(k, out_type, s),
+      astype(v, out_type, s),
+      astype(g, out_type, s),
+      astype(beta, out_type, s),
+      astype(state, out_type, s)};
+  if (has_mask) {
+    inputs.push_back(*mask);
+  }
+
+  auto outputs = array::make_arrays(
+      {std::move(y_shape), std::move(state_shape)},
+      {out_type, out_type},
+      std::make_shared<GatedDeltaStep>(
+          s, fallback, fused, has_mask, T, Dk, Dv, Hk, Hv),
+      std::move(inputs));
+  // Break sibling bond: state_out pins T-proportional y, causing
+  // peak ∝ layers × context.  Async eval detaches both outputs
+  // without blocking the CPU.
+  async_eval(outputs);
+  return outputs;
+}
+
+std::vector<array> gated_delta_step_fused(
+    const array& q_raw,
+    const array& k_raw,
+    const array& v,
+    const array& a,
+    const array& b_input,
+    const array& a_log,
+    const array& dt_bias,
+    const array& state,
+    const std::optional<array>& mask,
+    int T,
+    int Dk,
+    int Dv,
+    int Hk,
+    int Hv,
+    StreamOrDevice s_ /* = {} */) {
+  auto s = to_stream(s_);
+  auto out_type = q_raw.dtype();
+  bool has_mask = mask.has_value();
+
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[gated_delta_step_fused] Only runs on GPU");
+  };
+
+  int B = static_cast<int>(state.shape(0));
+  Shape y_shape = {B, T, Hv, Dv};
+  Shape state_shape = state.shape();
+
+  // Fused path: q_raw, k_raw, v, a, b_input, a_log, dt_bias, state [, mask]
+  std::vector<array> inputs = {
+      astype(q_raw, out_type, s),
+      astype(k_raw, out_type, s),
+      astype(v, out_type, s),
+      astype(a, out_type, s),
+      astype(b_input, out_type, s),
+      astype(a_log, out_type, s),
+      astype(dt_bias, out_type, s),
+      astype(state, out_type, s)};
+  if (has_mask) {
+    inputs.push_back(*mask);
+  }
+
+  auto outputs = array::make_arrays(
+      {std::move(y_shape), std::move(state_shape)},
+      {out_type, out_type},
+      std::make_shared<GatedDeltaStep>(
+          s, fallback, /*fused=*/true, has_mask, T, Dk, Dv, Hk, Hv),
+      std::move(inputs));
+  // Break sibling bond (see gated_delta_step comment above).
+  async_eval(outputs);
+  return outputs;
+}
+
+std::vector<array> ssm_step(
+    const array& X,
+    const array& A_log,
+    const array& B,
+    const array& C,
+    const array& D,
+    const array& dt,
+    const array& state,
+    int Dh,
+    int Ds,
+    int H,
+    int G,
+    StreamOrDevice s_ /* = {} */) {
+  auto s = to_stream(s_);
+  auto out_type = X.dtype();
+
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[ssm_step] Only runs on GPU");
+  };
+
+  // Output shapes
+  // out: same shape as X [N, Dh]
+  Shape out_shape = X.shape();
+  // state_out: same shape as state [N, Dh, Ds]
+  Shape state_shape = state.shape();
+
+  std::vector<array> inputs = {
+      astype(X, out_type, s),
+      astype(A_log, out_type, s),
+      astype(B, out_type, s),
+      astype(C, out_type, s),
+      astype(D, out_type, s),
+      astype(dt, out_type, s),
+      astype(state, out_type, s)};
+
+  auto outputs = array::make_arrays(
+      {std::move(out_shape), std::move(state_shape)},
+      {out_type, out_type},
+      std::make_shared<SSMStep>(s, fallback, Dh, Ds, H, G),
+      std::move(inputs));
+  // Break sibling bond (see gated_delta_step comment above).
+  async_eval(outputs);
+  return outputs;
 }
 
 } // namespace mlx::core::fast

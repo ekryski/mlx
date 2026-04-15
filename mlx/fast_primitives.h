@@ -71,6 +71,201 @@ class RMSNorm : public Custom {
   float eps_;
 };
 
+class RMSNormQuantizedGEMV : public Custom {
+ public:
+  RMSNormQuantizedGEMV(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      float eps,
+      int group_size)
+      : Custom(stream, std::move(fallback)),
+        eps_(eps),
+        group_size_(group_size) {}
+
+  static bool use_fallback(Stream stream);
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("NYI");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(RMSNormQuantizedGEMV)
+  bool is_equivalent(const Primitive& other) const override;
+  DEFINE_INPUT_OUTPUT_SHAPE()
+
+  auto state() const {
+    return std::make_tuple(nullptr, eps_, group_size_);
+  }
+
+ private:
+  float eps_;
+  int group_size_;
+};
+
+class BatchedQKVQuantizedGEMV : public Custom {
+ public:
+  BatchedQKVQuantizedGEMV(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int group_size,
+      int n_q,
+      int n_k,
+      int n_v)
+      : Custom(stream, std::move(fallback)),
+        group_size_(group_size),
+        n_q_(n_q),
+        n_k_(n_k),
+        n_v_(n_v) {}
+
+  static bool use_fallback(Stream stream);
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("NYI");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(BatchedQKVQuantizedGEMV)
+  bool is_equivalent(const Primitive& other) const override;
+  DEFINE_INPUT_OUTPUT_SHAPE()
+
+  auto state() const {
+    return std::make_tuple(nullptr, group_size_, n_q_, n_k_, n_v_);
+  }
+
+ private:
+  int group_size_;
+  int n_q_, n_k_, n_v_;
+};
+
+class WarpMoeGateUp : public Custom {
+ public:
+  WarpMoeGateUp(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int group_size,
+      int hidden_dims,
+      int activation_type)
+      : Custom(stream, std::move(fallback)),
+        group_size_(group_size),
+        hidden_dims_(hidden_dims),
+        activation_type_(activation_type) {}
+
+  static bool use_fallback(Stream stream);
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs) override {
+    throw std::runtime_error("NYI");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) override;
+  DEFINE_NAME(WarpMoeGateUp)
+  bool is_equivalent(const Primitive& other) const override;
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  auto state() const { return std::make_tuple(nullptr, group_size_, hidden_dims_, activation_type_); }
+ private:
+  int group_size_;
+  int hidden_dims_;
+  int activation_type_;
+};
+
+class WarpMoeDown : public Custom {
+ public:
+  WarpMoeDown(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int group_size,
+      int hidden_dims,
+      int out_dims)
+      : Custom(stream, std::move(fallback)),
+        group_size_(group_size),
+        hidden_dims_(hidden_dims),
+        out_dims_(out_dims) {}
+
+  static bool use_fallback(Stream stream);
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs) override {
+    throw std::runtime_error("NYI");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) override;
+  DEFINE_NAME(WarpMoeDown)
+  bool is_equivalent(const Primitive& other) const override;
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  auto state() const { return std::make_tuple(nullptr, group_size_, hidden_dims_, out_dims_); }
+ private:
+  int group_size_;
+  int hidden_dims_;
+  int out_dims_;
+};
+
+class RMSNormResidual : public Custom {
+ public:
+  RMSNormResidual(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      float eps)
+      : Custom(stream, std::move(fallback)),
+        eps_(eps) {}
+
+  static bool use_fallback(Stream stream);
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("NYI");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(RMSNormResidual)
+  bool is_equivalent(const Primitive& other) const override;
+  DEFINE_INPUT_OUTPUT_SHAPE()
+
+  auto state() const {
+    return std::make_tuple(nullptr, eps_);
+  }
+
+ private:
+  float eps_;
+};
+
+class RMSNormRoPE : public Custom {
+ public:
+  RMSNormRoPE(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      float eps,
+      int n_heads,
+      int seq_len,
+      int offset)
+      : Custom(stream, std::move(fallback)),
+        eps_(eps),
+        n_heads_(n_heads),
+        seq_len_(seq_len),
+        offset_(offset) {}
+
+  static bool use_fallback(Stream stream);
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("NYI");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(RMSNormRoPE)
+  bool is_equivalent(const Primitive& other) const override;
+  DEFINE_INPUT_OUTPUT_SHAPE()
+
+  auto state() const {
+    return std::make_tuple(nullptr, eps_, n_heads_, seq_len_, offset_);
+  }
+
+ private:
+  float eps_;
+  int n_heads_;
+  int seq_len_;
+  int offset_;
+};
+
 class RMSNormVJP : public Custom {
  public:
   RMSNormVJP(
@@ -422,6 +617,297 @@ class CustomKernel : public Primitive {
   std::vector<ScalarArg> scalar_arguments_;
   bool is_precompiled_;
   int shared_memory_;
+};
+
+// ============================================================================
+// TurboQuant primitives — compressed-domain attention kernels
+// ============================================================================
+
+class TurboScore : public Custom {
+ public:
+  TurboScore(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int bits,
+      int dim)
+      : Custom(stream, std::move(fallback)), bits_(bits), dim_(dim) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("TurboScore only runs on GPU");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(TurboScore)
+  bool is_equivalent(const Primitive& other) const override;
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  auto state() const {
+    return std::make_tuple(nullptr, bits_, dim_);
+  }
+
+ private:
+  int bits_;
+  int dim_;
+};
+
+class TurboEncode : public Custom {
+ public:
+  TurboEncode(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int bits,
+      int dim,
+      bool use_wht)
+      : Custom(stream, std::move(fallback)),
+        bits_(bits),
+        dim_(dim),
+        use_wht_(use_wht) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("TurboEncode only runs on GPU");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(TurboEncode)
+  bool is_equivalent(const Primitive& other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
+  auto state() const {
+    return std::make_tuple(nullptr, bits_, dim_, use_wht_);
+  }
+
+ private:
+  int bits_;
+  int dim_;
+  bool use_wht_;
+};
+
+class TurboFlashPass1 : public Custom {
+ public:
+  TurboFlashPass1(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int key_bits,
+      int value_bits,
+      int dim,
+      bool causal)
+      : Custom(stream, std::move(fallback)),
+        key_bits_(key_bits),
+        value_bits_(value_bits),
+        dim_(dim),
+        causal_(causal) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("TurboFlashPass1 only runs on GPU");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(TurboFlashPass1)
+  bool is_equivalent(const Primitive& other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
+  auto state() const {
+    return std::make_tuple(nullptr, key_bits_, value_bits_, dim_, causal_);
+  }
+
+ private:
+  int key_bits_;
+  int value_bits_;
+  int dim_;
+  bool causal_;
+};
+
+class TurboFlashPass1NR0 : public Custom {
+ public:
+  TurboFlashPass1NR0(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int key_bits,
+      int value_bits,
+      int dim,
+      int nr0,
+      bool causal)
+      : Custom(stream, std::move(fallback)),
+        key_bits_(key_bits),
+        value_bits_(value_bits),
+        dim_(dim),
+        nr0_(nr0),
+        causal_(causal) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("TurboFlashPass1NR0 only runs on GPU");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(TurboFlashPass1NR0)
+  bool is_equivalent(const Primitive& other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
+  auto state() const {
+    return std::make_tuple(
+        nullptr, key_bits_, value_bits_, dim_, nr0_, causal_);
+  }
+
+ private:
+  int key_bits_;
+  int value_bits_;
+  int dim_;
+  int nr0_;
+  bool causal_;
+};
+
+class TurboFlashPass2 : public Custom {
+ public:
+  TurboFlashPass2(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int dim,
+      bool fused_rotation)
+      : Custom(stream, std::move(fallback)),
+        dim_(dim),
+        fused_rotation_(fused_rotation) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("TurboFlashPass2 only runs on GPU");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(TurboFlashPass2)
+  bool is_equivalent(const Primitive& other) const override;
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  auto state() const {
+    return std::make_tuple(nullptr, dim_, fused_rotation_);
+  }
+
+ private:
+  int dim_;
+  bool fused_rotation_;
+};
+
+class TurboValue : public Custom {
+ public:
+  TurboValue(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int bits,
+      int dim)
+      : Custom(stream, std::move(fallback)), bits_(bits), dim_(dim) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("TurboValue only runs on GPU");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(TurboValue)
+  bool is_equivalent(const Primitive& other) const override;
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  auto state() const {
+    return std::make_tuple(nullptr, bits_, dim_);
+  }
+
+ private:
+  int bits_;
+  int dim_;
+};
+
+// ============================================================================
+// GatedDeltaNet / SSM recurrence primitives
+// ============================================================================
+
+class GatedDeltaStep : public Custom {
+ public:
+  GatedDeltaStep(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      bool fused,
+      bool has_mask,
+      int T,
+      int Dk,
+      int Dv,
+      int Hk,
+      int Hv)
+      : Custom(stream, std::move(fallback)),
+        fused_(fused),
+        has_mask_(has_mask),
+        T_(T),
+        Dk_(Dk),
+        Dv_(Dv),
+        Hk_(Hk),
+        Hv_(Hv) {}
+
+  static bool use_fallback(Stream stream);
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("NYI");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(GatedDeltaStep)
+  bool is_equivalent(const Primitive& other) const override;
+  DEFINE_INPUT_OUTPUT_SHAPE()
+
+  auto state() const {
+    return std::make_tuple(
+        nullptr, fused_, has_mask_, T_, Dk_, Dv_, Hk_, Hv_);
+  }
+
+ private:
+  bool fused_;
+  bool has_mask_;
+  int T_;
+  int Dk_;
+  int Dv_;
+  int Hk_;
+  int Hv_;
+};
+
+class SSMStep : public Custom {
+ public:
+  SSMStep(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int Dh,
+      int Ds,
+      int H,
+      int G)
+      : Custom(stream, std::move(fallback)),
+        Dh_(Dh),
+        Ds_(Ds),
+        H_(H),
+        G_(G) {}
+
+  static bool use_fallback(Stream stream);
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("NYI");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(SSMStep)
+  bool is_equivalent(const Primitive& other) const override;
+  DEFINE_INPUT_OUTPUT_SHAPE()
+
+  auto state() const {
+    return std::make_tuple(nullptr, Dh_, Ds_, H_, G_);
+  }
+
+ private:
+  int Dh_;
+  int Ds_;
+  int H_;
+  int G_;
 };
 
 } // namespace mlx::core::fast
