@@ -286,15 +286,17 @@ template <
       for (short iq = 0; iq < TQ; iq++) {
         STEEL_PRAGMA_UNROLL
         for (short ik = 0; ik < TK; ik++) {
+          const short row_pos = base_row + iq * kU;
+          const short col_pos = base_col + ik * kU;
+
           thread auto& fg = Stile.frag_at(iq, ik);
 
           STEEL_PRAGMA_UNROLL
           for (short ii = 0; ii < stile_t::kFragThrRows; ii++) {
             STEEL_PRAGMA_UNROLL
             for (short jj = 0; jj < stile_t::kFragThrCols; jj++) {
-              const auto r =
-                  base_row + iq * kU + ii * stile_t::kFragRowsJump + sm;
-              const auto c = base_col + ik * kU + jj + sn;
+              const auto r = row_pos + ii * stile_t::kFragRowsJump + sm;
+              const auto c = col_pos + jj + sn;
               const auto loc = ii * stile_t::kFragThrCols + jj;
               fg[loc] = (r < c) ? neg_inf : fg[loc];
             }
@@ -315,62 +317,32 @@ template <
       using mtile_t = NAXTile<melem_t, TQ, TK>;
       using mfrag_t = typename mtile_t::frag_type;
 
-      if (base_row + BQ <= params->qL && base_col + BK <= params->kL) {
-        for (short iq = 0; iq < TQ; iq++) {
-          STEEL_PRAGMA_UNROLL
-          for (short ik = 0; ik < TK; ik++) {
-            const int row_pos = base_row + iq * kU;
-            const int col_pos = base_col + ik * kU;
-
-            mfrag_t mfrag;
-            mtile_t::NAXFrag_t::load(
-                mfrag,
-                mask,
-                int64_t(mask_params->M_strides[2]),
-                Int<1>{},
-                row_pos,
-                col_pos);
-
-            thread auto& fg = Stile.frag_at(iq, ik);
-
-            STEEL_PRAGMA_UNROLL
-            for (short jj = 0; jj < mtile_t::kElemsPerFrag; jj++) {
-              if constexpr (is_bool) {
-                fg[jj] = mfrag[jj] ? fg[jj] : neg_inf;
-              } else {
-                fg[jj] += M_LOG2E_F * AccumType(mfrag[jj]);
-              }
-            }
-          }
-        }
-      } else {
+      STEEL_PRAGMA_UNROLL
+      for (short iq = 0; iq < TQ; iq++) {
         STEEL_PRAGMA_UNROLL
-        for (short iq = 0; iq < TQ; iq++) {
+        for (short ik = 0; ik < TK; ik++) {
+          const short row_pos = base_row + iq * kU;
+          const short col_pos = base_col + ik * kU;
+
+          mfrag_t mfrag;
+          mtile_t::NAXFrag_t::load_safe(
+              mfrag,
+              mask,
+              int64_t(mask_params->M_strides[2]),
+              Int<1>{},
+              params->qL,
+              params->kL,
+              row_pos,
+              col_pos);
+
+          thread auto& fg = Stile.frag_at(iq, ik);
+
           STEEL_PRAGMA_UNROLL
-          for (short ik = 0; ik < TK; ik++) {
-            const int row_pos = base_row + iq * kU;
-            const int col_pos = base_col + ik * kU;
-
-            mfrag_t mfrag;
-            mtile_t::NAXFrag_t::load_safe(
-                mfrag,
-                mask,
-                int64_t(mask_params->M_strides[2]),
-                Int<1>{},
-                params->qL,
-                params->kL,
-                row_pos,
-                col_pos);
-
-            thread auto& fg = Stile.frag_at(iq, ik);
-
-            STEEL_PRAGMA_UNROLL
-            for (short jj = 0; jj < mtile_t::kElemsPerFrag; jj++) {
-              if constexpr (is_bool) {
-                fg[jj] = mfrag[jj] ? fg[jj] : neg_inf;
-              } else {
-                fg[jj] += M_LOG2E_F * AccumType(mfrag[jj]);
-              }
+          for (short jj = 0; jj < mtile_t::kElemsPerFrag; jj++) {
+            if constexpr (is_bool) {
+              fg[jj] = mfrag[jj] ? fg[jj] : neg_inf;
+            } else {
+              fg[jj] += M_LOG2E_F * AccumType(mfrag[jj]);
             }
           }
         }
@@ -417,9 +389,16 @@ template <
     STEEL_PRAGMA_UNROLL
     for (short iq = 0; iq < TQ; iq++) {
       STEEL_PRAGMA_UNROLL
-      for (short id = 0; id < TD; id += 2) {
-        if constexpr (BD == 128) {
-          if (id == 4) {
+      // NOTE (EK): Upstream mainline implementation
+      // for (short id = 0; id < TD; id += 2) {
+      //   if constexpr (BD == 128) {
+      //     if (id == 4) {
+      //       threadgroup_barrier(mem_flags::mem_none);
+      //     }
+      //   }
+      for (short id = 0; id < TD; id++) {
+        if constexpr (BD >= 128) {
+          if (id == TD / 2) {
             threadgroup_barrier(mem_flags::mem_none);
           }
         }
