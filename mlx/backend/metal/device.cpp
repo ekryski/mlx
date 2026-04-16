@@ -495,11 +495,15 @@ Device::Device() : device_(load_device()), residency_set_(device_.get()) {
       max_mb_per_buffer_ = 40;
       break;
     case 's': // max
-      max_ops_per_buffer_ = 50;
+      // Note: ops_per_buffer=300 gives +11% decode speed but increases peak
+      // memory during prefill (more intermediates alive simultaneously).
+      // Keep default at 100; users can set MLX_MAX_OPS_PER_BUFFER=300 for
+      // decode-heavy workloads where memory isn't tight.
+      max_ops_per_buffer_ = 100;
       max_mb_per_buffer_ = 50;
       break;
     case 'd': // ultra
-      max_ops_per_buffer_ = 50;
+      max_ops_per_buffer_ = 100;
       max_mb_per_buffer_ = 50;
       break;
     default: // default to medium
@@ -799,8 +803,11 @@ CommandEncoder& get_command_encoder(Stream s) {
   auto& encoders = get_command_encoders();
   auto it = encoders.find(s.index);
   if (it == encoders.end()) {
-    throw std::runtime_error(
-        fmt::format("There is no Stream(gpu, {}) in current thread.", s.index));
+    // Lazily initialize the command encoder for this stream on the current thread.
+    // This handles Swift structured concurrency where Tasks can migrate between
+    // threads, and the thread-local encoder map may not have the stream registered.
+    auto& d = device(s.device);
+    it = encoders.try_emplace(s.index, d, s.index, d.residency_set()).first;
   }
   return it->second;
 }
