@@ -620,10 +620,14 @@ bool ScaledDotProductAttention::use_fallback(
   // the 32KB threadgroup memory limit (41KB for BD=256 at 4B/elem).
   const bool is_half = q.dtype() == float16 || q.dtype() == bfloat16;
 
+  // BD=512 vector kernel is instantiated for f16/bf16 — required for Gemma 4
+  // full-attention layers (head_dim=512) during decode. Not enabled for Steel
+  // full attention (prefill) due to register pressure at BD=512.
   const bool sdpa_vector_supported_head_dim =
       query_head_dim == value_head_dim &&
       (query_head_dim == 64 || query_head_dim == 96 || query_head_dim == 128 ||
-       query_head_dim == 256);
+       query_head_dim == 256 ||
+       (query_head_dim == 512 && is_half));
 
   // Steel full attention avoids materializing L×L attention score matrices.
   // BD≤128: works for all dtypes.
