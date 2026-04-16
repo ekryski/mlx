@@ -92,6 +92,387 @@ void RMSNorm::eval_gpu(
   }
 }
 
+bool RMSNormQuantizedGEMV::use_fallback(Stream s) {
+  return s.device == Device::cpu;
+}
+
+void RMSNormQuantizedGEMV::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  auto& out = outputs[0];
+
+  const array& x = inputs[0];
+  const array& norm_weight = inputs[1];
+  const array& w = inputs[2];
+  const array& scales = inputs[3];
+  const array& biases = inputs[4];
+
+  auto K = static_cast<int>(x.shape().back());
+  auto N = static_cast<int>(out.shape().back());
+
+  out.set_data(allocator::malloc(out.nbytes()));
+
+  // Kernel name: rms_norm_qgemv_<type>_gs<group_size>
+  std::string kname = "rms_norm_qgemv_" + type_to_name(out) + "_gs" +
+      std::to_string(group_size_);
+  auto kernel = d.get_kernel(kname);
+
+  // Same grid as qmv_impl: 8 outputs per threadgroup (2 simdgroups × 4 rows)
+  constexpr int outputs_per_tg = 8;
+  int n_tg_y = (N + outputs_per_tg - 1) / outputs_per_tg;
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.set_compute_pipeline_state(kernel);
+  compute_encoder.set_input_array(x, 0);
+  compute_encoder.set_input_array(norm_weight, 1);
+  compute_encoder.set_input_array(w, 2);
+  compute_encoder.set_input_array(scales, 3);
+  compute_encoder.set_input_array(biases, 4);
+  compute_encoder.set_output_array(out, 5);
+  compute_encoder.set_bytes(eps_, 6);
+  compute_encoder.set_bytes(K, 7);
+  compute_encoder.set_bytes(N, 8);
+  compute_encoder.dispatch_threadgroups(
+      MTL::Size(1, n_tg_y, 1),
+      MTL::Size(64, 1, 1));  // 2 simdgroups × 32 threads
+}
+
+bool RMSNormQuantizedGEMV::is_equivalent(const Primitive& other) const {
+  const RMSNormQuantizedGEMV& r =
+      static_cast<const RMSNormQuantizedGEMV&>(other);
+  return eps_ == r.eps_ && group_size_ == r.group_size_;
+}
+
+// ============================================================================
+// BatchedQKVQuantizedGEMV
+// ============================================================================
+
+bool BatchedQKVQuantizedGEMV::use_fallback(Stream stream) {
+  return stream.device == Device::cpu;
+}
+
+void BatchedQKVQuantizedGEMV::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+
+  // Inputs: x, w_q, scales_q, biases_q, w_k, scales_k, biases_k, w_v, scales_v, biases_v
+  const array& x = inputs[0];
+  const array& w_q = inputs[1];
+  const array& scales_q = inputs[2];
+  const array& biases_q = inputs[3];
+  const array& w_k = inputs[4];
+  const array& scales_k = inputs[5];
+  const array& biases_k = inputs[6];
+  const array& w_v = inputs[7];
+  const array& scales_v = inputs[8];
+  const array& biases_v = inputs[9];
+
+  // Single output: concatenated [N_q + N_k + N_v]
+  auto& out = outputs[0];
+  auto K = static_cast<int>(x.shape().back());
+
+  out.set_data(allocator::malloc(out.nbytes()));
+
+  std::string kname = "batched_qkv_qgemv_" + type_to_name(out) + "_gs" +
+      std::to_string(group_size_);
+  auto kernel = d.get_kernel(kname);
+
+  // Grid covers the largest output dim across Q/K/V
+  constexpr int outputs_per_tg = 8;
+  int max_n = std::max({n_q_, n_k_, n_v_});
+  int n_tg_y = (max_n + outputs_per_tg - 1) / outputs_per_tg;
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  compute_encoder.set_input_array(x, 0);
+  // Q weights
+  compute_encoder.set_input_array(w_q, 1);
+  compute_encoder.set_input_array(scales_q, 2);
+  compute_encoder.set_input_array(biases_q, 3);
+  // K weights
+  compute_encoder.set_input_array(w_k, 4);
+  compute_encoder.set_input_array(scales_k, 5);
+  compute_encoder.set_input_array(biases_k, 6);
+  // V weights
+  compute_encoder.set_input_array(w_v, 7);
+  compute_encoder.set_input_array(scales_v, 8);
+  compute_encoder.set_input_array(biases_v, 9);
+  // Output (single contiguous buffer)
+  compute_encoder.set_output_array(out, 10);
+  // Dimensions
+  compute_encoder.set_bytes(n_q_, 11);
+  compute_encoder.set_bytes(n_k_, 12);
+  compute_encoder.set_bytes(n_v_, 13);
+  compute_encoder.set_bytes(K, 14);
+
+  // z=3: one z-slice per matrix (Q, K, V), all run in parallel
+  compute_encoder.dispatch_threadgroups(
+      MTL::Size(1, n_tg_y, 3),
+      MTL::Size(64, 1, 1));
+}
+
+bool BatchedQKVQuantizedGEMV::is_equivalent(const Primitive& other) const {
+  const BatchedQKVQuantizedGEMV& r =
+      static_cast<const BatchedQKVQuantizedGEMV&>(other);
+  return group_size_ == r.group_size_ &&
+         n_q_ == r.n_q_ && n_k_ == r.n_k_ && n_v_ == r.n_v_;
+}
+
+// ============================================================================
+// WarpMoeGateUp
+// ============================================================================
+
+bool WarpMoeGateUp::use_fallback(Stream s) { return s.device == Device::cpu; }
+
+void WarpMoeGateUp::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+
+  // Inputs: x, w, scales, biases, indices
+  const array& x = inputs[0];       // [inputDims] flattened
+  const array& w = inputs[1];       // [numExperts, 2*H, K_packed]
+  const array& sc = inputs[2];      // [numExperts, 2*H, K/gs]
+  const array& bi = inputs[3];      // [numExperts, 2*H, K/gs]
+  const array& indices = inputs[4]; // [topK]
+
+  auto& out = outputs[0];  // [topK, hiddenDims]
+  out.set_data(allocator::malloc(out.nbytes()));
+
+  int in_vec_size = static_cast<int>(x.size());
+  int top_k = static_cast<int>(indices.size());
+
+  std::string kname = "warp_moe_gate_up_" + type_to_name(out) + "_gs" +
+      std::to_string(group_size_) + "_act" + std::to_string(activation_type_);
+  auto kernel = d.get_kernel(kname);
+
+  constexpr int outputs_per_tg = 8;
+  int n_tg_y = (hidden_dims_ + outputs_per_tg - 1) / outputs_per_tg;
+
+  auto& ce = metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+  ce.set_input_array(x, 0);
+  ce.set_input_array(w, 1);
+  ce.set_input_array(sc, 2);
+  ce.set_input_array(bi, 3);
+  ce.set_input_array(indices, 4);
+  ce.set_output_array(out, 5);
+  ce.set_bytes(in_vec_size, 6);
+  ce.set_bytes(hidden_dims_, 7);
+  ce.set_bytes(top_k, 8);
+
+  ce.dispatch_threadgroups(
+      MTL::Size(1, n_tg_y, top_k),  // z = topK experts in parallel
+      MTL::Size(64, 1, 1));
+}
+
+bool WarpMoeGateUp::is_equivalent(const Primitive& other) const {
+  const WarpMoeGateUp& r = static_cast<const WarpMoeGateUp&>(other);
+  return group_size_ == r.group_size_ &&
+         hidden_dims_ == r.hidden_dims_ &&
+         activation_type_ == r.activation_type_;
+}
+
+// ============================================================================
+// WarpMoeDown
+// ============================================================================
+
+bool WarpMoeDown::use_fallback(Stream s) { return s.device == Device::cpu; }
+
+void WarpMoeDown::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+
+  // Inputs: activated, w, scales, biases, indices, scores
+  const array& activated = inputs[0]; // [topK, hiddenDims]
+  const array& w = inputs[1];         // [numExperts, outDims, H_packed]
+  const array& sc = inputs[2];
+  const array& bi = inputs[3];
+  const array& indices = inputs[4];   // [topK]
+  const array& scores = inputs[5];    // [topK]
+
+  auto& out = outputs[0];  // [outDims]
+  out.set_data(allocator::malloc(out.nbytes()));
+
+  int top_k = static_cast<int>(indices.size());
+
+  std::string kname = "warp_moe_down_" + type_to_name(out) + "_gs" +
+      std::to_string(group_size_);
+  auto kernel = d.get_kernel(kname);
+
+  constexpr int outputs_per_tg = 8;
+  int n_tg_y = (out_dims_ + outputs_per_tg - 1) / outputs_per_tg;
+
+  auto& ce = metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+  ce.set_input_array(activated, 0);
+  ce.set_input_array(w, 1);
+  ce.set_input_array(sc, 2);
+  ce.set_input_array(bi, 3);
+  ce.set_input_array(indices, 4);
+  ce.set_input_array(scores, 5);
+  ce.set_output_array(out, 6);
+  ce.set_bytes(hidden_dims_, 7);
+  ce.set_bytes(out_dims_, 8);
+  ce.set_bytes(top_k, 9);
+
+  ce.dispatch_threadgroups(
+      MTL::Size(1, n_tg_y, 1),
+      MTL::Size(64, 1, 1));
+}
+
+bool WarpMoeDown::is_equivalent(const Primitive& other) const {
+  const WarpMoeDown& r = static_cast<const WarpMoeDown&>(other);
+  return group_size_ == r.group_size_ &&
+         hidden_dims_ == r.hidden_dims_ &&
+         out_dims_ == r.out_dims_;
+}
+
+bool RMSNormResidual::use_fallback(Stream s) {
+  return s.device == Device::cpu;
+}
+
+void RMSNormResidual::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  auto& out = outputs[0];
+
+  // Ensure x is contiguous in last dim
+  const array& x_in = inputs[0];
+  bool no_copy = x_in.flags().contiguous && x_in.strides()[x_in.ndim() - 1] == 1;
+  if (no_copy && x_in.ndim() > 1) {
+    auto st = x_in.strides()[x_in.ndim() - 2];
+    no_copy &= (st == 0 || st == x_in.shape().back() || x_in.shape(-2) == 1);
+  }
+  array x = no_copy ? x_in : contiguous_copy_gpu(x_in, s);
+
+  // Ensure residual is contiguous in last dim
+  const array& r_in = inputs[1];
+  bool r_no_copy = r_in.flags().contiguous && r_in.strides()[r_in.ndim() - 1] == 1;
+  if (r_no_copy && r_in.ndim() > 1) {
+    auto st = r_in.strides()[r_in.ndim() - 2];
+    r_no_copy &= (st == 0 || st == r_in.shape().back() || r_in.shape(-2) == 1);
+  }
+  array residual = r_no_copy ? r_in : contiguous_copy_gpu(r_in, s);
+
+  // Output allocation — must be fresh because kernel reads x and residual
+  // while writing output (in-place would cause read-after-write hazard).
+  out.set_data(
+      allocator::malloc(x.data_size() * x.itemsize()),
+      x.data_size(),
+      x.strides(),
+      x.flags());
+
+  const array& w = inputs[2];
+
+  auto axis_size = static_cast<uint32_t>(x.shape().back());
+  int n_rows = x.data_size() / axis_size;
+
+  std::string kname = "rms_norm_residual_" + type_to_name(out);
+  auto kernel = d.get_kernel(kname);
+
+  // Use max threadgroup size — kernel loops over elements when axis_size > threadgroup
+  size_t threadgroup_size = kernel->maxTotalThreadsPerThreadgroup();
+  size_t n_threads = n_rows * threadgroup_size;
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.set_compute_pipeline_state(kernel);
+  compute_encoder.set_input_array(x, 0);
+  compute_encoder.set_input_array(residual, 1);
+  compute_encoder.set_input_array(w, 2);
+  compute_encoder.set_output_array(out, 3);
+  compute_encoder.set_bytes(eps_, 4);
+  compute_encoder.set_bytes(axis_size, 5);
+  compute_encoder.dispatch_threads(
+      MTL::Size(n_threads, 1, 1),
+      MTL::Size(threadgroup_size, 1, 1));
+}
+
+bool RMSNormResidual::is_equivalent(const Primitive& other) const {
+  const RMSNormResidual& r = static_cast<const RMSNormResidual&>(other);
+  return eps_ == r.eps_;
+}
+
+bool RMSNormRoPE::use_fallback(Stream s) {
+  return s.device == Device::cpu;
+}
+
+void RMSNormRoPE::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  auto& out = outputs[0];
+
+  // Ensure input is contiguous in last dim
+  const array& x_in = inputs[0];
+  bool no_copy = x_in.flags().contiguous && x_in.strides()[x_in.ndim() - 1] == 1;
+  if (no_copy && x_in.ndim() > 1) {
+    auto st = x_in.strides()[x_in.ndim() - 2];
+    no_copy &= (st == 0 || st == x_in.shape().back() || x_in.shape(-2) == 1);
+  }
+  array x = no_copy ? x_in : contiguous_copy_gpu(x_in, s);
+  if (x.is_donatable()) {
+    out.copy_shared_buffer(x);
+  } else {
+    out.set_data(
+        allocator::malloc(x.data_size() * x.itemsize()),
+        x.data_size(),
+        x.strides(),
+        x.flags());
+  }
+
+  const array& w = inputs[1];
+  const array& inv_freqs = inputs[2];
+
+  auto axis_size = static_cast<uint32_t>(x.shape().back());
+  int n_rows = x.data_size() / axis_size;
+  uint32_t half_dim = axis_size / 2;
+
+  // Thread count: one thread per rotation pair (half_dim threads per row)
+  const int simd_size = 32;
+  size_t threadgroup_needed = half_dim;
+  size_t simds_needed = (threadgroup_needed + simd_size - 1) / simd_size;
+  size_t threadgroup_size = simd_size * simds_needed;
+
+  std::string kname = "rms_norm_rope_" + type_to_name(out);
+  auto kernel = d.get_kernel(kname);
+
+  assert(threadgroup_size <= kernel->maxTotalThreadsPerThreadgroup());
+  size_t n_threads = n_rows * threadgroup_size;
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.set_compute_pipeline_state(kernel);
+  compute_encoder.set_input_array(x, 0);
+  compute_encoder.set_input_array(w, 1);
+  compute_encoder.set_input_array(inv_freqs, 2);
+  compute_encoder.set_output_array(out, 3);
+  compute_encoder.set_bytes(eps_, 4);
+  compute_encoder.set_bytes(axis_size, 5);
+  compute_encoder.set_bytes(offset_, 6);
+  compute_encoder.set_bytes(n_heads_, 7);
+  compute_encoder.set_bytes(seq_len_, 8);
+  compute_encoder.dispatch_threads(
+      MTL::Size(n_threads, 1, 1),
+      MTL::Size(threadgroup_size, 1, 1));
+}
+
+bool RMSNormRoPE::is_equivalent(const Primitive& other) const {
+  const RMSNormRoPE& r = static_cast<const RMSNormRoPE&>(other);
+  return eps_ == r.eps_ && n_heads_ == r.n_heads_ &&
+         seq_len_ == r.seq_len_ && offset_ == r.offset_;
+}
+
 void RMSNormVJP::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
