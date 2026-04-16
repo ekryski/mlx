@@ -1480,8 +1480,10 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   // We are walking x in order and w is also in order so we can batch up the
   // matmuls and reuse reading x and w.
   //
-  // TODO: Tune 16 and 4 here a bit better.
-  if (M == 1 && B >= 16 && right_sorted_ == true && B / E >= 4) {
+  // Threshold lowered from B>=16 && B/E>=4 to B>=4 to enable the optimized
+  // sorted-gather path for MoE decode (topK=8, E=256 → B=8).
+  // The original thresholds excluded most MoE workloads from this path.
+  if (M == 1 && B >= 4 && right_sorted_ == true) {
     gather_qmm_rhs(
         x,
         w,
