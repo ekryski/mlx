@@ -283,6 +283,37 @@ TEST_CASE("icb CommandEncoder integration: missing dispatch throws at end") {
   (void)enc.end_icb_recording();
 }
 
+TEST_CASE("icb recorder: threadgroup memory length is recorded") {
+  auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+  constexpr size_t N = 8;
+  auto rig = make_rig(N);
+  auto& d = device(mlx::core::Device::gpu);
+
+  IndirectCommandRecorder rec(d, /*max_commands=*/1);
+  rec.begin_command(rig.pso_fill.get());
+  rec.set_kernel_buffer(rig.out_buf.get(), 0, 0);
+  struct { float v; } s{9.0f};
+  CHECK(rec.set_bytes(&s, sizeof(s), 1));
+  // Request 128 bytes of threadgroup memory at slot 0. The fill kernel
+  // doesn't actually use it, but this exercises the code path end-to-end
+  // without requiring a new kernel.
+  rec.set_threadgroup_memory(128, 0);
+  rec.end_command(MTL::Size(N, 1, 1), MTL::Size(1, 1, 1), true);
+  rec.finalize();
+
+  auto* cbuf = rig.queue->commandBuffer();
+  auto* enc = cbuf->computeCommandEncoder(MTL::DispatchTypeConcurrent);
+  rec.replay(enc);
+  enc->endEncoding();
+  cbuf->commit();
+  cbuf->waitUntilCompleted();
+
+  auto* out = static_cast<float*>(rig.out_buf->contents());
+  for (size_t i = 0; i < N; ++i) {
+    CHECK(out[i] == doctest::Approx(9.0f));
+  }
+}
+
 TEST_CASE("icb CommandEncoder integration: begin while recording throws") {
   auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
   auto rig = make_rig(8);

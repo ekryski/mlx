@@ -75,6 +75,10 @@ class MLX_API IndirectCommandRecorder {
   // then treat the recording as failed and fall back to direct dispatch.
   [[nodiscard]] bool set_bytes(const void* data, size_t length, int slot);
 
+  // Set threadgroup memory length at `slot` for the current command.
+  // Must be called after `begin_command` and before `end_command`.
+  void set_threadgroup_memory(size_t length, int slot);
+
   // Finalize the current command. If `use_dispatch_threads` is true, the
   // command is emitted with concurrentDispatchThreads (i.e. `grid` is
   // total thread count); otherwise concurrentDispatchThreadgroups is used
@@ -118,9 +122,21 @@ class MLX_API IndirectCommandRecorder {
     int64_t offset = 0;
   };
 
+  // Per-slot threadgroup memory allocation. `length == 0` means unused.
+  // We use a small number here because Metal's per-device max is typically
+  // 32KB and only a handful of slots are used in practice.
+  static constexpr int kMaxThreadgroupMemorySlots = 8;
+
+  struct ThreadgroupMem {
+    int slot = -1;
+    size_t length = 0;
+  };
+
   struct Command {
     MTL::ComputePipelineState* pipeline = nullptr;
     std::array<Binding, kMaxKernelBufferBindCount> bindings{};
+    std::array<ThreadgroupMem, kMaxThreadgroupMemorySlots> threadgroup_mem{};
+    int threadgroup_mem_count = 0;
     MTL::Size grid{0, 0, 0};
     MTL::Size group{0, 0, 0};
     bool use_dispatch_threads = false;

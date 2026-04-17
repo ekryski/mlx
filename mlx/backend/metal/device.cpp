@@ -339,6 +339,14 @@ void CommandEncoder::set_compute_pipeline_state(
   get_command_encoder()->setComputePipelineState(kernel);
 }
 
+void CommandEncoder::set_threadgroup_memory_length(size_t length, int idx) {
+  if (recording_) {
+    active_recorder_->set_threadgroup_memory(length, idx);
+    return;
+  }
+  get_command_encoder()->setThreadgroupMemoryLength(length, idx);
+}
+
 void CommandEncoder::set_bytes_raw(const void* data, size_t length, int idx) {
   if (recording_) {
     if (!active_recorder_->set_bytes(data, length, idx)) {

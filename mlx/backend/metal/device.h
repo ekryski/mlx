@@ -80,9 +80,7 @@ class MLX_API CommandEncoder {
     set_bytes_raw(&v, sizeof(T), idx);
   }
 
-  void set_threadgroup_memory_length(size_t length, int idx) {
-    get_command_encoder()->setThreadgroupMemoryLength(length, idx);
-  }
+  void set_threadgroup_memory_length(size_t length, int idx);
 
   ConcurrentContext start_concurrent() {
     return ConcurrentContext(*this);

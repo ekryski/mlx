@@ -154,6 +154,19 @@ bool IndirectCommandRecorder::set_bytes(
   return true;
 }
 
+void IndirectCommandRecorder::set_threadgroup_memory(size_t length, int slot) {
+  if (!cur_active_) {
+    throw std::logic_error(
+        "[metal::IndirectCommandRecorder] set_threadgroup_memory outside command");
+  }
+  if (cur_.threadgroup_mem_count >= kMaxThreadgroupMemorySlots) {
+    throw std::overflow_error(
+        "[metal::IndirectCommandRecorder] threadgroup memory slots exceeded");
+  }
+  cur_.threadgroup_mem[cur_.threadgroup_mem_count++] =
+      ThreadgroupMem{slot, length};
+}
+
 void IndirectCommandRecorder::end_command(
     MTL::Size grid,
     MTL::Size group,
@@ -189,6 +202,12 @@ void IndirectCommandRecorder::finalize() {
       if (b.buffer) {
         icmd->setKernelBuffer(b.buffer, static_cast<NS::UInteger>(b.offset), slot);
       }
+    }
+    for (int i = 0; i < c.threadgroup_mem_count; ++i) {
+      const auto& tm = c.threadgroup_mem[i];
+      icmd->setThreadgroupMemoryLength(
+          static_cast<NS::UInteger>(tm.length),
+          static_cast<NS::UInteger>(tm.slot));
     }
     if (c.use_dispatch_threads) {
       icmd->concurrentDispatchThreads(c.grid, c.group);
