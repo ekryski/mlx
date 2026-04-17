@@ -175,6 +175,13 @@ class MLX_API CommandEncoder {
   // gap for ICB replay (each skipped bind may mean a dispatch runs
   // with missing arguments).
   size_t icb_skipped_set_input_{0};
+  // Diagnostic counter — how many dispatch_threadgroups / dispatch_threads
+  // calls reached the encoder during the active recording. Compare with
+  // the ICB's recorded command count: a gap means some dispatches were
+  // begun but never finalized (e.g. set_compute_pipeline_state called
+  // twice in a row clobbered `cur_`) or the primitive called dispatch
+  // via a path we don't route through `recording_`.
+  size_t icb_dispatch_calls_{0};
 
   // Buffer that stores encoded commands.
   NS::SharedPtr<MTL::CommandQueue> queue_;

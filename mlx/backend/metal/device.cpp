@@ -498,6 +498,7 @@ void CommandEncoder::dispatch_threadgroups(
     maybeInsertBarrier();
     active_recorder_->end_command(grid_dims, group_dims, /*use_threads=*/false);
     has_pending_command_ = false;
+    icb_dispatch_calls_++;
     return;
   }
   maybeInsertBarrier();
@@ -522,6 +523,7 @@ void CommandEncoder::dispatch_threads(
     maybeInsertBarrier();
     active_recorder_->end_command(grid_dims, group_dims, /*use_threads=*/true);
     has_pending_command_ = false;
+    icb_dispatch_calls_++;
     return;
   }
   maybeInsertBarrier();
@@ -683,6 +685,7 @@ void CommandEncoder::begin_icb_recording(
   recording_ = true;
   has_pending_command_ = false;
   icb_skipped_set_input_ = 0;
+  icb_dispatch_calls_ = 0;
 }
 
 std::unique_ptr<IndirectCommandRecorder>
@@ -698,12 +701,19 @@ CommandEncoder::end_icb_recording() {
         "[metal::CommandEncoder] end_icb_recording with a pending command "
         "(missing dispatch after set_compute_pipeline_state)");
   }
+  // Expose recording diagnostics so callers can reconcile the ICB size
+  // against the live GPU.totalDispatches() counter.
+  std::cerr
+      << "[metal::ICB] dispatch calls routed through encoder during recording: "
+      << icb_dispatch_calls_
+      << "; set_input/buffer pre-pipeline skips: " << icb_skipped_set_input_
+      << std::endl;
   if (icb_skipped_set_input_ > 0) {
     std::cerr
-        << "[metal::ICB] warning: " << icb_skipped_set_input_
+        << "[metal::ICB] warning: "
+        << icb_skipped_set_input_
         << " set_input_array / set_buffer calls were skipped during recording "
-           "because no pipeline was bound. The replayed ICB may be missing "
-           "argument bindings; replay numerics may differ from live."
+           "because no pipeline was bound. Replay may be missing bindings."
         << std::endl;
   }
   active_recorder_->finalize();
