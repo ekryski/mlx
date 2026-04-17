@@ -19,6 +19,9 @@ size_t align_up(size_t x, size_t a) {
 
 } // namespace
 
+const std::vector<IndirectCommandRecorder::TagLocation>
+    IndirectCommandRecorder::kEmptyTagLocations_{};
+
 bool IndirectCommandRecorder::is_supported(Device& d) {
   auto* dev = d.mtl_device();
   if (!dev) {
@@ -229,6 +232,27 @@ void IndirectCommandRecorder::end_command(
     }
   }
 
+  // Resolve any pending binding tags against this command's bindings.
+  // Done before push_back so we can index the command via segments_.size()-1
+  // and seg.commands.size() as the final (post-push) position.
+  const size_t seg_idx = segments_.size() - 1;
+  const size_t cmd_idx = seg.commands.size();
+  if (!pending_tags_by_buffer_.empty()) {
+    for (int slot = 0; slot < kMaxKernelBufferBindCount; ++slot) {
+      const auto& b = cur_.bindings[slot];
+      if (!b.buffer) {
+        continue;
+      }
+      auto it = pending_tags_by_buffer_.find(b.buffer);
+      if (it == pending_tags_by_buffer_.end()) {
+        continue;
+      }
+      for (uint32_t name_id : it->second) {
+        tags_[name_id].push_back({seg_idx, cmd_idx, slot, b.offset});
+      }
+    }
+  }
+
   seg.commands.push_back(cur_);
   ++total_commands_;
   cur_active_ = false;
@@ -309,6 +333,121 @@ void IndirectCommandRecorder::replay(MTL::ComputeCommandEncoder* enc) const {
       enc->memoryBarrier(MTL::BarrierScopeBuffers);
     }
     for (const auto* buf : seg.resource_set) {
+      enc->useResource(buf, usage);
+    }
+    enc->executeCommandsInBuffer(seg.icb.get(), NS::Range(0, seg.commands.size()));
+    any_emitted = true;
+  }
+}
+
+size_t IndirectCommandRecorder::tag_binding(
+    uint32_t name_id,
+    const MTL::Buffer* buf) {
+  if (finalized_) {
+    throw std::logic_error(
+        "[metal::IndirectCommandRecorder] cannot tag after finalize");
+  }
+  if (!buf) {
+    throw std::invalid_argument(
+        "[metal::IndirectCommandRecorder] null buffer in tag_binding");
+  }
+
+  // Step 1: scan already-recorded bindings in all segments for matches.
+  size_t matches = 0;
+  auto& locs = tags_[name_id];
+  for (size_t si = 0; si < segments_.size(); ++si) {
+    const auto& seg = segments_[si];
+    for (size_t ci = 0; ci < seg.commands.size(); ++ci) {
+      const auto& cmd = seg.commands[ci];
+      for (int slot = 0; slot < kMaxKernelBufferBindCount; ++slot) {
+        const auto& b = cmd.bindings[slot];
+        if (b.buffer == buf) {
+          locs.push_back({si, ci, slot, b.offset});
+          ++matches;
+        }
+      }
+    }
+  }
+
+  // Step 2: register pending so future bindings of `buf` under this
+  // recorder also accrue tags via end_command.
+  pending_tags_by_buffer_[buf].push_back(name_id);
+
+  return matches;
+}
+
+const std::vector<IndirectCommandRecorder::TagLocation>&
+IndirectCommandRecorder::tags_for(uint32_t name_id) const {
+  auto it = tags_.find(name_id);
+  if (it == tags_.end()) {
+    return kEmptyTagLocations_;
+  }
+  return it->second;
+}
+
+void IndirectCommandRecorder::replay_with_overrides(
+    MTL::ComputeCommandEncoder* enc,
+    const std::vector<
+        std::tuple<uint32_t, const MTL::Buffer*, int64_t>>& overrides) {
+  if (!finalized_) {
+    throw std::logic_error(
+        "[metal::IndirectCommandRecorder] replay_with_overrides before finalize");
+  }
+  if (!enc) {
+    throw std::invalid_argument(
+        "[metal::IndirectCommandRecorder] null encoder");
+  }
+
+  // Per-segment additional-resource set for useResource. We must cover
+  // every override buffer on the live encoder even if it wasn't part of
+  // the original seg.resource_set.
+  std::vector<std::unordered_set<const MTL::Buffer*>> extra_resources(
+      segments_.size());
+
+  // Apply overrides: for each (name, buffer, offset) triple, walk every
+  // TagLocation registered under that name and rewrite the ICB's
+  // indirect compute command's slot binding. Missing names are skipped
+  // silently — caller may choose to override only a subset.
+  for (const auto& [name_id, new_buf, new_offset] : overrides) {
+    if (!new_buf) {
+      throw std::invalid_argument(
+          "[metal::IndirectCommandRecorder] null buffer in overrides");
+    }
+    auto it = tags_.find(name_id);
+    if (it == tags_.end()) {
+      continue;
+    }
+    for (const auto& loc : it->second) {
+      auto& seg = segments_[loc.segment_idx];
+      if (!seg.icb) {
+        // Empty segment somehow registered a tag — skip defensively.
+        continue;
+      }
+      auto* icmd = seg.icb->indirectComputeCommand(loc.command_in_segment);
+      icmd->setKernelBuffer(
+          new_buf,
+          static_cast<NS::UInteger>(new_offset),
+          loc.slot);
+      extra_resources[loc.segment_idx].insert(new_buf);
+    }
+  }
+
+  // Replay — identical structure to replay() but unions in the
+  // per-segment override buffers when calling useResource.
+  const auto usage = MTL::ResourceUsageRead | MTL::ResourceUsageWrite;
+  bool any_emitted = false;
+  for (size_t si = 0; si < segments_.size(); ++si) {
+    const auto& seg = segments_[si];
+    if (seg.commands.empty() || !seg.icb) {
+      continue;
+    }
+    if (any_emitted) {
+      enc->memoryBarrier(MTL::BarrierScopeBuffers);
+    }
+    for (const auto* buf : seg.resource_set) {
+      enc->useResource(buf, usage);
+    }
+    for (const auto* buf : extra_resources[si]) {
       enc->useResource(buf, usage);
     }
     enc->executeCommandsInBuffer(seg.icb.get(), NS::Range(0, seg.commands.size()));

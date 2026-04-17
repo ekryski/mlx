@@ -4,6 +4,9 @@
 
 #include <Metal/Metal.hpp>
 #include <array>
+#include <cstdint>
+#include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -106,6 +109,65 @@ class MLX_API IndirectCommandRecorder {
     return bytes_offset_;
   }
 
+  // ─────────────────────────────────────────────────────────────────────
+  // Named binding tags (for replay-with-overrides)
+  // ─────────────────────────────────────────────────────────────────────
+  //
+  // During recording, callers may associate a caller-chosen `name_id`
+  // with an MTLBuffer that flows through the recorded dispatches. At
+  // replay time, a different MTLBuffer can be substituted at every slot
+  // that was originally bound with the tagged buffer. This is how a
+  // per-layer ICB can be re-used across decode steps: each step rebinds
+  // the layer's mutable inputs (current hidden state, KV cache pointers,
+  // output slot) without re-encoding the dispatch sequence.
+
+  // Concrete binding location in the recorder. Populated as bindings
+  // are observed. `offset` preserves the original offset at record
+  // time so callers can override the buffer while keeping the offset
+  // (typical case: same tensor, different step).
+  struct TagLocation {
+    size_t segment_idx;
+    size_t command_in_segment;
+    int slot;
+    int64_t offset;
+  };
+
+  // Associate `name_id` with every slot currently (or subsequently)
+  // bound with `buf`. Behavior:
+  //   1. Scans every already-recorded binding and registers a
+  //      TagLocation for each match.
+  //   2. Registers a pending tag so that any *future* set_kernel_buffer
+  //      call with the same `buf` (for the lifetime of this recorder,
+  //      until finalize()) also produces a TagLocation.
+  //
+  // Returns the number of immediate matches found (step 1 only).
+  // Rationale: callers often tag before the layer they care about runs
+  // (e.g. tag the hidden-state input, then execute the layer). In that
+  // case step 1 returns 0 and the pending mechanism supplies the tags
+  // as bindings happen.
+  size_t tag_binding(uint32_t name_id, const MTL::Buffer* buf);
+
+  // All recorded TagLocations for `name_id`. Empty vector if unknown.
+  const std::vector<TagLocation>& tags_for(uint32_t name_id) const;
+
+  // Replay with per-name buffer overrides. For each (name_id, buffer,
+  // offset) entry:
+  //   - Look up every TagLocation registered under `name_id`.
+  //   - Rewrite the corresponding command's slot in the materialized
+  //     `MTL::IndirectCommandBuffer` via `setKernelBuffer`, using the
+  //     supplied offset.
+  //   - Ensure the override buffer is covered by `useResource` on the
+  //     live encoder before the segment's `executeCommandsInBuffer`.
+  //
+  // Any tag names not present in `overrides` keep their recorded
+  // binding. The ICB's commands are mutated in place — a subsequent
+  // replay() (no overrides) will observe the last overrides written.
+  // Callers typically replay_with_overrides every step.
+  void replay_with_overrides(
+      MTL::ComputeCommandEncoder* enc,
+      const std::vector<
+          std::tuple<uint32_t, const MTL::Buffer*, int64_t>>& overrides);
+
  private:
   struct Binding {
     const MTL::Buffer* buffer = nullptr;
@@ -170,6 +232,14 @@ class MLX_API IndirectCommandRecorder {
   std::unordered_set<const MTL::Buffer*> all_retained_;
 
   bool finalized_ = false;
+
+  // Named-binding tag storage. Populated by tag_binding and maintained
+  // by end_command (which scans cur_ bindings for pending matches
+  // before cur_ lands in a segment).
+  std::unordered_map<uint32_t, std::vector<TagLocation>> tags_;
+  std::unordered_map<const MTL::Buffer*, std::vector<uint32_t>>
+      pending_tags_by_buffer_;
+  static const std::vector<TagLocation> kEmptyTagLocations_;
 };
 
 } // namespace mlx::core::metal

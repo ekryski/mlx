@@ -370,6 +370,273 @@ TEST_CASE("icb recorder: threadgroup memory length is recorded") {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Named binding tags + replay_with_overrides
+// ─────────────────────────────────────────────────────────────────────
+
+TEST_CASE("icb recorder: tag after bindings redirects replay to override buffer") {
+  // Record a fill command targeting `out_buf_a`, tag it as name 42,
+  // then replay with an override redirecting name 42 to `out_buf_b`.
+  // The fill value must land in B, not A.
+  auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+  constexpr size_t N = 32;
+  auto rig = make_rig(N);
+
+  auto& d = device(mlx::core::Device::gpu);
+  auto* dev = d.mtl_device();
+  auto out_buf_b = NS::TransferPtr(
+      dev->newBuffer(N * sizeof(float), MTL::ResourceStorageModeShared));
+  auto* pb = static_cast<float*>(out_buf_b->contents());
+  for (size_t i = 0; i < N; ++i) {
+    pb[i] = 0.0f;
+  }
+
+  IndirectCommandRecorder rec(d, /*max_commands=*/1);
+  rec.begin_command(rig.pso_fill.get());
+  rec.set_kernel_buffer(rig.out_buf.get(), 0, /*slot=*/0);
+  float scale = 4.25f;
+  CHECK(rec.set_bytes(&scale, sizeof(scale), 1));
+  rec.end_command(MTL::Size(N, 1, 1), MTL::Size(1, 1, 1), true);
+
+  // Tag AFTER recording — matches existing binding at slot 0.
+  constexpr uint32_t kNameOutput = 42;
+  size_t matches = rec.tag_binding(kNameOutput, rig.out_buf.get());
+  CHECK(matches == 1);
+  const auto& locs = rec.tags_for(kNameOutput);
+  REQUIRE(locs.size() == 1);
+  CHECK(locs[0].segment_idx == 0);
+  CHECK(locs[0].command_in_segment == 0);
+  CHECK(locs[0].slot == 0);
+  CHECK(locs[0].offset == 0);
+
+  rec.finalize();
+
+  // Replay with override: write into out_buf_b instead.
+  auto* cbuf = rig.queue->commandBuffer();
+  auto* enc = cbuf->computeCommandEncoder(MTL::DispatchTypeConcurrent);
+  rec.replay_with_overrides(
+      enc,
+      {{kNameOutput, out_buf_b.get(), 0}});
+  enc->endEncoding();
+  cbuf->commit();
+  cbuf->waitUntilCompleted();
+
+  // The original buffer must be untouched (still 0) and the override
+  // buffer must hold the fill value.
+  auto* pa = static_cast<float*>(rig.out_buf->contents());
+  auto* pb_after = static_cast<float*>(out_buf_b->contents());
+  for (size_t i = 0; i < N; ++i) {
+    CHECK(pa[i] == doctest::Approx(0.0f));
+    CHECK(pb_after[i] == doctest::Approx(4.25f));
+  }
+}
+
+TEST_CASE("icb recorder: tag before bindings — pending matcher tags future binds") {
+  // Call tag_binding BEFORE recording any command; then record a
+  // dispatch that binds the tagged buffer. The pending matcher must
+  // produce the same TagLocation that an after-recording tag would.
+  auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+  constexpr size_t N = 16;
+  auto rig = make_rig(N);
+
+  auto& d = device(mlx::core::Device::gpu);
+  auto* dev = d.mtl_device();
+  auto out_buf_b = NS::TransferPtr(
+      dev->newBuffer(N * sizeof(float), MTL::ResourceStorageModeShared));
+  auto* pb = static_cast<float*>(out_buf_b->contents());
+  for (size_t i = 0; i < N; ++i) {
+    pb[i] = 0.0f;
+  }
+
+  IndirectCommandRecorder rec(d, /*max_commands=*/1);
+
+  // Tag BEFORE any commands — must return 0 immediate matches but
+  // register a pending tag so the next set_kernel_buffer lands in tags_.
+  constexpr uint32_t kName = 7;
+  size_t matches = rec.tag_binding(kName, rig.out_buf.get());
+  CHECK(matches == 0);
+  CHECK(rec.tags_for(kName).empty());
+
+  rec.begin_command(rig.pso_fill.get());
+  rec.set_kernel_buffer(rig.out_buf.get(), 0, /*slot=*/0);
+  float scale = 9.75f;
+  CHECK(rec.set_bytes(&scale, sizeof(scale), 1));
+  rec.end_command(MTL::Size(N, 1, 1), MTL::Size(1, 1, 1), true);
+
+  // After end_command, the pending tag must have fired.
+  const auto& locs = rec.tags_for(kName);
+  REQUIRE(locs.size() == 1);
+  CHECK(locs[0].command_in_segment == 0);
+  CHECK(locs[0].slot == 0);
+
+  rec.finalize();
+
+  auto* cbuf = rig.queue->commandBuffer();
+  auto* enc = cbuf->computeCommandEncoder(MTL::DispatchTypeConcurrent);
+  rec.replay_with_overrides(enc, {{kName, out_buf_b.get(), 0}});
+  enc->endEncoding();
+  cbuf->commit();
+  cbuf->waitUntilCompleted();
+
+  auto* pa = static_cast<float*>(rig.out_buf->contents());
+  auto* pb_after = static_cast<float*>(out_buf_b->contents());
+  for (size_t i = 0; i < N; ++i) {
+    CHECK(pa[i] == doctest::Approx(0.0f));
+    CHECK(pb_after[i] == doctest::Approx(9.75f));
+  }
+}
+
+TEST_CASE("icb recorder: replay_with_overrides across two segments with barriers") {
+  // Record fill into out_buf, split, add 2.5 into out_buf, split, add 2.5.
+  // Tag the output buffer. Replay with override redirecting to out_buf_b.
+  // Expected result in out_buf_b: 1.0 + 2.5 + 2.5 = 6.0.
+  auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+  constexpr size_t N = 32;
+  auto rig = make_rig(N);
+  auto& d = device(mlx::core::Device::gpu);
+  auto* dev = d.mtl_device();
+  auto out_buf_b = NS::TransferPtr(
+      dev->newBuffer(N * sizeof(float), MTL::ResourceStorageModeShared));
+  auto* pb = static_cast<float*>(out_buf_b->contents());
+  for (size_t i = 0; i < N; ++i) {
+    pb[i] = 0.0f;
+  }
+
+  IndirectCommandRecorder rec(d, /*max_commands_per_segment=*/4);
+
+  // Tag before recording to exercise the pending path across all three
+  // commands.
+  constexpr uint32_t kName = 99;
+  CHECK(rec.tag_binding(kName, rig.out_buf.get()) == 0);
+
+  rec.begin_command(rig.pso_fill.get());
+  rec.set_kernel_buffer(rig.out_buf.get(), 0, 0);
+  float v1 = 1.0f;
+  CHECK(rec.set_bytes(&v1, sizeof(v1), 1));
+  rec.end_command(MTL::Size(N, 1, 1), MTL::Size(1, 1, 1), true);
+
+  for (int i = 0; i < 2; ++i) {
+    rec.split_segment();
+    rec.begin_command(rig.pso_add.get());
+    rec.set_kernel_buffer(rig.out_buf.get(), 0, 0);
+    float v = 2.5f;
+    CHECK(rec.set_bytes(&v, sizeof(v), 1));
+    rec.end_command(MTL::Size(N, 1, 1), MTL::Size(1, 1, 1), true);
+  }
+  rec.finalize();
+  CHECK(rec.num_segments() == 3);
+  // Tag must cover all three commands — one per segment.
+  CHECK(rec.tags_for(kName).size() == 3);
+
+  auto* cbuf = rig.queue->commandBuffer();
+  auto* enc = cbuf->computeCommandEncoder(MTL::DispatchTypeConcurrent);
+  rec.replay_with_overrides(enc, {{kName, out_buf_b.get(), 0}});
+  enc->endEncoding();
+  cbuf->commit();
+  cbuf->waitUntilCompleted();
+
+  auto* pa = static_cast<float*>(rig.out_buf->contents());
+  auto* pb_after = static_cast<float*>(out_buf_b->contents());
+  for (size_t i = 0; i < N; ++i) {
+    CHECK(pa[i] == doctest::Approx(0.0f));
+    CHECK(pb_after[i] == doctest::Approx(6.0f));
+  }
+}
+
+TEST_CASE("icb recorder: replay_with_overrides preserves the original offset") {
+  // Record a fill at offset 16 * sizeof(float) into out_buf; override to
+  // out_buf_b with offset 0. The override's explicit offset must be
+  // honored (the recorder's stored offset is metadata for the caller,
+  // not the mutation itself).
+  auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+  constexpr size_t N = 32;
+  auto rig = make_rig(N);
+  auto& d = device(mlx::core::Device::gpu);
+  auto* dev = d.mtl_device();
+  auto out_buf_b = NS::TransferPtr(
+      dev->newBuffer(N * sizeof(float), MTL::ResourceStorageModeShared));
+  auto* pb = static_cast<float*>(out_buf_b->contents());
+  for (size_t i = 0; i < N; ++i) {
+    pb[i] = 0.0f;
+  }
+
+  IndirectCommandRecorder rec(d, /*max_commands=*/1);
+  constexpr int64_t kOrigOffset = 16 * sizeof(float);
+  rec.begin_command(rig.pso_fill.get());
+  rec.set_kernel_buffer(rig.out_buf.get(), kOrigOffset, 0);
+  float v = 3.0f;
+  CHECK(rec.set_bytes(&v, sizeof(v), 1));
+  // Only N/2 threads to match the offset window.
+  rec.end_command(MTL::Size(N / 2, 1, 1), MTL::Size(1, 1, 1), true);
+
+  constexpr uint32_t kName = 1;
+  CHECK(rec.tag_binding(kName, rig.out_buf.get()) == 1);
+  CHECK(rec.tags_for(kName).at(0).offset == kOrigOffset);
+
+  rec.finalize();
+
+  auto* cbuf = rig.queue->commandBuffer();
+  auto* enc = cbuf->computeCommandEncoder(MTL::DispatchTypeConcurrent);
+  rec.replay_with_overrides(enc, {{kName, out_buf_b.get(), /*offset=*/0}});
+  enc->endEncoding();
+  cbuf->commit();
+  cbuf->waitUntilCompleted();
+
+  auto* pb_after = static_cast<float*>(out_buf_b->contents());
+  // With override offset 0, the first N/2 elements of B must be 3.0.
+  for (size_t i = 0; i < N / 2; ++i) {
+    CHECK(pb_after[i] == doctest::Approx(3.0f));
+  }
+}
+
+TEST_CASE("icb recorder: tag after finalize throws") {
+  auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+  auto rig = make_rig(8);
+  auto& d = device(mlx::core::Device::gpu);
+  IndirectCommandRecorder rec(d, /*max_commands=*/1);
+  rec.begin_command(rig.pso_fill.get());
+  rec.set_kernel_buffer(rig.out_buf.get(), 0, 0);
+  float v = 0.0f;
+  CHECK(rec.set_bytes(&v, sizeof(v), 1));
+  rec.end_command(MTL::Size(8, 1, 1), MTL::Size(1, 1, 1), true);
+  rec.finalize();
+  CHECK_THROWS_AS(
+      rec.tag_binding(1, rig.out_buf.get()), std::logic_error);
+}
+
+TEST_CASE("icb recorder: replay_with_overrides on unknown name is a no-op") {
+  // Override for a name that was never tagged must not throw and must
+  // produce the same result as plain replay().
+  auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+  constexpr size_t N = 16;
+  auto rig = make_rig(N);
+  auto& d = device(mlx::core::Device::gpu);
+  auto* dev = d.mtl_device();
+  auto bogus = NS::TransferPtr(
+      dev->newBuffer(N * sizeof(float), MTL::ResourceStorageModeShared));
+
+  IndirectCommandRecorder rec(d, /*max_commands=*/1);
+  rec.begin_command(rig.pso_fill.get());
+  rec.set_kernel_buffer(rig.out_buf.get(), 0, 0);
+  float v = 2.0f;
+  CHECK(rec.set_bytes(&v, sizeof(v), 1));
+  rec.end_command(MTL::Size(N, 1, 1), MTL::Size(1, 1, 1), true);
+  rec.finalize();
+
+  auto* cbuf = rig.queue->commandBuffer();
+  auto* enc = cbuf->computeCommandEncoder(MTL::DispatchTypeConcurrent);
+  // Override a name that was never tagged. Must be a no-op.
+  rec.replay_with_overrides(enc, {{12345, bogus.get(), 0}});
+  enc->endEncoding();
+  cbuf->commit();
+  cbuf->waitUntilCompleted();
+
+  auto* pa = static_cast<float*>(rig.out_buf->contents());
+  for (size_t i = 0; i < N; ++i) {
+    CHECK(pa[i] == doctest::Approx(2.0f));
+  }
+}
+
 TEST_CASE("icb CommandEncoder integration: begin while recording throws") {
   auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
   auto rig = make_rig(8);
