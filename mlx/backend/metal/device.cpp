@@ -283,6 +283,12 @@ void CommandEncoder::set_buffer(
     int idx,
     int64_t offset /* = 0 */) {
   if (recording_) {
+    if (!has_pending_command_) {
+      abort_icb_recording_();
+      throw std::runtime_error(
+          "[metal::CommandEncoder] set_buffer while recording but no "
+          "pipeline bound — primitive not ICB-compatible.");
+    }
     // Raw MTLBuffer bindings bypass the dependency-tracking path (there's
     // no mlx::array to check for RAW against prev outputs). Just route to
     // the recorder.
@@ -307,6 +313,18 @@ void CommandEncoder::set_input_array(
   needs_barrier_ =
       needs_barrier_ | (prev_outputs_.find(r_buf) != prev_outputs_.end());
   if (recording_) {
+    if (!has_pending_command_) {
+      // Primitive called set_input_array without a preceding
+      // set_compute_pipeline_state in this recording window. The recorder
+      // cannot attribute this binding to any command. Abort recording
+      // cleanly so the caller sees a normal exception rather than
+      // propagating a half-corrupt recorder state.
+      abort_icb_recording_();
+      throw std::runtime_error(
+          "[metal::CommandEncoder] set_input_array while recording but no "
+          "pipeline bound — this primitive is not ICB-compatible; file an "
+          "issue with the primitive name or skip ICB capture for this model.");
+    }
     auto* a_buf = static_cast<const MTL::Buffer*>(a.buffer().ptr());
     active_recorder_->set_kernel_buffer(a_buf, a.offset() + offset, idx);
     return;
