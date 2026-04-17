@@ -836,13 +836,21 @@ NS::SharedPtr<MTL::Function> Device::get_function_(
 NS::SharedPtr<MTL::ComputePipelineState> Device::get_kernel_(
     const std::string& name,
     const MTL::Function* mtl_function) {
-  // Compile kernel to compute pipeline
+  // Compile kernel to compute pipeline. We always request ICB support so
+  // every pipeline can participate in an IndirectCommandRecorder capture
+  // without having to rebuild. Per Apple: "[supportIndirectCommandBuffers]
+  // doesn't affect performance when used for direct dispatch." Only
+  // relevant cost is a slightly larger PSO on disk.
   NS::Error* error = nullptr;
   NS::SharedPtr<MTL::ComputePipelineState> kernel;
 
   if (mtl_function) {
-    kernel =
-        NS::TransferPtr(device_->newComputePipelineState(mtl_function, &error));
+    auto pool = new_scoped_memory_pool();
+    auto desc = MTL::ComputePipelineDescriptor::alloc()->init()->autorelease();
+    desc->setComputeFunction(mtl_function);
+    desc->setSupportIndirectCommandBuffers(true);
+    kernel = NS::TransferPtr(device_->newComputePipelineState(
+        desc, MTL::PipelineOptionNone, nullptr, &error));
   }
 
   // Throw error if unable to compile metal function
@@ -884,6 +892,7 @@ NS::SharedPtr<MTL::ComputePipelineState> Device::get_kernel_(
   auto desc = MTL::ComputePipelineDescriptor::alloc()->init()->autorelease();
   desc->setComputeFunction(mtl_function);
   desc->setLinkedFunctions(linked_functions);
+  desc->setSupportIndirectCommandBuffers(true);
 
   // Compile kernel to compute pipeline
   NS::Error* error = nullptr;
