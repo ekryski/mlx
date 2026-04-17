@@ -668,12 +668,23 @@ void CommandEncoder::synchronize() {
   }
 }
 
+// Thread-local pointer set by begin_icb_recording so that
+// get_command_encoder(Stream) redirects every stream's lookup to the
+// recording encoder for the duration of the capture. Declared extern
+// because `get_command_encoder` is defined later in the file.
+extern thread_local CommandEncoder* t_icb_steer_target_;
+
 void CommandEncoder::begin_icb_recording(
     size_t max_commands,
     size_t bytes_arena_cap) {
   if (recording_) {
     throw std::logic_error(
         "[metal::CommandEncoder] begin_icb_recording while already recording");
+  }
+  if (t_icb_steer_target_ != nullptr) {
+    throw std::logic_error(
+        "[metal::CommandEncoder] begin_icb_recording while a different recording "
+        "is steering this thread");
   }
   // Flush anything the live encoder had pending so it doesn't interleave
   // with the ICB we're about to build. The live encoder is left in a
@@ -686,6 +697,14 @@ void CommandEncoder::begin_icb_recording(
   has_pending_command_ = false;
   icb_skipped_set_input_ = 0;
   icb_dispatch_calls_ = 0;
+
+  // Steer every stream's encoder lookup on this thread through us until
+  // end / abort. A secondary-stream primitive (MoE expert gather, a
+  // fast kernel taking a caller-supplied Stream) will now call through
+  // our set_compute_pipeline_state / set_input_array / dispatch_* and
+  // accumulate into the recorder instead of emitting live on a sibling
+  // encoder.
+  t_icb_steer_target_ = this;
 }
 
 std::unique_ptr<IndirectCommandRecorder>
@@ -718,6 +737,7 @@ CommandEncoder::end_icb_recording() {
   }
   active_recorder_->finalize();
   recording_ = false;
+  t_icb_steer_target_ = nullptr;
   auto r = std::move(active_recorder_);
   return r;
 }
@@ -726,6 +746,9 @@ void CommandEncoder::abort_icb_recording_() {
   recording_ = false;
   active_recorder_.reset();
   has_pending_command_ = false;
+  if (t_icb_steer_target_ == this) {
+    t_icb_steer_target_ = nullptr;
+  }
 }
 
 void CommandEncoder::abort_icb_recording() {
@@ -1124,7 +1147,32 @@ Device& device(mlx::core::Device) {
   return *metal_device;
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// ICB multi-stream capture: during an active recording, redirect every
+// `get_command_encoder(Stream)` lookup to a single target encoder so
+// that primitives which would normally dispatch to a secondary stream
+// (e.g. MoE expert gather, fast primitives that take a caller-supplied
+// stream) still accumulate into the recording encoder.
+//
+// The target pointer lives in thread_local storage — same scope as the
+// encoder map itself — so concurrent recordings on different threads
+// don't interfere, and the pointer never dangles across thread_local
+// destruction.
+//
+// Lifecycle: set by `CommandEncoder::begin_icb_recording`, cleared by
+// `end_icb_recording` / `abort_icb_recording_`.
+// ─────────────────────────────────────────────────────────────────────
+thread_local CommandEncoder* t_icb_steer_target_ = nullptr;
+
 CommandEncoder& get_command_encoder(Stream s) {
+  // If an ICB recording is active on this thread, every stream's
+  // dispatches route to the recording encoder so primitives that
+  // target secondary streams (MoE expert scheduling, fast kernels
+  // taking caller-supplied streams) still land in the ICB instead of
+  // bypassing it via a sibling encoder.
+  if (t_icb_steer_target_ != nullptr) {
+    return *t_icb_steer_target_;
+  }
   auto& encoders = get_command_encoders();
   auto it = encoders.find(s.index);
   if (it == encoders.end()) {

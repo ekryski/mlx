@@ -687,6 +687,50 @@ TEST_CASE("icb CommandEncoder integration: tag_binding + replay_with_overrides")
   }
 }
 
+TEST_CASE("icb CommandEncoder: multi-stream steering routes secondary streams to the recorder") {
+  // Begin recording on the default stream; then look up the encoder for
+  // a *new* stream. With steering active, the second lookup must return
+  // the SAME encoder (the recording one). Dispatching through it emits
+  // commands into the recorder, not a sibling encoder.
+  auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+  auto rig = make_rig(8);
+
+  mlx::core::Stream def_s =
+      mlx::core::default_stream(mlx::core::Device::gpu);
+  auto& def_enc = get_command_encoder(def_s);
+  REQUIRE_FALSE(def_enc.is_recording());
+
+  // Secondary stream — primitives scheduled on this stream would
+  // normally dispatch to a separate encoder.
+  mlx::core::Stream sec_s =
+      mlx::core::new_stream(mlx::core::Device::gpu);
+
+  def_enc.begin_icb_recording(/*max_commands=*/2);
+
+  // During recording, the secondary stream's encoder lookup must
+  // resolve to the recording encoder.
+  auto& sec_enc_during = get_command_encoder(sec_s);
+  CHECK(&sec_enc_during == &def_enc);
+  CHECK(sec_enc_during.is_recording());
+
+  // Drive a dispatch "on" the secondary stream. It must land in the
+  // recorder, not a sibling live encoder.
+  sec_enc_during.set_compute_pipeline_state(rig.pso_fill.get());
+  sec_enc_during.set_buffer(rig.out_buf.get(), 0);
+  struct Scale { float value; } scale{1.0f};
+  sec_enc_during.set_bytes(scale, 1);
+  sec_enc_during.dispatch_threads(MTL::Size(8, 1, 1), MTL::Size(1, 1, 1));
+
+  auto rec = def_enc.end_icb_recording();
+  REQUIRE(rec);
+  CHECK(rec->size() == 1);
+
+  // After recording ends, the secondary stream's encoder reverts to
+  // its own distinct instance.
+  auto& sec_enc_after = get_command_encoder(sec_s);
+  CHECK(&sec_enc_after != &def_enc);
+}
+
 TEST_CASE("icb CommandEncoder: tag_binding outside recording throws") {
   mlx::core::Stream s = mlx::core::default_stream(mlx::core::Device::gpu);
   auto& enc = get_command_encoder(s);
