@@ -908,7 +908,8 @@ array scaled_dot_product_attention(
     const std::string& mask_mode /* = "" */,
     std::optional<array> mask_arr /* = {} */,
     const std::optional<array>& sinks /* = {} */,
-    StreamOrDevice s /* = {}*/) {
+    StreamOrDevice s /* = {}*/,
+    int window_size /* = -1 */) {
   for (const auto& tensor : {queries, keys, values}) {
     if (tensor.ndim() != 4) {
       std::ostringstream msg;
@@ -944,6 +945,19 @@ array scaled_dot_product_attention(
     has_mask = true;
     has_arr_mask = true;
     has_bool_mask = mask_arr->dtype() == bool_;
+  }
+
+  // Sliding-window currently requires the causal mask mode: it narrows the
+  // causal triangle to a diagonal band of `window_size` keys per query.
+  if (window_size > 0 && !do_causal) {
+    std::ostringstream msg;
+    msg << "[scaled_dot_product_attention] window_size > 0 requires "
+        << "mask_mode == 'causal' (got '" << mask_mode << "').";
+    throw std::invalid_argument(msg.str());
+  }
+  if (window_size == 0) {
+    throw std::invalid_argument(
+        "[scaled_dot_product_attention] window_size must be positive (or -1 to disable).");
   }
 
   if (has_arr_mask && mask_arr->ndim() > 4) {
@@ -1010,6 +1024,7 @@ array scaled_dot_product_attention(
                    do_causal,
                    has_sinks,
                    has_arr_mask,
+                   window_size,
                    s](const std::vector<array>& inputs) {
     auto q = multiply(array(scale, inputs[0].dtype()), inputs[0], s);
     int n_repeats = n_q_heads / n_kv_heads;
@@ -1032,7 +1047,16 @@ array scaled_dot_product_attention(
           auto k_idx = arange(0, kL, s);
           q_idx = expand_dims(q_idx, 1, s);
           k_idx = expand_dims(k_idx, 0, s);
-          return greater_equal(q_idx, k_idx, s);
+          auto causal_mask = greater_equal(q_idx, k_idx, s);
+          if (window_size > 0) {
+            // Also require k_idx > q_idx - window_size — i.e., keys
+            // within the last `window_size` positions of each query.
+            auto lower_bound =
+                subtract(q_idx, array(window_size, q_idx.dtype()), s);
+            auto within_window = greater(k_idx, lower_bound, s);
+            return logical_and(causal_mask, within_window, s);
+          }
+          return causal_mask;
         }
         return inputs[3];
       };
@@ -1124,7 +1148,8 @@ array scaled_dot_product_attention(
           do_causal,
           is_training,
           output_logsumexp,
-          stream)) {
+          stream,
+          window_size)) {
     if (has_bool_mask && !ScaledDotProductAttention::supports_bool_mask()) {
       // Convert bool mask to additive mask.
       float inf = std::numeric_limits<float>::infinity();
@@ -1136,7 +1161,13 @@ array scaled_dot_product_attention(
     }
     Shape out_shape{q.shape(0), q.shape(1), q.shape(2), v.shape(-1)};
     auto primitive = std::make_shared<ScaledDotProductAttention>(
-        stream, fallback, scale, do_causal, has_sinks, output_logsumexp);
+        stream,
+        fallback,
+        scale,
+        do_causal,
+        has_sinks,
+        output_logsumexp,
+        window_size);
     if (output_logsumexp) {
       return array::make_arrays(
           {std::move(out_shape), Shape{q.shape(0), q.shape(1), q.shape(2), 1}},
@@ -1202,7 +1233,8 @@ bool ScaledDotProductAttention::is_equivalent(const Primitive& other) const {
       static_cast<const ScaledDotProductAttention&>(other);
   return scale_ == a_other.scale_ && do_causal_ == a_other.do_causal_ &&
       has_sinks_ == a_other.has_sinks_ &&
-      output_logsumexp_ == a_other.output_logsumexp_;
+      output_logsumexp_ == a_other.output_logsumexp_ &&
+      window_size_ == a_other.window_size_;
 }
 
 bool ScaledDotProductAttentionVJP::is_equivalent(const Primitive& other) const {
