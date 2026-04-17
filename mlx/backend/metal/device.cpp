@@ -334,16 +334,6 @@ void CommandEncoder::set_output_array(
   register_output_array(a);
 }
 
-void CommandEncoder::set_compute_pipeline_state(
-    MTL::ComputePipelineState* kernel) {
-  if (recording_) {
-    active_recorder_->begin_command(kernel);
-    has_pending_command_ = true;
-    return;
-  }
-  get_command_encoder()->setComputePipelineState(kernel);
-}
-
 void CommandEncoder::set_threadgroup_memory_length(size_t length, int idx) {
   if (recording_) {
     active_recorder_->set_threadgroup_memory(length, idx);
@@ -464,6 +454,11 @@ void CommandEncoder::set_compute_pipeline_state(
           : std::string("<unnamed>");
     }
     g_last_kernel_label_ = std::move(name);
+  }
+  if (recording_) {
+    active_recorder_->begin_command(kernel);
+    has_pending_command_ = true;
+    return;
   }
   get_command_encoder()->setComputePipelineState(kernel);
 }
