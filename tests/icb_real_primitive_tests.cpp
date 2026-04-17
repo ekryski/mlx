@@ -11,6 +11,8 @@
 // on a fresh command buffer, and checks the output. The first test that
 // crashes or produces wrong output identifies the primitive to fix.
 
+#include <cstring>
+
 #include "doctest/doctest.h"
 
 #include "mlx/mlx.h"
@@ -189,6 +191,95 @@ TEST_CASE("icb primitive: record + replay of fast::scaled_dot_product_attention"
   REQUIRE(rec);
   MESSAGE("fast::SDPA: size=", rec->size(), " segments=", rec->num_segments());
   CHECK(rec->size() > 0);
+}
+
+TEST_CASE("icb primitive: SDPA setBytes arena is shape-dependent (T_k varies)") {
+  // Records fast::scaled_dot_product_attention twice with identical
+  // Q shape but DIFFERENT K/V sequence length (T_k). If the kernel's
+  // setBytes-encoded payloads include T_k, the two recordings'
+  // bytes_arena contents will differ — which would mean ICB replay
+  // across growing-KV-cache decode steps requires either shape
+  // overrideability or per-step re-recording.
+  //
+  // If this test reports `arenas identical`, ICB replay across growing
+  // cache is numerically safe for SDPA alone. If it reports
+  // `arenas differ`, we have confirmation of a shape-dependency gap.
+  Stream s = default_stream(mlx::core::Device::gpu);
+  auto& enc = get_command_encoder(s);
+
+  // Match GPT-OSS-ish proportions: 1 batch, 64 heads, d_k=64. Use
+  // float16 to match the 4-bit quantized model's kernel path.
+  constexpr int H = 64;
+  constexpr int D = 64;
+
+  auto record_with_k_length = [&](int T_k) {
+    auto q = ones({1, H, 1, D}, float16, s);
+    auto k = ones({1, H, T_k, D}, float16, s);
+    auto v = ones({1, H, T_k, D}, float16, s);
+    enc.synchronize();
+
+    enc.begin_icb_recording(/*max_commands=*/512);
+    auto out = fast::scaled_dot_product_attention(
+        q, k, v,
+        /*scale=*/0.125f,
+        /*mask_mode=*/"causal",
+        /*mask_arrs=*/{},
+        /*memory_efficient_threshold=*/std::nullopt,
+        s);
+    eval(out);
+    return enc.end_icb_recording();
+  };
+
+  auto rec_1024 = record_with_k_length(1024);
+  auto rec_1025 = record_with_k_length(1025);
+
+  REQUIRE(rec_1024);
+  REQUIRE(rec_1025);
+
+  const size_t used_1024 = rec_1024->bytes_arena_used();
+  const size_t used_1025 = rec_1025->bytes_arena_used();
+
+  MESSAGE(
+      "SDPA T_k=1024: commands=", rec_1024->size(),
+      " segments=", rec_1024->num_segments(),
+      " bytes_used=", used_1024);
+  MESSAGE(
+      "SDPA T_k=1025: commands=", rec_1025->size(),
+      " segments=", rec_1025->num_segments(),
+      " bytes_used=", used_1025);
+
+  // Primary diagnostic: compare the used portion of the arenas
+  // byte-by-byte. Note: may only be meaningful when sizes match —
+  // if sizes differ, the command mix itself changed, which is even
+  // stronger evidence of shape dependence.
+  bool identical = false;
+  if (used_1024 == used_1025 && used_1024 > 0) {
+    const auto* a = static_cast<const uint8_t*>(rec_1024->bytes_arena_ptr());
+    const auto* b = static_cast<const uint8_t*>(rec_1025->bytes_arena_ptr());
+    REQUIRE(a);
+    REQUIRE(b);
+    identical = (std::memcmp(a, b, used_1024) == 0);
+  }
+
+  if (identical) {
+    MESSAGE(
+        "ARENAS IDENTICAL — SDPA setBytes payload is NOT T_k-dependent. "
+        "ICB replay across a growing KV cache is numerically safe for "
+        "this primitive.");
+  } else {
+    MESSAGE(
+        "ARENAS DIFFER — SDPA setBytes payload DOES depend on T_k. ICB "
+        "replay across a growing KV cache will compute on the recorded "
+        "T_k, not the current one. A decode-loop integration needs "
+        "either per-step re-record, shape-overrideable bindings, or "
+        "rounded-up fixed K/V shape.");
+  }
+
+  // The test itself is informational — it must not fail. Its purpose
+  // is to report the shape-dependency finding in the test output so
+  // the integration direction is data-driven.
+  CHECK(rec_1024->size() > 0);
+  CHECK(rec_1025->size() > 0);
 }
 
 TEST_CASE("icb primitive: exhaust bytes arena mid-record — expect throw") {

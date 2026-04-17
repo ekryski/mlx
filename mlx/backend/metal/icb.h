@@ -109,6 +109,14 @@ class MLX_API IndirectCommandRecorder {
     return bytes_offset_;
   }
 
+  // Read-only view into the used portion of the inline-bytes arena.
+  // For diagnostics and parity tests only — returned pointer is valid
+  // for the recorder's lifetime. Returns `nullptr` if the arena wasn't
+  // allocated (bytes_arena_cap_ == 0).
+  const void* bytes_arena_ptr() const {
+    return bytes_arena_ ? bytes_arena_->contents() : nullptr;
+  }
+
   // ─────────────────────────────────────────────────────────────────────
   // Named binding tags (for replay-with-overrides)
   // ─────────────────────────────────────────────────────────────────────
