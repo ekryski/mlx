@@ -637,6 +637,65 @@ TEST_CASE("icb recorder: replay_with_overrides on unknown name is a no-op") {
   }
 }
 
+TEST_CASE("icb CommandEncoder integration: tag_binding + replay_with_overrides") {
+  // End-to-end: record a fill through the CommandEncoder, tag the
+  // output buffer by name, finalize, then replay through the encoder
+  // with an override redirecting to a different buffer.
+  auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+  constexpr size_t N = 16;
+  auto rig = make_rig(N);
+
+  auto& d = device(mlx::core::Device::gpu);
+  auto* dev = d.mtl_device();
+  auto out_buf_b = NS::TransferPtr(
+      dev->newBuffer(N * sizeof(float), MTL::ResourceStorageModeShared));
+  auto* pb = static_cast<float*>(out_buf_b->contents());
+  for (size_t i = 0; i < N; ++i) {
+    pb[i] = 0.0f;
+  }
+
+  mlx::core::Stream s = mlx::core::default_stream(mlx::core::Device::gpu);
+  auto& enc = get_command_encoder(s);
+
+  enc.begin_icb_recording(/*max_commands=*/1);
+  enc.set_compute_pipeline_state(rig.pso_fill.get());
+  enc.set_buffer(rig.out_buf.get(), 0);
+  struct Scale { float value; } scale{5.5f};
+  enc.set_bytes(scale, 1);
+  enc.dispatch_threads(MTL::Size(N, 1, 1), MTL::Size(1, 1, 1));
+
+  // Tag the output slot by name. tag_binding must be called while
+  // recording is active; the encoder routes it to the recorder.
+  constexpr uint32_t kNameOut = 101;
+  enc.tag_binding(kNameOut, rig.out_buf.get());
+
+  auto rec = enc.end_icb_recording();
+  REQUIRE(rec);
+  CHECK(rec->tags_for(kNameOut).size() == 1);
+
+  // Replay with override — encoder must be out of recording mode now.
+  CHECK_FALSE(enc.is_recording());
+  enc.replay_icb_with_overrides(
+      *rec, {{kNameOut, out_buf_b.get(), 0}});
+  enc.synchronize();
+
+  auto* pa = static_cast<float*>(rig.out_buf->contents());
+  auto* pb_after = static_cast<float*>(out_buf_b->contents());
+  for (size_t i = 0; i < N; ++i) {
+    CHECK(pa[i] == doctest::Approx(0.0f));
+    CHECK(pb_after[i] == doctest::Approx(5.5f));
+  }
+}
+
+TEST_CASE("icb CommandEncoder: tag_binding outside recording throws") {
+  mlx::core::Stream s = mlx::core::default_stream(mlx::core::Device::gpu);
+  auto& enc = get_command_encoder(s);
+  CHECK_FALSE(enc.is_recording());
+  auto rig = make_rig(1);
+  CHECK_THROWS_AS(
+      enc.tag_binding(1, rig.out_buf.get()), std::logic_error);
+}
+
 TEST_CASE("icb CommandEncoder integration: begin while recording throws") {
   auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
   auto rig = make_rig(8);

@@ -132,6 +132,27 @@ class MLX_API CommandEncoder {
   // before reissuing work.
   void abort_icb_recording();
   void replay_icb(const IndirectCommandRecorder& recorder);
+
+  // Named-binding tag during recording. Must be called while a
+  // recording session is active; associates `name_id` with the
+  // underlying MTLBuffer of `a`. Any already-recorded command that
+  // binds that buffer (at any slot) is tagged immediately; any
+  // subsequent bind of the same buffer under this recorder is also
+  // tagged at end_command time. See
+  // `IndirectCommandRecorder::tag_binding` for semantics.
+  void tag_binding(uint32_t name_id, const array& a);
+  void tag_binding(uint32_t name_id, const MTL::Buffer* buf);
+
+  // Replay a recorded IndirectCommandRecorder with per-name buffer
+  // overrides. Each override triple is (name_id, override_buffer,
+  // override_offset). See
+  // `IndirectCommandRecorder::replay_with_overrides` for semantics —
+  // in particular, override writes mutate the recorder's ICBs in place.
+  void replay_icb_with_overrides(
+      IndirectCommandRecorder& recorder,
+      const std::vector<
+          std::tuple<uint32_t, const MTL::Buffer*, int64_t>>& overrides);
+
   bool is_recording() const {
     return recording_;
   }

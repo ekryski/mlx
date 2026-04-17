@@ -744,6 +744,31 @@ void CommandEncoder::replay_icb(const IndirectCommandRecorder& recorder) {
   recorder.replay(get_command_encoder());
 }
 
+void CommandEncoder::tag_binding(uint32_t name_id, const array& a) {
+  tag_binding(
+      name_id, static_cast<const MTL::Buffer*>(a.buffer().ptr()));
+}
+
+void CommandEncoder::tag_binding(uint32_t name_id, const MTL::Buffer* buf) {
+  if (!recording_) {
+    throw std::logic_error(
+        "[metal::CommandEncoder] tag_binding requires active recording");
+  }
+  active_recorder_->tag_binding(name_id, buf);
+}
+
+void CommandEncoder::replay_icb_with_overrides(
+    IndirectCommandRecorder& recorder,
+    const std::vector<
+        std::tuple<uint32_t, const MTL::Buffer*, int64_t>>& overrides) {
+  if (recording_) {
+    throw std::logic_error(
+        "[metal::CommandEncoder] replay_icb_with_overrides while recording is active");
+  }
+  buffer_ops_ += 1;
+  recorder.replay_with_overrides(get_command_encoder(), overrides);
+}
+
 MTL::ComputeCommandEncoder* CommandEncoder::get_command_encoder() {
   if (!encoder_) {
     encoder_ = NS::RetainPtr(
