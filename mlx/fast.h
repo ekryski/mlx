@@ -116,7 +116,8 @@ MLX_API array scaled_dot_product_attention(
     const std::string& mask_mode = "",
     std::optional<array> mask_arr = {},
     const std::optional<array>& sinks = {},
-    StreamOrDevice s = {});
+    StreamOrDevice s = {},
+    int window_size = -1);
 
 using TemplateArg = std::variant<int, bool, Dtype>;
 using ScalarArg = std::variant<bool, int, float>;

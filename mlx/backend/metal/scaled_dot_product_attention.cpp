@@ -595,7 +595,8 @@ bool ScaledDotProductAttention::use_fallback(
     bool do_causal,
     bool is_training,
     bool output_logsumexp,
-    Stream s) {
+    Stream s,
+    int window_size) {
   if (is_training) {
     // It's faster for training on Metal to use the unfused SDPA for both
     // forward and backward.
@@ -605,6 +606,13 @@ bool ScaledDotProductAttention::use_fallback(
     return true;
   }
   if (s.device == Device::cpu) {
+    return true;
+  }
+  // Sliding-window masks are synthesized in the composed fallback path
+  // (arange + compare on GPU). None of the current Steel / sdpa_vector /
+  // NAX kernels honor an additional window bound — they treat the causal
+  // mask as a full lower triangle. Route windowed cases through fallback.
+  if (window_size > 0) {
     return true;
   }
 
