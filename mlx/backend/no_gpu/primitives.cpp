@@ -32,7 +32,8 @@ bool fast::ScaledDotProductAttention::use_fallback(
     bool do_causal,
     bool is_training,
     bool output_logsumexp,
-    Stream s) {
+    Stream s,
+    int window_size) {
   return true;
 }
 
