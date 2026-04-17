@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstdint>
+#include <iostream>
 #include <sstream>
 
 #include <fmt/format.h>
@@ -317,6 +318,7 @@ void CommandEncoder::set_input_array(
     // splitting but are meaningless to the ICB (they'd bind to no command).
     // Swallow them silently when no command is in progress.
     if (!has_pending_command_) {
+      icb_skipped_set_input_++;
       return;
     }
     auto* a_buf = static_cast<const MTL::Buffer*>(a.buffer().ptr());
@@ -680,6 +682,7 @@ void CommandEncoder::begin_icb_recording(
       device_, max_commands, bytes_arena_cap);
   recording_ = true;
   has_pending_command_ = false;
+  icb_skipped_set_input_ = 0;
 }
 
 std::unique_ptr<IndirectCommandRecorder>
@@ -694,6 +697,14 @@ CommandEncoder::end_icb_recording() {
     throw std::logic_error(
         "[metal::CommandEncoder] end_icb_recording with a pending command "
         "(missing dispatch after set_compute_pipeline_state)");
+  }
+  if (icb_skipped_set_input_ > 0) {
+    std::cerr
+        << "[metal::ICB] warning: " << icb_skipped_set_input_
+        << " set_input_array / set_buffer calls were skipped during recording "
+           "because no pipeline was bound. The replayed ICB may be missing "
+           "argument bindings; replay numerics may differ from live."
+        << std::endl;
   }
   active_recorder_->finalize();
   recording_ = false;

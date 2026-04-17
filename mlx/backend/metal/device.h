@@ -135,6 +135,14 @@ class MLX_API CommandEncoder {
   bool is_recording() const {
     return recording_;
   }
+  // Number of set_input_array / set_buffer calls that were silently
+  // skipped during the most recent recording session because no
+  // pipeline command was in progress. High counts indicate primitives
+  // relying on sticky bindings across dispatches — an ICB-incompatible
+  // pattern. Reset to 0 on begin_icb_recording.
+  size_t icb_skipped_set_input_count() const {
+    return icb_skipped_set_input_;
+  }
 
   MTL::CommandQueue* get_command_queue() const {
     return queue_.get();
@@ -162,6 +170,11 @@ class MLX_API CommandEncoder {
   // Staged dispatch state: set by `set_compute_pipeline_state` and closed
   // out by `dispatch_*`. Only meaningful while recording.
   bool has_pending_command_{false};
+  // Diagnostic counter — how many set_input_array / set_buffer calls
+  // we ignored because no pipeline was bound. Exposes the correctness
+  // gap for ICB replay (each skipped bind may mean a dispatch runs
+  // with missing arguments).
+  size_t icb_skipped_set_input_{0};
 
   // Buffer that stores encoded commands.
   NS::SharedPtr<MTL::CommandQueue> queue_;
