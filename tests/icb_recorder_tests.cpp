@@ -283,6 +283,65 @@ TEST_CASE("icb CommandEncoder integration: missing dispatch throws at end") {
   (void)enc.end_icb_recording();
 }
 
+TEST_CASE("icb recorder: explicit split between fill and sequential accumulate") {
+  // With a split between every add, reads of out_buf sit AFTER a memory
+  // barrier on replay. Result is deterministic: 1.0 + 2.5 * 3 = 8.5.
+  auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+  constexpr size_t N = 32;
+  auto rig = make_rig(N);
+  auto& d = device(mlx::core::Device::gpu);
+
+  IndirectCommandRecorder rec(d, /*max_commands_per_segment=*/4);
+
+  rec.begin_command(rig.pso_fill.get());
+  rec.set_kernel_buffer(rig.out_buf.get(), 0, 0);
+  float v1 = 1.0f;
+  CHECK(rec.set_bytes(&v1, sizeof(v1), 1));
+  rec.end_command(MTL::Size(N, 1, 1), MTL::Size(1, 1, 1), true);
+
+  for (int i = 0; i < 3; ++i) {
+    rec.split_segment();
+    rec.begin_command(rig.pso_add.get());
+    rec.set_kernel_buffer(rig.out_buf.get(), 0, 0);
+    float v2 = 2.5f;
+    CHECK(rec.set_bytes(&v2, sizeof(v2), 1));
+    rec.end_command(MTL::Size(N, 1, 1), MTL::Size(1, 1, 1), true);
+  }
+  rec.finalize();
+  CHECK(rec.num_segments() == 4);
+  CHECK(rec.size() == 4);
+
+  auto* cbuf = rig.queue->commandBuffer();
+  auto* enc = cbuf->computeCommandEncoder(MTL::DispatchTypeConcurrent);
+  rec.replay(enc);
+  enc->endEncoding();
+  cbuf->commit();
+  cbuf->waitUntilCompleted();
+
+  auto* out = static_cast<float*>(rig.out_buf->contents());
+  for (size_t i = 0; i < N; ++i) {
+    CHECK(out[i] == doctest::Approx(8.5f));  // 1.0 + 3 * 2.5
+  }
+}
+
+TEST_CASE("icb recorder: split on empty segment is a no-op") {
+  auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+  auto rig = make_rig(8);
+  auto& d = device(mlx::core::Device::gpu);
+
+  IndirectCommandRecorder rec(d, /*max_commands_per_segment=*/4);
+  rec.split_segment();  // No-op — segment was empty
+  rec.split_segment();  // No-op — still empty
+
+  rec.begin_command(rig.pso_fill.get());
+  rec.set_kernel_buffer(rig.out_buf.get(), 0, 0);
+  float v = 1.0f;
+  CHECK(rec.set_bytes(&v, sizeof(v), 1));
+  rec.end_command(MTL::Size(8, 1, 1), MTL::Size(1, 1, 1), true);
+  rec.finalize();
+  CHECK(rec.num_segments() == 1);  // Only the real segment exists
+}
+
 TEST_CASE("icb recorder: threadgroup memory length is recorded") {
   auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
   constexpr size_t N = 8;

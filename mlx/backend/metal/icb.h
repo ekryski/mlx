@@ -13,48 +13,40 @@ namespace mlx::core::metal {
 
 class Device;
 
-// Captures a stable sequence of compute dispatches as an
-// MTLIndirectCommandBuffer so the sequence can be replayed on subsequent
-// evaluations with substantially lower CPU encoding cost.
+// Captures a stable sequence of compute dispatches as one or more
+// MTLIndirectCommandBuffer segments, separated by memory barriers. The
+// captured sequence can be replayed on subsequent evaluations with
+// substantially lower CPU encoding cost than direct dispatch.
 //
 // Feasibility: see tests/icb_feasibility_tests.cpp — ~17x speedup on
 // encoding 1500 trivial dispatches (M1 Max, macOS 26.2).
 //
 // Design notes:
-//   - Bindings are captured per-slot into a compact command table and
-//     materialized into the ICB on `finalize()`. This keeps the hot path
-//     (record_* calls) allocation-free after construction.
-//   - `MTLIndirectComputeCommand` has no `setBytes` — inline constants
-//     spill into an arena-allocated shared-memory buffer during recording
-//     and bind as a kernel buffer on replay.
-//   - ICB execution uses `IndirectCommandTypeConcurrentDispatch`, so the
-//     recorded sequence must be barrier-free. A caller that needs
-//     barriers splits the work into multiple recorders and interleaves
-//     barriers on the live encoder between replays. This is handled one
-//     level up (by `CommandEncoder` integration), not here.
-//   - The recorder holds references to every MTLBuffer and pipeline it
-//     recorded so they cannot be freed while the ICB is alive. Replay
-//     callers still need to `useResource` those buffers on the executing
-//     command buffer — `replay()` does this automatically.
+//   - `MTL::IndirectComputeCommand` cannot emit memory barriers, so the
+//     recorder splits the recording into multiple ICB segments at every
+//     caller-requested barrier boundary. Replay walks segments and emits
+//     `memoryBarrier(BarrierScopeBuffers)` on the live encoder between
+//     them.
+//   - `MTL::IndirectComputeCommand` has no `setBytes` — inline constants
+//     spill into a shared-memory arena during recording and bind as a
+//     kernel buffer on replay. The arena is shared across all segments.
+//   - Strong-references every MTLBuffer it binds so replay after mlx's
+//     original array references go out of scope is safe.
 class MLX_API IndirectCommandRecorder {
  public:
   // Hard cap per Metal's compute ICB limits (tier-2 argument buffer GPUs
-  // support 31 compute-kernel buffer bindings). We set the descriptor's
-  // maxKernelBufferBindCount to this value.
+  // support 31 compute-kernel buffer bindings).
   static constexpr int kMaxKernelBufferBindCount = 31;
 
-  // Feature gate. Returns true on any GPU that supports MTLIndirectCommandBuffer
-  // for compute with per-command pipeline binding. On Apple Silicon this is
-  // effectively every M-series device, but we probe at runtime rather than
-  // assuming.
+  // Feature gate — effectively every M-series device.
   static bool is_supported(Device& d);
 
-  // `max_commands` is the capacity of the underlying ICB. `bytes_arena_cap`
-  // is the total pool available for spilled inline constants across all
-  // commands.
+  // `max_commands_per_segment` is the capacity of each ICB segment.
+  // `bytes_arena_cap` is the total pool shared across all segments for
+  // spilled inline constants.
   IndirectCommandRecorder(
       Device& d,
-      size_t max_commands,
+      size_t max_commands_per_segment,
       size_t bytes_arena_cap = 64 * 1024);
   ~IndirectCommandRecorder();
 
@@ -62,56 +54,54 @@ class MLX_API IndirectCommandRecorder {
   IndirectCommandRecorder& operator=(const IndirectCommandRecorder&) = delete;
 
   // Start a new command. `pipeline` must have been built with
-  // setSupportIndirectCommandBuffers(true); passing a non-ICB pipeline
-  // results in an invalid ICB at finalize time.
+  // setSupportIndirectCommandBuffers(true).
   void begin_command(MTL::ComputePipelineState* pipeline);
 
-  // Bind a device buffer at `slot` for the current command. `slot` must
-  // be in [0, kMaxKernelBufferBindCount).
+  // Bind a device buffer at `slot` for the current command.
   void set_kernel_buffer(const MTL::Buffer* buf, int64_t offset, int slot);
 
   // Spill `length` bytes into the arena and bind the resulting region at
-  // `slot`. Returns false if the arena is exhausted; the caller should
-  // then treat the recording as failed and fall back to direct dispatch.
+  // `slot`. Returns false if the arena is exhausted.
   [[nodiscard]] bool set_bytes(const void* data, size_t length, int slot);
 
   // Set threadgroup memory length at `slot` for the current command.
-  // Must be called after `begin_command` and before `end_command`.
   void set_threadgroup_memory(size_t length, int slot);
 
-  // Finalize the current command. If `use_dispatch_threads` is true, the
-  // command is emitted with concurrentDispatchThreads (i.e. `grid` is
-  // total thread count); otherwise concurrentDispatchThreadgroups is used
-  // (`grid` is in threadgroup units).
+  // Finalize the current command.
   void end_command(MTL::Size grid, MTL::Size group, bool use_dispatch_threads);
 
-  // Number of commands recorded so far.
+  // Close the current segment (allocating and populating its ICB), open
+  // a new segment for subsequent commands. Replay inserts a memory
+  // barrier between consecutive segments. No-op if the current segment
+  // is empty (no wasted barriers). Must not be called while a command
+  // is partially built.
+  void split_segment();
+
+  // Total number of commands across all segments.
   size_t size() const {
-    return next_cmd_;
+    return total_commands_;
   }
 
-  // Whether the recorder has been finalized; replay is only legal after.
+  // Number of segments (ICBs) recorded. Always ≥ 1 after first command.
+  size_t num_segments() const {
+    return segments_.size();
+  }
+
   bool finalized() const {
     return finalized_;
   }
 
-  // Materialize the recorded commands into the ICB. Must be called before
-  // `replay`. No further commands can be recorded after `finalize`.
+  // Materialize the final (open) segment's ICB. Must be called before
+  // replay. No further record_* calls after this.
   void finalize();
 
-  // Replay the recorded sequence on `enc`. The caller must have a live
-  // compute encoder. `replay` will:
-  //   - Call `useResource` on every MTLBuffer the recording references,
-  //     including the bytes-arena buffer itself.
-  //   - Issue a single `executeCommandsInBuffer` for the full range.
+  // Replay the full recorded sequence on `enc`. For each segment:
+  //   - calls `useResource` on every referenced buffer, and
+  //   - issues `executeCommandsInBuffer` for the segment's range.
+  // Between consecutive segments, emits a memory barrier on `enc`.
   void replay(MTL::ComputeCommandEncoder* enc) const;
 
-  // Access to the underlying ICB (for debugging / advanced integration).
-  const MTL::IndirectCommandBuffer* icb() const {
-    return icb_.get();
-  }
-
-  // Total bytes consumed from the inline-bytes arena so far. For telemetry.
+  // Total bytes consumed from the inline-bytes arena.
   size_t bytes_arena_used() const {
     return bytes_offset_;
   }
@@ -122,9 +112,6 @@ class MLX_API IndirectCommandRecorder {
     int64_t offset = 0;
   };
 
-  // Per-slot threadgroup memory allocation. `length == 0` means unused.
-  // We use a small number here because Metal's per-device max is typically
-  // 32KB and only a handful of slots are used in practice.
   static constexpr int kMaxThreadgroupMemorySlots = 8;
 
   struct ThreadgroupMem {
@@ -142,32 +129,45 @@ class MLX_API IndirectCommandRecorder {
     bool use_dispatch_threads = false;
   };
 
+  struct Segment {
+    NS::SharedPtr<MTL::IndirectCommandBuffer> icb;
+    std::vector<Command> commands;
+    std::unordered_set<const MTL::Buffer*> resource_set;
+  };
+
+  // Builds the descriptor and allocates the ICB for a segment, given its
+  // known command count.
+  NS::SharedPtr<MTL::IndirectCommandBuffer> allocate_icb_(size_t max_commands);
+
+  // Materialize `commands` into `icb` (set pipeline, bindings, threadgroup
+  // mem, dispatch) for one segment.
+  static void materialize_icb_(
+      const std::vector<Command>& commands,
+      MTL::IndirectCommandBuffer* icb);
+
+  // Add a buffer to the current segment's resource_set and retain if new.
+  void track_resource_(const MTL::Buffer* buf);
+
   Device& device_;
-  size_t max_commands_;
+  size_t max_commands_per_segment_;
   size_t bytes_arena_cap_;
 
-  NS::SharedPtr<MTL::IndirectCommandBuffer> icb_;
+  std::vector<Segment> segments_;
 
-  std::vector<Command> commands_;
+  // The command currently being built.
   Command cur_{};
   bool cur_active_ = false;
-  size_t next_cmd_ = 0;
+  size_t total_commands_ = 0;
 
-  // Shared-memory arena for spilled `setBytes` payloads. Shared so we can
-  // memcpy into it from the CPU cheaply; each command that uses bytes
-  // carves a suballocation and binds it at the appropriate slot.
+  // Shared-memory arena for spilled setBytes payloads. Shared across all
+  // segments in this recorder.
   NS::SharedPtr<MTL::Buffer> bytes_arena_;
   size_t bytes_offset_ = 0;
 
-  // Unique set of referenced buffers — used to drive `useResource` on
-  // replay. Includes the bytes arena itself.
-  std::unordered_set<const MTL::Buffer*> resource_set_;
-
-  // Strong references to every buffer we reference, so they outlive any
-  // mlx::core::array that originally owned them. Without this, replay
-  // after a decode step that drops the array would dereference freed
-  // Metal buffers.
+  // Strong refs to every unique MTLBuffer we bound, so backing storage
+  // outlives any mlx::core::array that originally held it.
   std::vector<NS::SharedPtr<MTL::Buffer>> retained_buffers_;
+  std::unordered_set<const MTL::Buffer*> all_retained_;
 
   bool finalized_ = false;
 };

@@ -283,6 +283,9 @@ void CommandEncoder::set_buffer(
     int idx,
     int64_t offset /* = 0 */) {
   if (recording_) {
+    // Raw MTLBuffer bindings bypass the dependency-tracking path (there's
+    // no mlx::array to check for RAW against prev outputs). Just route to
+    // the recorder.
     active_recorder_->set_kernel_buffer(buf, offset, idx);
     return;
   }
@@ -297,6 +300,12 @@ void CommandEncoder::set_input_array(
     const array& a,
     int idx,
     int64_t offset /* = 0 */) {
+  // Barrier tracking runs whether recording or not — during recording
+  // the flag drives ICB segment splitting via maybeInsertBarrier; outside
+  // recording it drives memory-barrier emission on the live encoder.
+  auto r_buf = static_cast<MTL::Resource*>(const_cast<void*>(a.buffer().ptr()));
+  needs_barrier_ =
+      needs_barrier_ | (prev_outputs_.find(r_buf) != prev_outputs_.end());
   if (recording_) {
     auto* a_buf = static_cast<const MTL::Buffer*>(a.buffer().ptr());
     active_recorder_->set_kernel_buffer(a_buf, a.offset() + offset, idx);
@@ -305,9 +314,6 @@ void CommandEncoder::set_input_array(
   if (all_inputs_.insert(a.buffer().ptr()).second) {
     buffer_sizes_ += a.data_size();
   }
-  auto r_buf = static_cast<MTL::Resource*>(const_cast<void*>(a.buffer().ptr()));
-  needs_barrier_ =
-      needs_barrier_ | (prev_outputs_.find(r_buf) != prev_outputs_.end());
   auto a_buf = static_cast<const MTL::Buffer*>(a.buffer().ptr());
   get_command_encoder()->setBuffer(a_buf, a.offset() + offset, idx);
 }
@@ -317,11 +323,10 @@ void CommandEncoder::set_output_array(
     int idx,
     int64_t offset /* = 0 */) {
   if (recording_) {
-    // During recording, register_output_array's state machine (next_outputs_,
-    // prev_outputs_) is irrelevant because maybeInsertBarrier is a no-op.
-    // We only need the buffer binding.
-    auto* a_buf = static_cast<const MTL::Buffer*>(a.buffer().ptr());
-    active_recorder_->set_kernel_buffer(a_buf, a.offset() + offset, idx);
+    // Track outputs in next_outputs_ so a subsequent read of this array
+    // raises needs_barrier_ and triggers an ICB segment split.
+    set_input_array(a, idx, offset);
+    register_output_array(a);
     return;
   }
   // Add barriers before adding the output to the output set
@@ -383,11 +388,20 @@ void CommandEncoder::add_temporaries(std::vector<array> arrays) {
 
 void CommandEncoder::maybeInsertBarrier() {
   if (recording_) {
-    // Inside an ICB recording window we cannot emit memory barriers —
-    // MTLIndirectComputeCommand has no barrier primitive. The caller
-    // guarantees the recorded sequence is barrier-independent (either
-    // the ops are truly concurrent, or barriers get inserted *between*
-    // multiple ICB recorders at a higher level).
+    // MTLIndirectComputeCommand cannot emit memory barriers. When a RAW
+    // dependency is detected, split the recording into a new ICB segment
+    // — replay will insert a memoryBarrier between segments on the live
+    // encoder. Dependency tracking (prev_outputs_ / next_outputs_ /
+    // needs_barrier_) runs the same as in the live path so splits fire
+    // exactly where a live barrier would.
+    if (needs_barrier_) {
+      active_recorder_->split_segment();
+      needs_barrier_ = false;
+      prev_outputs_ = std::move(next_outputs_);
+    } else {
+      prev_outputs_.insert(next_outputs_.begin(), next_outputs_.end());
+    }
+    next_outputs_.clear();
     return;
   }
   if (needs_barrier_) {
@@ -463,6 +477,11 @@ void CommandEncoder::dispatch_threadgroups(
           "[metal::CommandEncoder] dispatch_threadgroups while recording "
           "without a preceding set_compute_pipeline_state");
     }
+    // Barrier check fires *before* the command is appended to the current
+    // segment, so when needs_barrier_ is true the current command lands in
+    // a freshly-started segment — replay will emit a memoryBarrier on the
+    // live encoder between the two segments.
+    maybeInsertBarrier();
     active_recorder_->end_command(grid_dims, group_dims, /*use_threads=*/false);
     has_pending_command_ = false;
     return;
@@ -486,6 +505,7 @@ void CommandEncoder::dispatch_threads(
           "[metal::CommandEncoder] dispatch_threads while recording "
           "without a preceding set_compute_pipeline_state");
     }
+    maybeInsertBarrier();
     active_recorder_->end_command(grid_dims, group_dims, /*use_threads=*/true);
     has_pending_command_ = false;
     return;
