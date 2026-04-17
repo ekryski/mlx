@@ -1,6 +1,8 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <atomic>
 #include <cstdlib>
+#include <cstdint>
 #include <sstream>
 
 #include <fmt/format.h>
@@ -342,12 +344,19 @@ void CommandEncoder::maybeInsertBarrier() {
   next_outputs_.clear();
 }
 
+// Process-wide dispatch counter. Must be static (not per-encoder) so the
+// `metal::reset_dispatch_counter()` / `total_dispatches()` API returns the
+// total across all stream encoders — MLX ops can run on any of several
+// stream-specific encoders, and a per-encoder counter would miss anything
+// not on whichever stream the caller happened to query.
+static std::atomic<uint64_t> g_total_dispatches_{0};
+
 void CommandEncoder::dispatch_threadgroups(
     MTL::Size grid_dims,
     MTL::Size group_dims) {
   maybeInsertBarrier();
   buffer_ops_++;
-  total_dispatches_++;
+  g_total_dispatches_.fetch_add(1, std::memory_order_relaxed);
   get_command_encoder()->dispatchThreadgroups(grid_dims, group_dims);
 }
 
@@ -356,16 +365,16 @@ void CommandEncoder::dispatch_threads(
     MTL::Size group_dims) {
   maybeInsertBarrier();
   buffer_ops_++;
-  total_dispatches_++;
+  g_total_dispatches_.fetch_add(1, std::memory_order_relaxed);
   get_command_encoder()->dispatchThreads(grid_dims, group_dims);
 }
 
 void CommandEncoder::reset_dispatch_counter() {
-  total_dispatches_ = 0;
+  g_total_dispatches_.store(0, std::memory_order_relaxed);
 }
 
 uint64_t CommandEncoder::total_dispatches() const {
-  return total_dispatches_;
+  return g_total_dispatches_.load(std::memory_order_relaxed);
 }
 
 void CommandEncoder::barrier() {

@@ -119,7 +119,6 @@ class MLX_API CommandEncoder {
   NS::SharedPtr<MTL::CommandBuffer> buffer_;
   int buffer_ops_{0};
   size_t buffer_sizes_{0};
-  uint64_t total_dispatches_{0};
 
   // Encoder for issuing GPU commands.
   // The members are used within a single ComputeCommandEncoder and will be
