@@ -342,6 +342,14 @@ MLX_API std::string kernel_name_for(const MTL::ComputePipelineState* pipeline);
 std::unordered_map<int, CommandEncoder>& get_command_encoders();
 NS::SharedPtr<NS::AutoreleasePool> new_scoped_memory_pool();
 
+/// Programmatically enable or disable compilation of compute pipelines
+/// with `supportIndirectCommandBuffers = true`. Affects subsequent
+/// `Device::get_kernel_` calls only; pipelines already compiled are
+/// untouched. Overrides the MLX_METAL_ICB env-var setting. Intended
+/// for tests and benchmarks that need ICB capture without relying on
+/// env-var ordering.
+MLX_API void set_icb_pipeline_support(bool enabled);
+
 bool is_nax_available();
 
 } // namespace mlx::core::metal

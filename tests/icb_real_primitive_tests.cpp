@@ -25,6 +25,18 @@ using namespace mlx::core::metal;
 
 namespace {
 
+// Every test in this file records real mlx primitives, which require
+// pipelines compiled with setSupportIndirectCommandBuffers(true). We
+// enable that programmatically so the tests don't depend on the
+// MLX_METAL_ICB env var being set before the test binary launches.
+// Behaves as a module-level init: runs once before any test body.
+struct IcbPipelineSupportFixture {
+  IcbPipelineSupportFixture() { set_icb_pipeline_support(true); }
+};
+static IcbPipelineSupportFixture g_icb_fixture_;
+
+
+
 // Round-trip helper: materialize expected result live, then record the
 // same computation, replay it, and compare outputs.
 //

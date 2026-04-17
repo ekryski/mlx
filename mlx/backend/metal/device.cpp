@@ -429,6 +429,12 @@ void CommandEncoder::maybeInsertBarrier() {
 // stream-specific encoders, and a per-encoder counter would miss anything
 // not on whichever stream the caller happened to query.
 static std::atomic<uint64_t> g_total_dispatches_{0};
+// Opt-in flag. The atomic fetch_add on every dispatch is a fixed
+// per-kernel tax (measurable on high-dispatch-count models like
+// GPT-OSS 20B at ~1500 kernels/token); by default we skip the counter
+// entirely. `reset_dispatch_counter()` enables it — a caller that
+// wants the counter must reset it first.
+static std::atomic<bool> g_dispatch_counter_enabled_{false};
 
 // Kernel-name log: per-encoder thread-local "last kernel set" captured in
 // set_compute_pipeline_state(), and a global mutex-protected vector
@@ -503,7 +509,9 @@ void CommandEncoder::dispatch_threadgroups(
   }
   maybeInsertBarrier();
   buffer_ops_++;
-  g_total_dispatches_.fetch_add(1, std::memory_order_relaxed);
+  if (g_dispatch_counter_enabled_.load(std::memory_order_relaxed)) {
+    g_total_dispatches_.fetch_add(1, std::memory_order_relaxed);
+  }
   if (g_kernel_log_enabled_.load(std::memory_order_relaxed)) {
     std::lock_guard<std::mutex> lk(g_kernel_log_mutex_);
     g_kernel_log_.push_back(g_last_kernel_label_);
@@ -528,7 +536,9 @@ void CommandEncoder::dispatch_threads(
   }
   maybeInsertBarrier();
   buffer_ops_++;
-  g_total_dispatches_.fetch_add(1, std::memory_order_relaxed);
+  if (g_dispatch_counter_enabled_.load(std::memory_order_relaxed)) {
+    g_total_dispatches_.fetch_add(1, std::memory_order_relaxed);
+  }
   if (g_kernel_log_enabled_.load(std::memory_order_relaxed)) {
     std::lock_guard<std::mutex> lk(g_kernel_log_mutex_);
     g_kernel_log_.push_back(g_last_kernel_label_);
@@ -538,6 +548,9 @@ void CommandEncoder::dispatch_threads(
 
 void CommandEncoder::reset_dispatch_counter() {
   g_total_dispatches_.store(0, std::memory_order_relaxed);
+  // Enable counting from this point on. Callers that don't care about
+  // the counter (i.e. production decode) pay no per-dispatch atomic.
+  g_dispatch_counter_enabled_.store(true, std::memory_order_relaxed);
 }
 
 uint64_t CommandEncoder::total_dispatches() const {
@@ -954,24 +967,53 @@ NS::SharedPtr<MTL::Function> Device::get_function_(
   return mtl_function;
 }
 
+// Opt-in for MTLComputePipelineDescriptor.supportIndirectCommandBuffers
+// = true. Despite Apple's documentation claiming no cost for direct
+// dispatch, empirical measurement on GPT-OSS 20B (~1500 kernels/token)
+// shows a real per-dispatch tax on Apple Silicon. Default is off;
+// callers that want ICB capture either set MLX_METAL_ICB=1 before
+// first kernel compile, or call `set_icb_pipeline_support(true)`
+// programmatically (tests). The programmatic override wins over env.
+static std::atomic<int> g_icb_pipeline_support_override_{-1}; // -1 = use env
+
+static bool icb_pipeline_flag_enabled_() {
+  int override = g_icb_pipeline_support_override_.load(std::memory_order_relaxed);
+  if (override >= 0) {
+    return override != 0;
+  }
+  const char* v = std::getenv("MLX_METAL_ICB");
+  return v != nullptr && v[0] == '1';
+}
+
+void set_icb_pipeline_support(bool enabled) {
+  g_icb_pipeline_support_override_.store(
+      enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
 NS::SharedPtr<MTL::ComputePipelineState> Device::get_kernel_(
     const std::string& name,
     const MTL::Function* mtl_function) {
-  // Compile kernel to compute pipeline. We always request ICB support so
-  // every pipeline can participate in an IndirectCommandRecorder capture
-  // without having to rebuild. Per Apple: "[supportIndirectCommandBuffers]
-  // doesn't affect performance when used for direct dispatch." Only
-  // relevant cost is a slightly larger PSO on disk.
   NS::Error* error = nullptr;
   NS::SharedPtr<MTL::ComputePipelineState> kernel;
 
   if (mtl_function) {
-    auto pool = new_scoped_memory_pool();
-    auto desc = MTL::ComputePipelineDescriptor::alloc()->init()->autorelease();
-    desc->setComputeFunction(mtl_function);
-    desc->setSupportIndirectCommandBuffers(true);
-    kernel = NS::TransferPtr(device_->newComputePipelineState(
-        desc, MTL::PipelineOptionNone, nullptr, &error));
+    if (icb_pipeline_flag_enabled_()) {
+      // ICB-capable path — slightly more expensive direct dispatch, but
+      // a pipeline built without this flag cannot participate in an
+      // IndirectCommandRecorder capture at all (Metal requires the flag
+      // at pipeline creation time).
+      auto pool = new_scoped_memory_pool();
+      auto desc =
+          MTL::ComputePipelineDescriptor::alloc()->init()->autorelease();
+      desc->setComputeFunction(mtl_function);
+      desc->setSupportIndirectCommandBuffers(true);
+      kernel = NS::TransferPtr(device_->newComputePipelineState(
+          desc, MTL::PipelineOptionNone, nullptr, &error));
+    } else {
+      // Fast path — direct function-to-PSO. Matches stock mlx behavior.
+      kernel = NS::TransferPtr(
+          device_->newComputePipelineState(mtl_function, &error));
+    }
   }
 
   // Throw error if unable to compile metal function
@@ -1013,7 +1055,9 @@ NS::SharedPtr<MTL::ComputePipelineState> Device::get_kernel_(
   auto desc = MTL::ComputePipelineDescriptor::alloc()->init()->autorelease();
   desc->setComputeFunction(mtl_function);
   desc->setLinkedFunctions(linked_functions);
-  desc->setSupportIndirectCommandBuffers(true);
+  if (icb_pipeline_flag_enabled_()) {
+    desc->setSupportIndirectCommandBuffers(true);
+  }
 
   // Compile kernel to compute pipeline
   NS::Error* error = nullptr;
