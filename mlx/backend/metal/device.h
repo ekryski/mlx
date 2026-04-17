@@ -126,6 +126,11 @@ class MLX_API CommandEncoder {
   // any CommandEncoder bound to the same device.
   void begin_icb_recording(size_t max_commands, size_t bytes_arena_cap = 64 * 1024);
   std::unique_ptr<IndirectCommandRecorder> end_icb_recording();
+  // Cancel the current recording session and discard any captured work.
+  // Safe to call whether or not `recording_` is currently true. Use this
+  // when a recording block throws and the caller wants a clean slate
+  // before reissuing work.
+  void abort_icb_recording();
   void replay_icb(const IndirectCommandRecorder& recorder);
   bool is_recording() const {
     return recording_;
@@ -141,6 +146,10 @@ class MLX_API CommandEncoder {
  private:
   MTL::ComputeCommandEncoder* get_command_encoder();
   void set_bytes_raw(const void* data, size_t length, int idx);
+  // Internal: force recording state back to idle (clear flag + recorder +
+  // pending command). Used by throw sites so exceptions don't leave the
+  // encoder in a half-recording state.
+  void abort_icb_recording_();
 
   Device& device_;
   bool exiting_{false};

@@ -345,6 +345,11 @@ void CommandEncoder::set_threadgroup_memory_length(size_t length, int idx) {
 void CommandEncoder::set_bytes_raw(const void* data, size_t length, int idx) {
   if (recording_) {
     if (!active_recorder_->set_bytes(data, length, idx)) {
+      // Arena exhausted. Abort the whole recording session so the caller
+      // sees a clean "not recording" state on rethrow and can retry with
+      // a larger arena. Without this reset, `recording_` stays true and
+      // every subsequent begin_icb_recording throws "already recording".
+      abort_icb_recording_();
       throw std::runtime_error(
           "[metal::CommandEncoder] ICB bytes arena exhausted; "
           "pick a larger bytes_arena_cap on begin_icb_recording.");
@@ -672,6 +677,8 @@ CommandEncoder::end_icb_recording() {
         "[metal::CommandEncoder] end_icb_recording without begin");
   }
   if (has_pending_command_) {
+    // Bad caller state, but drop recording so they aren't trapped in it.
+    abort_icb_recording_();
     throw std::logic_error(
         "[metal::CommandEncoder] end_icb_recording with a pending command "
         "(missing dispatch after set_compute_pipeline_state)");
@@ -680,6 +687,16 @@ CommandEncoder::end_icb_recording() {
   recording_ = false;
   auto r = std::move(active_recorder_);
   return r;
+}
+
+void CommandEncoder::abort_icb_recording_() {
+  recording_ = false;
+  active_recorder_.reset();
+  has_pending_command_ = false;
+}
+
+void CommandEncoder::abort_icb_recording() {
+  abort_icb_recording_();
 }
 
 void CommandEncoder::replay_icb(const IndirectCommandRecorder& recorder) {

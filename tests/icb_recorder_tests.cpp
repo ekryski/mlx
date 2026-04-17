@@ -271,16 +271,13 @@ TEST_CASE("icb CommandEncoder integration: missing dispatch throws at end") {
 
   enc.begin_icb_recording(/*max_commands=*/1);
   enc.set_compute_pipeline_state(rig.pso_fill.get());
-  // Deliberately do not dispatch. end_icb_recording must catch this.
+  // Deliberately do not dispatch. end_icb_recording must catch the
+  // pending-command state *and* auto-abort so the encoder isn't stuck
+  // in recording mode afterwards.
   CHECK_THROWS_AS(enc.end_icb_recording(), std::logic_error);
 
-  // Clean up — force the recorder out even though we're in a bad state.
-  // Recover by finishing the command.
-  enc.set_buffer(rig.out_buf.get(), 0);
-  struct { float v; } s_{0.0f};
-  enc.set_bytes(s_, 1);
-  enc.dispatch_threads(MTL::Size(8, 1, 1), MTL::Size(1, 1, 1));
-  (void)enc.end_icb_recording();
+  // Recording has been aborted; subsequent calls must see a clean slate.
+  CHECK_FALSE(enc.is_recording());
 }
 
 TEST_CASE("icb recorder: explicit split between fill and sequential accumulate") {
