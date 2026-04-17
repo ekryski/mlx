@@ -282,6 +282,278 @@ TEST_CASE("icb primitive: SDPA setBytes arena is shape-dependent (T_k varies)") 
   CHECK(rec_1025->size() > 0);
 }
 
+TEST_CASE("icb primitive: sweep T_k to map SDPA segment-topology thresholds") {
+  // Extends the T_k=1024/1025 comparison with a broader sweep. For each
+  // T_k in the list, record SDPA once and capture:
+  //   - command count
+  //   - segment count
+  //   - bytes_used in the setBytes arena
+  //   - hash of bytes_arena contents
+  //
+  // Emits a table via MESSAGE so the output feeds directly into the
+  // argument-buffers adoption plan. Groups T_k by bytes_arena-content
+  // equivalence: two T_k values sharing the same (commands, segments,
+  // bytes, hash) are in the same "bucket" — a single ICB recording can
+  // in principle serve every T_k in its bucket.
+  //
+  // This tells us D3 (bucketed ICBs) viability: few buckets in a
+  // decode range means D3 is manageable; many buckets means D3 degrades
+  // toward per-step re-recording.
+  Stream s = default_stream(mlx::core::Device::gpu);
+  auto& enc = get_command_encoder(s);
+
+  constexpr int H = 64;
+  constexpr int D = 64;
+
+  // A spread of T_k values covering typical decode ranges (prompt
+  // 128..4096 + growth) and a few near power-of-two boundaries where
+  // kernel selection is known to shift.
+  const std::vector<int> t_k_values = {
+      64, 96, 128, 192, 256, 384, 512, 768,
+      1024, 1025, 1200, 1280, 1536, 1792,
+      2048, 2049, 2500, 3072, 3500, 4096};
+
+  struct Fingerprint {
+    size_t commands;
+    size_t segments;
+    size_t bytes_used;
+    uint64_t arena_hash;
+    bool operator==(const Fingerprint& o) const {
+      return commands == o.commands && segments == o.segments &&
+             bytes_used == o.bytes_used && arena_hash == o.arena_hash;
+    }
+  };
+
+  auto record_at = [&](int T_k) -> Fingerprint {
+    auto q = ones({1, H, 1, D}, float16, s);
+    auto k = ones({1, H, T_k, D}, float16, s);
+    auto v = ones({1, H, T_k, D}, float16, s);
+    enc.synchronize();
+
+    enc.begin_icb_recording(/*max_commands=*/512);
+    auto out = fast::scaled_dot_product_attention(
+        q, k, v, 0.125f, "causal", {}, std::nullopt, s);
+    eval(out);
+    auto rec = enc.end_icb_recording();
+
+    // FNV-1a 64-bit over the used arena portion.
+    uint64_t h = 14695981039346656037ULL;
+    if (rec->bytes_arena_used() > 0) {
+      const auto* p =
+          static_cast<const uint8_t*>(rec->bytes_arena_ptr());
+      for (size_t i = 0; i < rec->bytes_arena_used(); ++i) {
+        h ^= p[i];
+        h *= 1099511628211ULL;
+      }
+    }
+    return {rec->size(), rec->num_segments(), rec->bytes_arena_used(), h};
+  };
+
+  std::vector<std::pair<int, Fingerprint>> rows;
+  rows.reserve(t_k_values.size());
+  for (int T_k : t_k_values) {
+    rows.emplace_back(T_k, record_at(T_k));
+  }
+
+  // Group rows by fingerprint equivalence → buckets.
+  std::vector<std::pair<Fingerprint, std::vector<int>>> buckets;
+  for (const auto& [t_k, fp] : rows) {
+    bool placed = false;
+    for (auto& [bfp, tks] : buckets) {
+      if (bfp == fp) {
+        tks.push_back(t_k);
+        placed = true;
+        break;
+      }
+    }
+    if (!placed) {
+      buckets.push_back({fp, {t_k}});
+    }
+  }
+
+  // Emit the per-T_k row so raw data is in the test output.
+  MESSAGE("T_k sweep — per-row fingerprint:");
+  for (const auto& [t_k, fp] : rows) {
+    MESSAGE(
+        "  T_k=", t_k,
+        "  commands=", fp.commands,
+        "  segments=", fp.segments,
+        "  bytes=", fp.bytes_used,
+        "  hash=", fp.arena_hash);
+  }
+
+  // Emit the bucket summary — the number that matters for D3 viability.
+  MESSAGE("Bucket summary — ", buckets.size(),
+          " distinct ICB-topology groups across ",
+          t_k_values.size(), " T_k values tested:");
+  for (size_t i = 0; i < buckets.size(); ++i) {
+    const auto& [fp, tks] = buckets[i];
+    std::ostringstream tks_str;
+    for (size_t j = 0; j < tks.size(); ++j) {
+      if (j) tks_str << ",";
+      tks_str << tks[j];
+    }
+    MESSAGE(
+        "  bucket ", i, ": commands=", fp.commands,
+        " segments=", fp.segments,
+        " bytes=", fp.bytes_used,
+        " T_k={", tks_str.str(), "}");
+  }
+
+  if (buckets.size() == 1) {
+    MESSAGE(
+        "ALL T_k VALUES SHARE THE SAME ICB TOPOLOGY — one ICB recording "
+        "could serve any T_k in the tested range (arena contents still "
+        "differ per T_k, but topology does not).");
+  } else if (buckets.size() <= 4) {
+    MESSAGE(
+        "FEW BUCKETS — D3 (bucketed ICBs) is manageable. One recording "
+        "per bucket covers the tested T_k range.");
+  } else {
+    MESSAGE(
+        "MANY BUCKETS — D3 degrades toward per-step re-recording. "
+        "Each decode step may need its own ICB recording, making D3 "
+        "memory- and warmup-expensive.");
+  }
+
+  CHECK(rows.size() == t_k_values.size());
+  CHECK(!buckets.empty());
+}
+
+TEST_CASE("icb primitive: stale-T_k replay produces wrong attention output") {
+  // Measures numerical divergence when an ICB recorded with T_k=N is
+  // replayed against K/V buffers actually shaped for T_k=N+1. This is
+  // the concrete failure mode D3 (bucketed ICBs) has to tolerate if
+  // ICBs are not re-recorded per step. The test quantifies: does the
+  // replay output approximate the correct T_k=N+1 answer, or does it
+  // instead equal the T_k=N answer (the values it was built against)?
+  //
+  // Method: use non-uniform K/V (random-ish) so the "extra position"
+  // at index N is numerically distinguishable. Record SDPA at T_k=N
+  // while tagging k and v; replay with k/v overridden to T_k=N+1
+  // buffers (the ICB's setBytes still encodes N). Compare the replay
+  // output to the two live references.
+  Stream s = default_stream(mlx::core::Device::gpu);
+  auto& enc = get_command_encoder(s);
+
+  constexpr int H = 8;
+  constexpr int D = 16;
+  constexpr int N = 128;  // T_k at record time
+  constexpr int M = N + 1;  // T_k at replay time
+
+  // Distinct per-position values in K/V so the extra slot at index N
+  // is numerically distinguishable from the first N slots.
+  auto positions_N = expand_dims(
+      astype(arange(static_cast<double>(N), s), float16, s), {0, 1, 3});
+  auto k_small = broadcast_to(positions_N, {1, H, N, D}, s) *
+      array(1.0f / 128.0f, float16);
+  auto v_small = k_small + array(0.5f, float16);
+  auto positions_M = expand_dims(
+      astype(arange(static_cast<double>(M), s), float16, s), {0, 1, 3});
+  auto k_big = broadcast_to(positions_M, {1, H, M, D}, s) *
+      array(1.0f / 128.0f, float16);
+  auto v_big = k_big + array(0.5f, float16);
+  auto q = ones({1, H, 1, D}, float16, s);
+
+  // Force materialization so the MLX::Buffer pointers below are
+  // populated.
+  eval(k_small, v_small, k_big, v_big, q);
+
+  // Live references — what the correct answer looks like at each T_k.
+  auto ref_N = fast::scaled_dot_product_attention(
+      q, k_small, v_small, 0.125f, "causal", {}, std::nullopt, s);
+  auto ref_M = fast::scaled_dot_product_attention(
+      q, k_big, v_big, 0.125f, "causal", {}, std::nullopt, s);
+  eval(ref_N, ref_M);
+
+  // Record SDPA at T_k=N, tagging k and v so we can override them on
+  // replay. Tag *after* the eval so the recorder's pre-finalize
+  // binding scan finds the K and V bindings emitted by SDPA.
+  enc.begin_icb_recording(/*max_commands=*/512);
+  auto out_record = fast::scaled_dot_product_attention(
+      q, k_small, v_small, 0.125f, "causal", {}, std::nullopt, s);
+  eval(out_record);
+  enc.tag_binding(/*name=*/1001, k_small);
+  enc.tag_binding(/*name=*/1002, v_small);
+  enc.tag_binding(/*name=*/1003, out_record);
+  auto rec = enc.end_icb_recording();
+  REQUIRE(rec);
+  MESSAGE(
+      "Recording: commands=", rec->size(),
+      " k_tags=", rec->tags_for(1001).size(),
+      " v_tags=", rec->tags_for(1002).size(),
+      " out_tags=", rec->tags_for(1003).size());
+
+  // Allocate a fresh destination buffer for the replay output that
+  // matches T_k=N's output shape — SDPA output shape is [B, H, T_q, D],
+  // independent of T_k, so the same buffer works.
+  auto replay_out = zeros({1, H, 1, D}, float16, s);
+  eval(replay_out);
+
+  // Replay with overrides. K and V point at T_k=M buffers (bigger).
+  // The ICB's setBytes still say T_k=N, so attention loops only over
+  // the first N positions of the M-length buffers.
+  const auto* k_big_buf =
+      static_cast<const MTL::Buffer*>(k_big.buffer().ptr());
+  const auto* v_big_buf =
+      static_cast<const MTL::Buffer*>(v_big.buffer().ptr());
+  const auto* out_buf =
+      static_cast<const MTL::Buffer*>(replay_out.buffer().ptr());
+  enc.replay_icb_with_overrides(
+      *rec,
+      {
+          {1001, k_big_buf, k_big.offset()},
+          {1002, v_big_buf, v_big.offset()},
+          {1003, out_buf, replay_out.offset()},
+      });
+  enc.synchronize();
+
+  // Compute the three distances:
+  //   d_to_N  = ||replay - ref_N||   (did the ICB produce the T_k=N answer?)
+  //   d_to_M  = ||replay - ref_M||   (did it happen to produce T_k=M?)
+  //   d_N_to_M = ||ref_N - ref_M||   (scale — how far apart are the two truths?)
+  auto l2_diff = [&](const array& a, const array& b) {
+    auto d = astype(a, float32, s) - astype(b, float32, s);
+    auto sq = d * d;
+    auto r = sqrt(mlx::core::sum(sq, /*keepdims=*/false, s));
+    eval(r);
+    return r.item<float>();
+  };
+  const float d_to_N = l2_diff(replay_out, ref_N);
+  const float d_to_M = l2_diff(replay_out, ref_M);
+  const float d_N_to_M = l2_diff(ref_N, ref_M);
+
+  MESSAGE(
+      "Distances (L2):  replay↔ref_N=", d_to_N,
+      "  replay↔ref_M=", d_to_M,
+      "  ref_N↔ref_M=", d_N_to_M);
+
+  if (d_to_N < d_to_M * 0.25f && d_to_N < d_N_to_M * 0.25f) {
+    MESSAGE(
+        "REPLAY MATCHES T_k=N — the ICB replayed the recorded "
+        "computation correctly. The override plumbing works, but the "
+        "kernel's internal T_k is baked so the replay produces the "
+        "OLD T_k's answer, not the new one.");
+  } else if (d_to_M < d_to_N * 0.25f) {
+    MESSAGE(
+        "REPLAY MATCHES T_k=M — something about the override mechanism "
+        "is picking up the new shape. Unexpected; investigate.");
+  } else {
+    MESSAGE(
+        "REPLAY IS NEITHER — the stale-T_k replay doesn't match either "
+        "reference. The kernel is computing against mismatched "
+        "buffer+setBytes state and producing garbage.");
+  }
+
+  // Finally, D3-relevance: if the stale replay is a perfect match for
+  // the OLD T_k, the application-level impact is a 1-position miss in
+  // attention's softmax denominator. For a T_k=1024 stream that drifts
+  // to T_k=1025, that's ~0.1% of context. For the test here at
+  // T_k=128→129, it's ~0.8%.
+  CHECK(d_to_N >= 0.0f);
+  CHECK(d_to_M >= 0.0f);
+}
+
 TEST_CASE("icb primitive: exhaust bytes arena mid-record — expect throw") {
   // Tiny arena forces `set_bytes` to return false from the recorder,
   // which `set_bytes_raw` turns into a throw. If the throw propagates
