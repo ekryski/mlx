@@ -351,12 +351,63 @@ void CommandEncoder::maybeInsertBarrier() {
 // not on whichever stream the caller happened to query.
 static std::atomic<uint64_t> g_total_dispatches_{0};
 
+// Kernel-name log: per-encoder thread-local "last kernel set" captured in
+// set_compute_pipeline_state(), and a global mutex-protected vector
+// appended to on each dispatch when the log is enabled. The enable flag
+// is atomic so start/stop is cheap when off (one load).
+static std::atomic<bool> g_kernel_log_enabled_{false};
+static std::mutex g_kernel_log_mutex_;
+static std::vector<std::string> g_kernel_log_;
+// Last kernel label set on any encoder. Fine for single-threaded
+// generation; for concurrent multi-stream workloads we'd want this
+// per-encoder, but the ICB audit uses single-threaded decode.
+static thread_local std::string g_last_kernel_label_;
+
+// Map MTL::ComputePipelineState* → registration name, populated by
+// Device::get_kernel_ at pipeline-build time. Already inside
+// namespace mlx::core::metal, so these become mlx::core::metal::register_kernel_name
+// etc — matching the declarations in the header.
+static std::mutex g_kernel_name_mutex_;
+static std::unordered_map<const MTL::ComputePipelineState*, std::string>
+    g_kernel_name_map_;
+
+void register_kernel_name(
+    const MTL::ComputePipelineState* pipeline, const std::string& name) {
+  std::lock_guard<std::mutex> lk(g_kernel_name_mutex_);
+  g_kernel_name_map_[pipeline] = name;
+}
+
+std::string kernel_name_for(const MTL::ComputePipelineState* pipeline) {
+  std::lock_guard<std::mutex> lk(g_kernel_name_mutex_);
+  auto it = g_kernel_name_map_.find(pipeline);
+  return (it == g_kernel_name_map_.end()) ? std::string("") : it->second;
+}
+
+void CommandEncoder::set_compute_pipeline_state(
+    MTL::ComputePipelineState* kernel) {
+  if (g_kernel_log_enabled_.load(std::memory_order_relaxed)) {
+    auto name = kernel_name_for(kernel);
+    if (name.empty()) {
+      auto* label = kernel->label();
+      name = label
+          ? std::string(label->utf8String())
+          : std::string("<unnamed>");
+    }
+    g_last_kernel_label_ = std::move(name);
+  }
+  get_command_encoder()->setComputePipelineState(kernel);
+}
+
 void CommandEncoder::dispatch_threadgroups(
     MTL::Size grid_dims,
     MTL::Size group_dims) {
   maybeInsertBarrier();
   buffer_ops_++;
   g_total_dispatches_.fetch_add(1, std::memory_order_relaxed);
+  if (g_kernel_log_enabled_.load(std::memory_order_relaxed)) {
+    std::lock_guard<std::mutex> lk(g_kernel_log_mutex_);
+    g_kernel_log_.push_back(g_last_kernel_label_);
+  }
   get_command_encoder()->dispatchThreadgroups(grid_dims, group_dims);
 }
 
@@ -366,6 +417,10 @@ void CommandEncoder::dispatch_threads(
   maybeInsertBarrier();
   buffer_ops_++;
   g_total_dispatches_.fetch_add(1, std::memory_order_relaxed);
+  if (g_kernel_log_enabled_.load(std::memory_order_relaxed)) {
+    std::lock_guard<std::mutex> lk(g_kernel_log_mutex_);
+    g_kernel_log_.push_back(g_last_kernel_label_);
+  }
   get_command_encoder()->dispatchThreads(grid_dims, group_dims);
 }
 
@@ -375,6 +430,29 @@ void CommandEncoder::reset_dispatch_counter() {
 
 uint64_t CommandEncoder::total_dispatches() const {
   return g_total_dispatches_.load(std::memory_order_relaxed);
+}
+
+void CommandEncoder::start_kernel_log() {
+  {
+    std::lock_guard<std::mutex> lk(g_kernel_log_mutex_);
+    g_kernel_log_.clear();
+  }
+  g_kernel_log_enabled_.store(true, std::memory_order_relaxed);
+}
+
+void CommandEncoder::stop_kernel_log() {
+  g_kernel_log_enabled_.store(false, std::memory_order_relaxed);
+}
+
+size_t CommandEncoder::kernel_log_size() {
+  std::lock_guard<std::mutex> lk(g_kernel_log_mutex_);
+  return g_kernel_log_.size();
+}
+
+const char* CommandEncoder::kernel_log_at(size_t i) {
+  std::lock_guard<std::mutex> lk(g_kernel_log_mutex_);
+  if (i >= g_kernel_log_.size()) return nullptr;
+  return g_kernel_log_[i].c_str();
 }
 
 void CommandEncoder::barrier() {
@@ -661,6 +739,11 @@ NS::SharedPtr<MTL::ComputePipelineState> Device::get_kernel_(
     }
     throw std::runtime_error(msg.str());
   }
+
+  // Register the pipeline → name so the dispatch-counter kernel log can
+  // report meaningful names (MTLComputePipelineState has no writable
+  // label and no accessor for the source function name).
+  register_kernel_name(kernel.get(), name);
 
   return kernel;
 }

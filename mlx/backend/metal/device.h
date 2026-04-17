@@ -56,9 +56,7 @@ class MLX_API CommandEncoder {
   void dispatch_threads(MTL::Size grid_dims, MTL::Size group_dims);
   void maybeInsertBarrier();
 
-  void set_compute_pipeline_state(MTL::ComputePipelineState* kernel) {
-    get_command_encoder()->setComputePipelineState(kernel);
-  }
+  void set_compute_pipeline_state(MTL::ComputePipelineState* kernel);
 
   template <typename Vec, typename = std::enable_if_t<is_vector_v<Vec>>>
   void set_vector_bytes(const Vec& vec, size_t nelems, int idx) {
@@ -100,6 +98,19 @@ class MLX_API CommandEncoder {
   // quantify the CPU-encoding optimization target.
   void reset_dispatch_counter();
   uint64_t total_dispatches() const;
+
+  // Kernel-name logging — when started, every call to
+  // `set_compute_pipeline_state` followed by a `dispatch_*` appends the
+  // pipeline state's `label()` to an in-memory log. Enables the
+  // ICB-stability audit (compare kernel-name sequences across tokens
+  // — identical sequences mean the dispatch list is stable and the ICB
+  // encode-once/execute-many path is viable).
+  static void start_kernel_log();
+  static void stop_kernel_log();
+  static size_t kernel_log_size();
+  // Get the label at index i. Returns nullptr if out of range. The
+  // returned C-string is valid until the next `start_kernel_log()`.
+  static const char* kernel_log_at(size_t i);
 
   MTL::CommandQueue* get_command_queue() const {
     return queue_.get();
@@ -236,6 +247,18 @@ class MLX_API Device {
 
 MLX_API Device& device(mlx::core::Device);
 MLX_API CommandEncoder& get_command_encoder(Stream s);
+
+/// Register a name for a compute pipeline state. MLX calls this from
+/// `Device::get_kernel_` at pipeline-build time so the CommandEncoder's
+/// kernel log can resolve a pipeline pointer back to its
+/// Metal-function-name string at dispatch time. Safe to call concurrently.
+MLX_API void register_kernel_name(
+    const MTL::ComputePipelineState* pipeline, const std::string& name);
+
+/// Look up a previously-registered kernel name. Returns "" if the
+/// pipeline wasn't registered (e.g., kernels built outside the standard
+/// `get_kernel_` path).
+MLX_API std::string kernel_name_for(const MTL::ComputePipelineState* pipeline);
 
 std::unordered_map<int, CommandEncoder>& get_command_encoders();
 NS::SharedPtr<NS::AutoreleasePool> new_scoped_memory_pool();

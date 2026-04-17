@@ -59,4 +59,21 @@ uint64_t total_dispatches() {
   return encoder.total_dispatches();
 }
 
+void start_kernel_log() {
+  CommandEncoder::start_kernel_log();
+}
+
+void stop_kernel_log() {
+  CommandEncoder::stop_kernel_log();
+}
+
+size_t kernel_log_size() {
+  return CommandEncoder::kernel_log_size();
+}
+
+const char* kernel_log_at(size_t i) {
+  auto* p = CommandEncoder::kernel_log_at(i);
+  return p ? p : "";
+}
+
 } // namespace mlx::core::metal
