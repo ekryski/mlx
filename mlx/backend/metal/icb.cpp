@@ -116,7 +116,12 @@ void IndirectCommandRecorder::set_kernel_buffer(
   }
   cur_.bindings[slot] = Binding{buf, offset};
   if (buf) {
-    resource_set_.insert(buf);
+    if (resource_set_.insert(buf).second) {
+      // First time we've seen this buffer — retain a strong ref so the
+      // backing MTLBuffer outlives any mlx::core::array that was holding it.
+      retained_buffers_.push_back(
+          NS::RetainPtr(const_cast<MTL::Buffer*>(buf)));
+    }
   }
 }
 

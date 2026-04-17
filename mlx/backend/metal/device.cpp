@@ -13,6 +13,7 @@
 
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/metal/device.h"
+#include "mlx/backend/metal/icb.h"
 #include "mlx/backend/metal/metal.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx/utils.h"
@@ -281,6 +282,10 @@ void CommandEncoder::set_buffer(
     const MTL::Buffer* buf,
     int idx,
     int64_t offset /* = 0 */) {
+  if (recording_) {
+    active_recorder_->set_kernel_buffer(buf, offset, idx);
+    return;
+  }
   // Record as both input and output to ensure synchronization between command
   // buffers
   all_inputs_.insert((void*)buf);
@@ -292,6 +297,11 @@ void CommandEncoder::set_input_array(
     const array& a,
     int idx,
     int64_t offset /* = 0 */) {
+  if (recording_) {
+    auto* a_buf = static_cast<const MTL::Buffer*>(a.buffer().ptr());
+    active_recorder_->set_kernel_buffer(a_buf, a.offset() + offset, idx);
+    return;
+  }
   if (all_inputs_.insert(a.buffer().ptr()).second) {
     buffer_sizes_ += a.data_size();
   }
@@ -306,9 +316,39 @@ void CommandEncoder::set_output_array(
     array& a,
     int idx,
     int64_t offset /* = 0 */) {
+  if (recording_) {
+    // During recording, register_output_array's state machine (next_outputs_,
+    // prev_outputs_) is irrelevant because maybeInsertBarrier is a no-op.
+    // We only need the buffer binding.
+    auto* a_buf = static_cast<const MTL::Buffer*>(a.buffer().ptr());
+    active_recorder_->set_kernel_buffer(a_buf, a.offset() + offset, idx);
+    return;
+  }
   // Add barriers before adding the output to the output set
   set_input_array(a, idx, offset);
   register_output_array(a);
+}
+
+void CommandEncoder::set_compute_pipeline_state(
+    MTL::ComputePipelineState* kernel) {
+  if (recording_) {
+    active_recorder_->begin_command(kernel);
+    has_pending_command_ = true;
+    return;
+  }
+  get_command_encoder()->setComputePipelineState(kernel);
+}
+
+void CommandEncoder::set_bytes_raw(const void* data, size_t length, int idx) {
+  if (recording_) {
+    if (!active_recorder_->set_bytes(data, length, idx)) {
+      throw std::runtime_error(
+          "[metal::CommandEncoder] ICB bytes arena exhausted; "
+          "pick a larger bytes_arena_cap on begin_icb_recording.");
+    }
+    return;
+  }
+  get_command_encoder()->setBytes(data, length, idx);
 }
 
 void CommandEncoder::register_output_array(const array& a) {
@@ -334,6 +374,14 @@ void CommandEncoder::add_temporaries(std::vector<array> arrays) {
 }
 
 void CommandEncoder::maybeInsertBarrier() {
+  if (recording_) {
+    // Inside an ICB recording window we cannot emit memory barriers —
+    // MTLIndirectComputeCommand has no barrier primitive. The caller
+    // guarantees the recorded sequence is barrier-independent (either
+    // the ops are truly concurrent, or barriers get inserted *between*
+    // multiple ICB recorders at a higher level).
+    return;
+  }
   if (needs_barrier_) {
     get_command_encoder()->memoryBarrier(MTL::BarrierScopeBuffers);
     needs_barrier_ = false;
@@ -401,6 +449,16 @@ void CommandEncoder::set_compute_pipeline_state(
 void CommandEncoder::dispatch_threadgroups(
     MTL::Size grid_dims,
     MTL::Size group_dims) {
+  if (recording_) {
+    if (!has_pending_command_) {
+      throw std::logic_error(
+          "[metal::CommandEncoder] dispatch_threadgroups while recording "
+          "without a preceding set_compute_pipeline_state");
+    }
+    active_recorder_->end_command(grid_dims, group_dims, /*use_threads=*/false);
+    has_pending_command_ = false;
+    return;
+  }
   maybeInsertBarrier();
   buffer_ops_++;
   g_total_dispatches_.fetch_add(1, std::memory_order_relaxed);
@@ -414,6 +472,16 @@ void CommandEncoder::dispatch_threadgroups(
 void CommandEncoder::dispatch_threads(
     MTL::Size grid_dims,
     MTL::Size group_dims) {
+  if (recording_) {
+    if (!has_pending_command_) {
+      throw std::logic_error(
+          "[metal::CommandEncoder] dispatch_threads while recording "
+          "without a preceding set_compute_pipeline_state");
+    }
+    active_recorder_->end_command(grid_dims, group_dims, /*use_threads=*/true);
+    has_pending_command_ = false;
+    return;
+  }
   maybeInsertBarrier();
   buffer_ops_++;
   g_total_dispatches_.fetch_add(1, std::memory_order_relaxed);
@@ -554,6 +622,53 @@ void CommandEncoder::synchronize() {
               cb->error()->localizedDescription()->utf8String()));
     }
   }
+}
+
+void CommandEncoder::begin_icb_recording(
+    size_t max_commands,
+    size_t bytes_arena_cap) {
+  if (recording_) {
+    throw std::logic_error(
+        "[metal::CommandEncoder] begin_icb_recording while already recording");
+  }
+  // Flush anything the live encoder had pending so it doesn't interleave
+  // with the ICB we're about to build. The live encoder is left in a
+  // clean state and will be lazily recreated on the next direct call.
+  end_encoding();
+
+  active_recorder_ = std::make_unique<IndirectCommandRecorder>(
+      device_, max_commands, bytes_arena_cap);
+  recording_ = true;
+  has_pending_command_ = false;
+}
+
+std::unique_ptr<IndirectCommandRecorder>
+CommandEncoder::end_icb_recording() {
+  if (!recording_) {
+    throw std::logic_error(
+        "[metal::CommandEncoder] end_icb_recording without begin");
+  }
+  if (has_pending_command_) {
+    throw std::logic_error(
+        "[metal::CommandEncoder] end_icb_recording with a pending command "
+        "(missing dispatch after set_compute_pipeline_state)");
+  }
+  active_recorder_->finalize();
+  recording_ = false;
+  auto r = std::move(active_recorder_);
+  return r;
+}
+
+void CommandEncoder::replay_icb(const IndirectCommandRecorder& recorder) {
+  if (recording_) {
+    throw std::logic_error(
+        "[metal::CommandEncoder] replay_icb while recording is active");
+  }
+  // Replay counts as a single "op" from the command-buffer-commit
+  // threshold's perspective — even though the ICB may hold thousands of
+  // dispatches, Metal schedules them as one work item on the live encoder.
+  buffer_ops_ += 1;
+  recorder.replay(get_command_encoder());
 }
 
 MTL::ComputeCommandEncoder* CommandEncoder::get_command_encoder() {

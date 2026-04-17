@@ -4,6 +4,7 @@
 
 #include <Metal/Metal.hpp>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -20,6 +21,7 @@ using MTLFCList =
     std::vector<std::tuple<const void*, MTL::DataType, NS::UInteger>>;
 
 class Device;
+class IndirectCommandRecorder;
 
 class MLX_API CommandEncoder {
  public:
@@ -60,7 +62,7 @@ class MLX_API CommandEncoder {
 
   template <typename Vec, typename = std::enable_if_t<is_vector_v<Vec>>>
   void set_vector_bytes(const Vec& vec, size_t nelems, int idx) {
-    get_command_encoder()->setBytes(
+    set_bytes_raw(
         vec.data(), nelems * sizeof(typename Vec::value_type), idx);
   }
   template <typename Vec, typename = std::enable_if_t<is_vector_v<Vec>>>
@@ -70,12 +72,12 @@ class MLX_API CommandEncoder {
 
   template <typename T>
   void set_bytes(const T* v, int n, int idx) {
-    return get_command_encoder()->setBytes(v, n * sizeof(T), idx);
+    set_bytes_raw(v, n * sizeof(T), idx);
   }
 
   template <typename T>
   void set_bytes(const T& v, int idx) {
-    return get_command_encoder()->setBytes(&v, sizeof(T), idx);
+    set_bytes_raw(&v, sizeof(T), idx);
   }
 
   void set_threadgroup_memory_length(size_t length, int idx) {
@@ -112,6 +114,25 @@ class MLX_API CommandEncoder {
   // returned C-string is valid until the next `start_kernel_log()`.
   static const char* kernel_log_at(size_t i);
 
+  // Indirect Command Buffer recording.
+  //
+  // While recording is active, calls to `set_compute_pipeline_state`,
+  // `set_input_array` / `set_output_array` / `set_buffer`, `set_bytes`,
+  // and `dispatch_*` are routed into a side-channel `IndirectCommandRecorder`
+  // instead of emitting live commands. `maybeInsertBarrier` is a no-op
+  // while recording — the caller is responsible for ensuring the recorded
+  // sequence is barrier-independent (see docs on IndirectCommandRecorder).
+  //
+  // Finalize via `end_icb_recording`, which returns the recorder. The
+  // caller owns the recorder and can replay it later via `replay_icb` on
+  // any CommandEncoder bound to the same device.
+  void begin_icb_recording(size_t max_commands, size_t bytes_arena_cap = 64 * 1024);
+  std::unique_ptr<IndirectCommandRecorder> end_icb_recording();
+  void replay_icb(const IndirectCommandRecorder& recorder);
+  bool is_recording() const {
+    return recording_;
+  }
+
   MTL::CommandQueue* get_command_queue() const {
     return queue_.get();
   }
@@ -121,9 +142,19 @@ class MLX_API CommandEncoder {
 
  private:
   MTL::ComputeCommandEncoder* get_command_encoder();
+  void set_bytes_raw(const void* data, size_t length, int idx);
 
   Device& device_;
   bool exiting_{false};
+
+  // ICB recording state. When `recording_` is true, the encoder routes
+  // dispatch + binding calls into `active_recorder_` instead of emitting
+  // live Metal commands.
+  bool recording_{false};
+  std::unique_ptr<IndirectCommandRecorder> active_recorder_;
+  // Staged dispatch state: set by `set_compute_pipeline_state` and closed
+  // out by `dispatch_*`. Only meaningful while recording.
+  bool has_pending_command_{false};
 
   // Buffer that stores encoded commands.
   NS::SharedPtr<MTL::CommandQueue> queue_;

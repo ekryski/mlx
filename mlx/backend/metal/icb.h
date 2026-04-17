@@ -147,6 +147,12 @@ class MLX_API IndirectCommandRecorder {
   // replay. Includes the bytes arena itself.
   std::unordered_set<const MTL::Buffer*> resource_set_;
 
+  // Strong references to every buffer we reference, so they outlive any
+  // mlx::core::array that originally owned them. Without this, replay
+  // after a decode step that drops the array would dereference freed
+  // Metal buffers.
+  std::vector<NS::SharedPtr<MTL::Buffer>> retained_buffers_;
+
   bool finalized_ = false;
 };
 

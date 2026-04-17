@@ -225,3 +225,78 @@ TEST_CASE("icb recorder: replay before finalize throws") {
   CHECK_THROWS_AS(rec.replay(enc), std::logic_error);
   enc->endEncoding();
 }
+
+// Exercises the CommandEncoder integration — the routing of
+// set_compute_pipeline_state / set_buffer / set_bytes / dispatch_* into
+// the recorder while `recording_` is true.
+TEST_CASE("icb CommandEncoder integration: record + replay via stream encoder") {
+  auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+  constexpr size_t N = 32;
+  auto rig = make_rig(N);
+
+  mlx::core::Stream s = mlx::core::default_stream(mlx::core::Device::gpu);
+  auto& enc = get_command_encoder(s);
+
+  // Record a single fill command through the CommandEncoder API. This is
+  // exactly how a primitive would drive it during eval_gpu — only
+  // difference is we bracket the dispatches with begin/end_icb_recording.
+  enc.begin_icb_recording(/*max_commands=*/1);
+  enc.set_compute_pipeline_state(rig.pso_fill.get());
+  enc.set_buffer(rig.out_buf.get(), 0);  // slot 0 = out
+  struct Scale { float value; } scale{7.0f};
+  enc.set_bytes(scale, 1);
+  enc.dispatch_threads(MTL::Size(N, 1, 1), MTL::Size(1, 1, 1));
+  auto rec = enc.end_icb_recording();
+  REQUIRE(rec);
+  CHECK(rec->size() == 1);
+  CHECK(rec->finalized());
+
+  // Replay through the same CommandEncoder (it rebuilds the live encoder
+  // lazily). Force a synchronize so the GPU work actually runs before we
+  // read the output.
+  enc.replay_icb(*rec);
+  enc.synchronize();
+
+  auto* out = static_cast<float*>(rig.out_buf->contents());
+  for (size_t i = 0; i < N; ++i) {
+    CHECK(out[i] == doctest::Approx(7.0f));
+  }
+}
+
+TEST_CASE("icb CommandEncoder integration: missing dispatch throws at end") {
+  auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+  auto rig = make_rig(8);
+  mlx::core::Stream s = mlx::core::default_stream(mlx::core::Device::gpu);
+  auto& enc = get_command_encoder(s);
+
+  enc.begin_icb_recording(/*max_commands=*/1);
+  enc.set_compute_pipeline_state(rig.pso_fill.get());
+  // Deliberately do not dispatch. end_icb_recording must catch this.
+  CHECK_THROWS_AS(enc.end_icb_recording(), std::logic_error);
+
+  // Clean up — force the recorder out even though we're in a bad state.
+  // Recover by finishing the command.
+  enc.set_buffer(rig.out_buf.get(), 0);
+  struct { float v; } s_{0.0f};
+  enc.set_bytes(s_, 1);
+  enc.dispatch_threads(MTL::Size(8, 1, 1), MTL::Size(1, 1, 1));
+  (void)enc.end_icb_recording();
+}
+
+TEST_CASE("icb CommandEncoder integration: begin while recording throws") {
+  auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+  auto rig = make_rig(8);
+  mlx::core::Stream s = mlx::core::default_stream(mlx::core::Device::gpu);
+  auto& enc = get_command_encoder(s);
+
+  enc.begin_icb_recording(/*max_commands=*/1);
+  CHECK_THROWS_AS(enc.begin_icb_recording(1), std::logic_error);
+
+  // Finish cleanly.
+  enc.set_compute_pipeline_state(rig.pso_fill.get());
+  enc.set_buffer(rig.out_buf.get(), 0);
+  struct { float v; } s_{0.0f};
+  enc.set_bytes(s_, 1);
+  enc.dispatch_threads(MTL::Size(8, 1, 1), MTL::Size(1, 1, 1));
+  (void)enc.end_icb_recording();
+}
