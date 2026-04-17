@@ -291,7 +291,7 @@ void CommandEncoder::set_input_array(
     int idx,
     int64_t offset /* = 0 */) {
   if (all_inputs_.insert(a.buffer().ptr()).second) {
-    buffer_sizes_ += a.data_size();
+    buffer_input_sizes_ += a.data_size();
   }
   auto r_buf = static_cast<MTL::Resource*>(const_cast<void*>(a.buffer().ptr()));
   needs_barrier_ =
@@ -310,7 +310,14 @@ void CommandEncoder::set_output_array(
 }
 
 void CommandEncoder::register_output_array(const array& a) {
-  all_outputs_.insert(a.buffer().ptr());
+  // Track ALL output bytes (not deduplicated): pooled allocators may hand out
+  // the same buffer pointer repeatedly within one command buffer, and the
+  // input-side dedup hides that re-use. Counting every output materialization
+  // gives the commit heuristic a truer picture of in-flight memory pressure
+  // than the input-only counter alone.
+  if (all_outputs_.insert(a.buffer().ptr()).second) {
+    buffer_output_sizes_ += a.data_size();
+  }
 
   auto buf = static_cast<MTL::Resource*>(const_cast<void*>(a.buffer().ptr()));
   if (concurrent_) {
@@ -443,14 +450,19 @@ void CommandEncoder::end_encoding() {
 
 bool CommandEncoder::needs_commit() const {
   auto [max_ops, max_mb] = device_.get_max_ops_mb_per_buffer();
-  return (buffer_ops_ > max_ops) || ((buffer_sizes_ >> 20) > max_mb);
+  // Sum input + output bytes: inputs dominate for dense matmul-heavy ops,
+  // outputs for large intermediate allocations (attention score matrices,
+  // big prefill activations). Either alone undercounts memory pressure.
+  size_t total_bytes = buffer_input_sizes_ + buffer_output_sizes_;
+  return (buffer_ops_ > max_ops) || ((total_bytes >> 20) > max_mb);
 }
 
 void CommandEncoder::commit() {
   buffer_->commit();
   buffer_ = NS::RetainPtr(queue_->commandBufferWithUnretainedReferences());
   buffer_ops_ = 0;
-  buffer_sizes_ = 0;
+  buffer_input_sizes_ = 0;
+  buffer_output_sizes_ = 0;
 }
 
 void CommandEncoder::synchronize() {
@@ -505,17 +517,24 @@ Device::Device() : device_(load_device()), residency_set_(device_.get()) {
       max_mb_per_buffer_ = 40;
       break;
     case 's': // max
-      // Note: ops_per_buffer=300 gives +11% decode speed but increases peak
-      // memory during prefill (more intermediates alive simultaneously).
-      // Default 200 balances decode throughput vs peak prefill memory; raise
-      // with MLX_MAX_OPS_PER_BUFFER for decode-heavy workloads when memory
-      // allows.
-      max_ops_per_buffer_ = 200;
-      max_mb_per_buffer_ = 50;
+      // With the input+output byte tracking in needs_commit(), `max_ops`
+      // can sit well above historical defaults without blowing up prefill
+      // memory — the MB limit kicks in first when large intermediates
+      // accumulate (attention score matrices etc).
+      //
+      // Benchmark evidence (Gemma4 E2B 4-bit turbo4v2, M1 Max):
+      //   ops=200, mb=50  → decode 95.2 tok/s  @ peak 3.47 GB (old default)
+      //   ops=500, mb=100 → decode 99.8 tok/s  @ peak 4.32 GB (+4.8% / +0.85GB)
+      //   ops=500, mb=200 → decode 99.6 tok/s  @ peak 5.79 GB (+4.6% / +2.3GB)
+      //
+      // mb=100 is the sweet spot: decode wins materialize, memory bounded.
+      max_ops_per_buffer_ = 500;
+      max_mb_per_buffer_ = 100;
       break;
     case 'd': // ultra
-      max_ops_per_buffer_ = 200;
-      max_mb_per_buffer_ = 50;
+      // Ultra has more memory headroom — raise mb too.
+      max_ops_per_buffer_ = 500;
+      max_mb_per_buffer_ = 200;
       break;
     default: // default to medium
       max_ops_per_buffer_ = 40;

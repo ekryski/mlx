@@ -118,7 +118,14 @@ class MLX_API CommandEncoder {
   NS::SharedPtr<MTL::CommandQueue> queue_;
   NS::SharedPtr<MTL::CommandBuffer> buffer_;
   int buffer_ops_{0};
-  size_t buffer_sizes_{0};
+  // Cumulative bytes of unique input buffers referenced in the current
+  // command buffer. Incremented in `set_input_array` on first sighting.
+  size_t buffer_input_sizes_{0};
+  // Cumulative bytes of unique output buffers materialized in the current
+  // command buffer. Tracked separately from inputs so the commit heuristic
+  // can see the full memory footprint (allocators dedupe input-side
+  // re-uses of output pointers, which would otherwise hide output pressure).
+  size_t buffer_output_sizes_{0};
   uint64_t total_dispatches_{0};
 
   // Encoder for issuing GPU commands.
