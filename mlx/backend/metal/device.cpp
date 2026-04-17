@@ -347,6 +347,7 @@ void CommandEncoder::dispatch_threadgroups(
     MTL::Size group_dims) {
   maybeInsertBarrier();
   buffer_ops_++;
+  total_dispatches_++;
   get_command_encoder()->dispatchThreadgroups(grid_dims, group_dims);
 }
 
@@ -355,7 +356,16 @@ void CommandEncoder::dispatch_threads(
     MTL::Size group_dims) {
   maybeInsertBarrier();
   buffer_ops_++;
+  total_dispatches_++;
   get_command_encoder()->dispatchThreads(grid_dims, group_dims);
+}
+
+void CommandEncoder::reset_dispatch_counter() {
+  total_dispatches_ = 0;
+}
+
+uint64_t CommandEncoder::total_dispatches() const {
+  return total_dispatches_;
 }
 
 void CommandEncoder::barrier() {

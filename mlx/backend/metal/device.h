@@ -94,6 +94,13 @@ class MLX_API CommandEncoder {
   void commit();
   void synchronize();
 
+  // Dispatch counter — cumulative count of dispatchThreadgroups /
+  // dispatchThreads calls since the last reset_dispatch_counter(). Used to
+  // audit per-token dispatch counts for ICB feasibility studies and to
+  // quantify the CPU-encoding optimization target.
+  void reset_dispatch_counter();
+  uint64_t total_dispatches() const;
+
   MTL::CommandQueue* get_command_queue() const {
     return queue_.get();
   }
@@ -112,6 +119,7 @@ class MLX_API CommandEncoder {
   NS::SharedPtr<MTL::CommandBuffer> buffer_;
   int buffer_ops_{0};
   size_t buffer_sizes_{0};
+  uint64_t total_dispatches_{0};
 
   // Encoder for issuing GPU commands.
   // The members are used within a single ComputeCommandEncoder and will be
