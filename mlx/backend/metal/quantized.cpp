@@ -1,8 +1,12 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <cstdlib>
+#include <memory>
+
 #include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/common/compiled.h"
 #include "mlx/backend/gpu/copy.h"
+#include "mlx/backend/metal/argument_buffer.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/kernels.h"
 #include "mlx/backend/metal/reduce.h"
@@ -15,6 +19,16 @@
 namespace mlx::core {
 
 namespace {
+
+// Env-var gate matching RMSNorm's `MLX_METAL_AB=1` precedent. Cached.
+bool qmv_ab_enabled() {
+  static const bool v = []() {
+    const char* e = std::getenv("MLX_METAL_AB");
+    return e != nullptr && e[0] == '1';
+  }();
+  return v;
+}
+
 
 template <typename... Args>
 auto get_quantized_kernel_wrapped(
@@ -253,11 +267,73 @@ void qmv(
   MTL::Size group_dims(bk, 2, 1);
   MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
 
-  std::string kname;
-  kname.reserve(64);
   std::string type_string = get_type_string(x.dtype());
   bool fast = N % bn == 0 && K % 512 == 0;
 
+  // AB path covers only non-batched affine qmv. Other modes
+  // (fp4/fp8/mxfp4) and batched dispatches stay on legacy.
+  const bool use_ab =
+      qmv_ab_enabled() && B == 1 && mode == "affine" && biases.has_value();
+
+  if (use_ab) {
+    std::string kname;
+    concatenate(
+        kname,
+        (fast ? "affine_qmv_fast_ab_" : "affine_qmv_ab_"),
+        type_string,
+        "_gs_",
+        group_size,
+        "_b_",
+        bits);
+    auto kernel = d.get_kernel(kname);
+
+    auto& compute_encoder = metal::get_command_encoder(s);
+    compute_encoder.set_compute_pipeline_state(kernel);
+
+    using Slot = metal::ArgumentBuffer::Slot;
+    auto ab = std::make_shared<metal::ArgumentBuffer>(
+        d,
+        std::vector<Slot>{
+            {Slot::Kind::BufferPtrOffset, 0, "w"},
+            {Slot::Kind::BufferPtrOffset, 0, "scales"},
+            {Slot::Kind::BufferPtrOffset, 0, "biases"},
+            {Slot::Kind::BufferPtrOffset, 0, "x"},
+            {Slot::Kind::BufferPtrOffset, 0, "y"},
+            {Slot::Kind::Scalar32, 0, "K"},
+            {Slot::Kind::Scalar32, 0, "N"},
+        });
+    ab->set_buffer_ptr(
+        0, static_cast<const MTL::Buffer*>(w.buffer().ptr()), w.offset());
+    ab->set_buffer_ptr(
+        1,
+        static_cast<const MTL::Buffer*>(scales.buffer().ptr()),
+        scales.offset());
+    ab->set_buffer_ptr(
+        2,
+        static_cast<const MTL::Buffer*>(biases->buffer().ptr()),
+        biases->offset());
+    ab->set_buffer_ptr(
+        3, static_cast<const MTL::Buffer*>(x.buffer().ptr()), x.offset());
+    ab->set_buffer_ptr(
+        4, static_cast<const MTL::Buffer*>(out.buffer().ptr()), out.offset());
+    ab->set_scalar32(5, static_cast<uint32_t>(K));
+    ab->set_scalar32(6, static_cast<uint32_t>(N));
+
+    compute_encoder.register_input_array(w);
+    compute_encoder.register_input_array(scales);
+    compute_encoder.register_input_array(*biases);
+    compute_encoder.register_input_array(x);
+    compute_encoder.register_output_array(out);
+
+    compute_encoder.set_buffer(ab->mtl_buffer(), 0);
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+    compute_encoder.add_temporary_object(
+        std::static_pointer_cast<void>(ab));
+    return;
+  }
+
+  std::string kname;
+  kname.reserve(64);
   concatenate(
       kname,
       mode + (fast ? "_qmv_fast_" : "_qmv_"),
