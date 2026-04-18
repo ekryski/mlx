@@ -276,11 +276,14 @@ void qmv(
       qmv_ab_enabled() && B == 1 && mode == "affine" && biases.has_value();
 
   if (use_ab) {
+    // Kernel names use `type_to_name` style (bfloat16, not bfloat16_t)
+    // to match the AOT instantiation in affine_qmv_ab.metal.
+    std::string ab_type_name = type_to_name(x);
     std::string kname;
     concatenate(
         kname,
         (fast ? "affine_qmv_fast_ab_" : "affine_qmv_ab_"),
-        type_string,
+        ab_type_name,
         "_gs_",
         group_size,
         "_b_",
