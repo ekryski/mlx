@@ -11,6 +11,7 @@ if(MLX_BUILD_METAL OR MLX_BUILD_CUDA)
 endif()
 
 if(MLX_BUILD_METAL)
+  list(APPEND METAL_TEST_SOURCES argument_buffer_tests.cpp)
   list(APPEND METAL_TEST_SOURCES icb_feasibility_tests.cpp)
   list(APPEND METAL_TEST_SOURCES icb_recorder_tests.cpp)
   list(APPEND METAL_TEST_SOURCES icb_real_primitive_tests.cpp)
