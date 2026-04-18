@@ -328,6 +328,27 @@ void qmv(
     compute_encoder.register_input_array(x);
     compute_encoder.register_output_array(out);
 
+    // The AB kernel reads w/scales/biases/x/y via raw gpuAddress()
+    // pointers. register_*_array only handles barrier + cross-encoder
+    // fence tracking; Metal still needs explicit per-encoder
+    // residency declarations for the dispatch to keep those buffers
+    // mapped.
+    compute_encoder.use_resource(
+        static_cast<const MTL::Resource*>(w.buffer().ptr()),
+        MTL::ResourceUsageRead);
+    compute_encoder.use_resource(
+        static_cast<const MTL::Resource*>(scales.buffer().ptr()),
+        MTL::ResourceUsageRead);
+    compute_encoder.use_resource(
+        static_cast<const MTL::Resource*>(biases->buffer().ptr()),
+        MTL::ResourceUsageRead);
+    compute_encoder.use_resource(
+        static_cast<const MTL::Resource*>(x.buffer().ptr()),
+        MTL::ResourceUsageRead);
+    compute_encoder.use_resource(
+        static_cast<const MTL::Resource*>(out.buffer().ptr()),
+        MTL::ResourceUsageWrite);
+
     compute_encoder.set_buffer(ab->mtl_buffer(), 0);
     compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
     compute_encoder.add_temporary_object(

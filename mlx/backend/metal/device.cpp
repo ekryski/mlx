@@ -373,6 +373,17 @@ void CommandEncoder::set_bytes_raw(const void* data, size_t length, int idx) {
   get_command_encoder()->setBytes(data, length, idx);
 }
 
+void CommandEncoder::use_resource(
+    const MTL::Resource* res,
+    MTL::ResourceUsage usage) {
+  if (recording_) {
+    // ICB recording path not supported for now; callers using AB +
+    // ICB must arrange residency through heap declarations.
+    return;
+  }
+  get_command_encoder()->useResource(res, usage);
+}
+
 void CommandEncoder::register_input_array(const array& a) {
   // Mirrors the dependency-tracking half of `set_input_array` but skips
   // the `setBuffer` emit. Used by primitives that bind their inputs

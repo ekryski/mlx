@@ -47,6 +47,13 @@ class MLX_API CommandEncoder {
   };
 
   void set_buffer(const MTL::Buffer* buf, int idx, int64_t offset = 0);
+  // Declare per-encoder residency for a resource accessed indirectly
+  // (e.g. via an `ArgumentBuffer`'s gpuAddress slot). Mirrors Metal's
+  // `MTL::ComputeCommandEncoder::useResource(...)`. Required whenever
+  // a kernel dereferences a device pointer that the encoder did not
+  // also receive via `setBuffer` — without it, Metal may not keep the
+  // backing buffer mapped for the dispatch's duration.
+  void use_resource(const MTL::Resource* res, MTL::ResourceUsage usage);
   void set_input_array(const array& a, int idx, int64_t offset = 0);
   void set_output_array(array& a, int idx, int64_t offset = 0);
   // Dependency-only registration — like `set_input_array` but without

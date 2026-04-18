@@ -66,8 +66,17 @@ template <typename T, int group_size, int bits>
   device T* y =
       reinterpret_cast<device T*>(args.y.addr + args.y.offset);
 
+  // Bind struct scalars as constant-address-space references so the
+  // call through qmv_impl (which declares `const constant int&`)
+  // resolves to the same storage class used by the legacy kernel.
+  // Preserves any SIMD-broadcast load optimizations the compiler
+  // emits under the `constant` qualifier.
+  const constant int& in_vec_size = args.K;
+  const constant int& out_vec_size = args.N;
+
   qmv_impl<T, group_size, bits>(
-      w, scales, biases, x, y, args.K, args.N, tid, simd_gid, simd_lid);
+      w, scales, biases, x, y, in_vec_size, out_vec_size,
+      tid, simd_gid, simd_lid);
 }
 
 template <typename T, int group_size, int bits>
@@ -87,8 +96,12 @@ template <typename T, int group_size, int bits>
   device T* y =
       reinterpret_cast<device T*>(args.y.addr + args.y.offset);
 
+  const constant int& in_vec_size = args.K;
+  const constant int& out_vec_size = args.N;
+
   qmv_fast_impl<T, group_size, bits>(
-      w, scales, biases, x, y, args.K, args.N, tid, simd_gid, simd_lid);
+      w, scales, biases, x, y, in_vec_size, out_vec_size,
+      tid, simd_gid, simd_lid);
 }
 
 #define instantiate_affine_qmv_ab(name, itype, group_size, bits)                  \
