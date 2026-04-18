@@ -73,9 +73,10 @@ BufferPool& buffer_pool() {
 
 // Natural size of each slot kind in bytes. Layout is packed in
 // declaration order with each slot aligned to its own size (matches
-// Metal's default packing rules for these scalar types).
-size_t slot_size(ArgumentBuffer::Slot::Kind k) {
-  switch (k) {
+// Metal's default packing rules for these scalar types). For
+// `Bytes` slots the size is taken from the slot's `bytes_size`.
+size_t slot_size(const ArgumentBuffer::Slot& s) {
+  switch (s.kind) {
     case ArgumentBuffer::Slot::Kind::Scalar32:
     case ArgumentBuffer::Slot::Kind::Float32:
       return 4;
@@ -83,8 +84,26 @@ size_t slot_size(ArgumentBuffer::Slot::Kind k) {
       return 8;
     case ArgumentBuffer::Slot::Kind::BufferPtrOffset:
       return 16; // uint64 addr + uint64 offset
+    case ArgumentBuffer::Slot::Kind::Bytes:
+      return s.bytes_size;
   }
-  // Unreachable — all kinds handled above.
+  return 0;
+}
+
+// Alignment requirement per slot kind. `Bytes` slots align to 8
+// so 64-bit stride arrays sit on natural boundaries.
+size_t slot_alignment(ArgumentBuffer::Slot::Kind k) {
+  switch (k) {
+    case ArgumentBuffer::Slot::Kind::Scalar32:
+    case ArgumentBuffer::Slot::Kind::Float32:
+      return 4;
+    case ArgumentBuffer::Slot::Kind::Scalar64:
+      return 8;
+    case ArgumentBuffer::Slot::Kind::BufferPtrOffset:
+      return 16;
+    case ArgumentBuffer::Slot::Kind::Bytes:
+      return 8;
+  }
   return 0;
 }
 
@@ -101,8 +120,8 @@ ArgumentBuffer::ArgumentBuffer(Device& d, std::vector<Slot> slots)
   // boundaries, 16-byte buffer-ptr entries on 16-byte boundaries, etc.).
   size_t offset = 0;
   for (auto& s : layout_) {
-    const size_t sz = slot_size(s.kind);
-    offset = align_up(offset, sz);
+    const size_t sz = slot_size(s);
+    offset = align_up(offset, slot_alignment(s.kind));
     s.byte_offset = offset;
     offset += sz;
   }
@@ -166,6 +185,25 @@ void ArgumentBuffer::set_float32(int slot, float value) {
         "[metal::ArgumentBuffer::set_float32] slot type mismatch");
   }
   std::memcpy(contents_() + s.byte_offset, &value, sizeof(value));
+}
+
+void ArgumentBuffer::set_bytes(int slot, const void* data, size_t size) {
+  if (slot < 0 || static_cast<size_t>(slot) >= layout_.size()) {
+    throw std::out_of_range(
+        "[metal::ArgumentBuffer::set_bytes] slot index out of range");
+  }
+  const auto& s = layout_[slot];
+  if (s.kind != Slot::Kind::Bytes) {
+    throw std::invalid_argument(
+        "[metal::ArgumentBuffer::set_bytes] slot type mismatch");
+  }
+  if (size != s.bytes_size) {
+    throw std::invalid_argument(
+        "[metal::ArgumentBuffer::set_bytes] size mismatch: got "
+        + std::to_string(size) + ", expected "
+        + std::to_string(s.bytes_size));
+  }
+  std::memcpy(contents_() + s.byte_offset, data, size);
 }
 
 void ArgumentBuffer::set_buffer_ptr(

@@ -53,6 +53,13 @@ class MLX_API ArgumentBuffer {
       // Pointer to a device buffer + byte offset. On GPU this slot
       // reads as a 16-byte struct: `{ uint64_t addr; uint64_t offset; }`.
       BufferPtrOffset,
+      // Arbitrary fixed-size byte payload declared at layout time.
+      // Use for inline shape/stride arrays that match a kernel-side
+      // fixed-size array (e.g. `int x_shape[MAX_NDIMS]`). `bytes_size`
+      // MUST be set on the Slot entry; ignored for all other Kinds.
+      // Slot is aligned to 8 bytes so 64-bit stride arrays sit on
+      // natural boundaries.
+      Bytes,
     };
     Kind kind;
     // Byte offset into the argument buffer where this slot lives.
@@ -62,6 +69,10 @@ class MLX_API ArgumentBuffer {
     // Optional human-readable name for diagnostics / tests. Empty for
     // production use.
     std::string name;
+    // Only meaningful when `kind == Kind::Bytes`: size of the slot
+    // payload in bytes. Ignored for all other kinds (their size is
+    // determined by the kind).
+    size_t bytes_size = 0;
   };
 
   // Construct with a declarative layout. Slot `i` in the returned
@@ -94,6 +105,13 @@ class MLX_API ArgumentBuffer {
   // NOT retained by the argument buffer — the caller owns the buffer
   // lifetime. `offset` is in bytes.
   void set_buffer_ptr(int slot, const MTL::Buffer* buf, int64_t offset);
+
+  // Write a raw byte payload to a `Bytes` slot. `size` MUST equal
+  // the `bytes_size` declared on the slot; throws otherwise. Payload
+  // is copied verbatim; caller is responsible for matching the
+  // kernel-side struct field layout (typically an inline
+  // `int[N]` / `int64_t[N]` array).
+  void set_bytes(int slot, const void* data, size_t size);
 
   // The underlying device buffer. Bind this at a single kernel-arg
   // slot (via setBuffer) or reference it from an ICB's command. The
