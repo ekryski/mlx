@@ -1,7 +1,10 @@
 // Copyright © 2024 Apple Inc.
 #include <algorithm>
+#include <cstdlib>
+#include <memory>
 
 #include "mlx/backend/gpu/copy.h"
+#include "mlx/backend/metal/argument_buffer.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/kernels/defines.h"
 #include "mlx/backend/metal/reduce.h"
@@ -9,6 +12,20 @@
 #include "mlx/fast_primitives.h"
 
 namespace mlx::core::fast {
+
+namespace {
+
+// Env-var gate, matching the `MLX_METAL_ICB` opt-in pattern. Reads the
+// environment once on first call and caches the result.
+bool rms_ab_enabled() {
+  static const bool v = []() {
+    const char* e = std::getenv("MLX_METAL_AB");
+    return e != nullptr && e[0] == '1';
+  }();
+  return v;
+}
+
+} // namespace
 
 bool RMSNorm::use_fallback(Stream s) {
   return s.device == Device::cpu;
@@ -55,17 +72,23 @@ void RMSNorm::eval_gpu(
   const int simd_size = 32;
   const int n_reads = RMS_N_READS;
   const int looped_limit = RMS_LOOPED_LIMIT;
-  std::string op_name = "rms";
-  if (axis_size > looped_limit) {
-    op_name += "_looped";
+  const bool use_ab = rms_ab_enabled();
+  const bool looped = axis_size > looped_limit;
+
+  std::string op_name;
+  if (use_ab) {
+    op_name = looped ? "rms_ab_looped" : "rms_ab";
+  } else {
+    op_name = looped ? "rms_looped" : "rms";
   }
   op_name += type_to_name(out);
+
   auto& compute_encoder = metal::get_command_encoder(s);
   {
     auto kernel = d.get_kernel(op_name);
 
     MTL::Size grid_dims, group_dims;
-    if (axis_size <= looped_limit) {
+    if (!looped) {
       size_t threadgroup_needed = (axis_size + n_reads - 1) / n_reads;
       size_t simds_needed = (threadgroup_needed + simd_size - 1) / simd_size;
       size_t threadgroup_size = simd_size * simds_needed;
@@ -82,13 +105,55 @@ void RMSNorm::eval_gpu(
 
     uint32_t w_stride = (w.ndim() == 1) ? w.strides()[0] : 0;
     compute_encoder.set_compute_pipeline_state(kernel);
-    compute_encoder.set_input_array(x, 0);
-    compute_encoder.set_input_array(w, 1);
-    compute_encoder.set_output_array(out, 2);
-    compute_encoder.set_bytes(eps_, 3);
-    compute_encoder.set_bytes(axis_size, 4);
-    compute_encoder.set_bytes(w_stride, 5);
-    compute_encoder.dispatch_threads(grid_dims, group_dims);
+
+    if (use_ab) {
+      // Pack all per-dispatch arguments (x/w/out pointers, eps, axis
+      // size, w stride) into a single packed buffer. Replaces 6
+      // individual `setBuffer`/`setBytes` calls with one `setBuffer`
+      // at slot 0. Layout must match `RmsArgs` in
+      // `kernels/rms_norm_ab.metal`.
+      using Slot = metal::ArgumentBuffer::Slot;
+      auto ab = std::make_shared<metal::ArgumentBuffer>(
+          d,
+          std::vector<Slot>{
+              {Slot::Kind::BufferPtrOffset, 0, "x"},
+              {Slot::Kind::BufferPtrOffset, 0, "w"},
+              {Slot::Kind::BufferPtrOffset, 0, "out"},
+              {Slot::Kind::Float32, 0, "eps"},
+              {Slot::Kind::Scalar32, 0, "axis_size"},
+              {Slot::Kind::Scalar32, 0, "w_stride"},
+          });
+      ab->set_buffer_ptr(
+          0, static_cast<const MTL::Buffer*>(x.buffer().ptr()), x.offset());
+      ab->set_buffer_ptr(
+          1, static_cast<const MTL::Buffer*>(w.buffer().ptr()), w.offset());
+      ab->set_buffer_ptr(
+          2, static_cast<const MTL::Buffer*>(out.buffer().ptr()), out.offset());
+      ab->set_float32(3, eps_);
+      ab->set_scalar32(4, axis_size);
+      ab->set_scalar32(5, w_stride);
+
+      // Barrier + cross-encoder fence tracking for the indirect reads
+      // and writes the kernel performs through the AB.
+      compute_encoder.register_input_array(x);
+      compute_encoder.register_input_array(w);
+      compute_encoder.register_output_array(out);
+
+      compute_encoder.set_buffer(ab->mtl_buffer(), 0);
+      compute_encoder.dispatch_threads(grid_dims, group_dims);
+
+      // Keep the AB alive until the command buffer completes.
+      compute_encoder.add_temporary_object(
+          std::static_pointer_cast<void>(ab));
+    } else {
+      compute_encoder.set_input_array(x, 0);
+      compute_encoder.set_input_array(w, 1);
+      compute_encoder.set_output_array(out, 2);
+      compute_encoder.set_bytes(eps_, 3);
+      compute_encoder.set_bytes(axis_size, 4);
+      compute_encoder.set_bytes(w_stride, 5);
+      compute_encoder.dispatch_threads(grid_dims, group_dims);
+    }
   }
 }
 

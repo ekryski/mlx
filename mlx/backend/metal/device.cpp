@@ -373,6 +373,23 @@ void CommandEncoder::set_bytes_raw(const void* data, size_t length, int idx) {
   get_command_encoder()->setBytes(data, length, idx);
 }
 
+void CommandEncoder::register_input_array(const array& a) {
+  // Mirrors the dependency-tracking half of `set_input_array` but skips
+  // the `setBuffer` emit. Used by primitives that bind their inputs
+  // indirectly (e.g. via an ArgumentBuffer at buffer(0)) — the buffer
+  // is still read by the GPU, so barrier + cross-encoder fencing must
+  // still see it.
+  auto r_buf = static_cast<MTL::Resource*>(const_cast<void*>(a.buffer().ptr()));
+  needs_barrier_ =
+      needs_barrier_ | (prev_outputs_.find(r_buf) != prev_outputs_.end());
+  if (recording_) {
+    return;
+  }
+  if (all_inputs_.insert(a.buffer().ptr()).second) {
+    buffer_sizes_ += a.data_size();
+  }
+}
+
 void CommandEncoder::register_output_array(const array& a) {
   all_outputs_.insert(a.buffer().ptr());
 
@@ -393,6 +410,10 @@ void CommandEncoder::add_temporaries(std::vector<array> arrays) {
       temporaries_.end(),
       std::make_move_iterator(arrays.begin()),
       std::make_move_iterator(arrays.end()));
+}
+
+void CommandEncoder::add_temporary_object(std::shared_ptr<void> obj) {
+  temporary_objects_.push_back(std::move(obj));
 }
 
 void CommandEncoder::maybeInsertBarrier() {
@@ -630,6 +651,7 @@ void CommandEncoder::end_encoding() {
   buffer_->addCompletedHandler([this,
                                 fence = std::move(fence_),
                                 temporaries = std::move(temporaries_),
+                                temporary_objects = std::move(temporary_objects_),
                                 all_outputs = std::move(all_outputs_),
                                 waiting_on = std::move(waiting_on)](
                                    MTL::CommandBuffer*) mutable {

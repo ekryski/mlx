@@ -49,10 +49,21 @@ class MLX_API CommandEncoder {
   void set_buffer(const MTL::Buffer* buf, int idx, int64_t offset = 0);
   void set_input_array(const array& a, int idx, int64_t offset = 0);
   void set_output_array(array& a, int idx, int64_t offset = 0);
+  // Dependency-only registration — like `set_input_array` but without
+  // issuing a `setBuffer` on the live encoder. Use when the buffer is
+  // consumed indirectly (e.g. via an ArgumentBuffer) so barrier
+  // tracking and cross-encoder fencing still see it.
+  void register_input_array(const array& a);
   void register_output_array(const array& a);
 
   void add_temporary(array arr);
   void add_temporaries(std::vector<array> arrays);
+
+  // Retain an arbitrary heap-allocated helper object (e.g. an
+  // ArgumentBuffer) until the GPU finishes the current command buffer.
+  // Released in the command-buffer completion handler alongside
+  // `temporaries_`.
+  void add_temporary_object(std::shared_ptr<void> obj);
 
   void dispatch_threadgroups(MTL::Size grid_dims, MTL::Size group_dims);
   void dispatch_threads(MTL::Size grid_dims, MTL::Size group_dims);
@@ -218,6 +229,9 @@ class MLX_API CommandEncoder {
   bool needs_barrier_{false};
   bool concurrent_{false};
   std::vector<array> temporaries_;
+  // Heap-allocated helper objects kept alive for the life of the
+  // current command buffer (released in the completion handler).
+  std::vector<std::shared_ptr<void>> temporary_objects_;
   std::unordered_set<MTL::Resource*> prev_outputs_;
   std::unordered_set<MTL::Resource*> next_outputs_;
   std::unordered_set<MTL::Resource*> concurrent_outputs_;
