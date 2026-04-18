@@ -1,6 +1,11 @@
 // Copyright © 2024 Apple Inc.
 
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+
 #include "mlx/backend/common/unary.h"
+#include "mlx/backend/metal/argument_buffer.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/kernels.h"
 #include "mlx/backend/metal/utils.h"
@@ -12,6 +17,35 @@
   }
 
 namespace mlx::core {
+
+namespace {
+
+bool unary_ab_enabled() {
+  static const bool v = []() {
+    const char* e = std::getenv("MLX_METAL_AB");
+    return e != nullptr && e[0] == '1';
+  }();
+  return v;
+}
+
+// AB path covers only contiguous unary on a whitelist of ops and
+// dtypes matching elementwise_ab.metal's instantiations (Sigmoid,
+// Negative, Abs, Exp on float16 / bfloat16 / float32). Everything
+// else stays on legacy.
+bool unary_ab_supports(bool contig, const char* op, Dtype dtype) {
+  if (!contig) {
+    return false;
+  }
+  if (dtype != float16 && dtype != bfloat16 && dtype != float32) {
+    return false;
+  }
+  return std::strcmp(op, "Sigmoid") == 0 ||
+         std::strcmp(op, "Negative") == 0 ||
+         std::strcmp(op, "Abs") == 0 ||
+         std::strcmp(op, "Exp") == 0;
+}
+
+} // namespace
 
 void unary_op_gpu_inplace(
     const std::vector<array>& inputs,
@@ -54,6 +88,74 @@ void unary_op_gpu_inplace(
     }
   }
   concatenate(kernel_name, "_", op, type_to_name(in), type_to_name(out));
+
+  // AB fast path — only for the contiguous v / vn / v2 variants on
+  // a whitelist of ops + float dtypes. Same-type (T == U) enforced
+  // by the gate so the single-type instantiations in
+  // elementwise_ab.metal cover us.
+  const bool use_ab = unary_ab_enabled() && unary_ab_supports(contig, op, in.dtype())
+      && in.dtype() == out.dtype();
+
+  if (use_ab) {
+    const char* prefix;
+    if (large) {
+      prefix = "v2_ab_";
+    } else if (work_per_thread > 1) {
+      prefix = "vn_ab_";
+    } else {
+      prefix = "v_ab_";
+    }
+    std::string ab_kname;
+    concatenate(ab_kname, prefix, op, type_to_name(in));
+    auto ab_kernel = d.get_kernel(ab_kname);
+
+    auto& compute_encoder = metal::get_command_encoder(s);
+    compute_encoder.set_compute_pipeline_state(ab_kernel);
+
+    using Slot = metal::ArgumentBuffer::Slot;
+    auto ab = std::make_shared<metal::ArgumentBuffer>(
+        d,
+        std::vector<Slot>{
+            {Slot::Kind::BufferPtrOffset, 0, "a", 0},
+            {Slot::Kind::BufferPtrOffset, 0, "c", 0},
+            {Slot::Kind::Scalar64, 0, "size", 0},
+        });
+    ab->set_buffer_ptr(
+        0, static_cast<const MTL::Buffer*>(in.buffer().ptr()), in.offset());
+    ab->set_buffer_ptr(
+        1, static_cast<const MTL::Buffer*>(out.buffer().ptr()), out.offset());
+    ab->set_scalar64(2, static_cast<uint64_t>(in.data_size()));
+
+    compute_encoder.register_input_array(in);
+    compute_encoder.register_output_array(out);
+    compute_encoder.use_resource(
+        static_cast<const MTL::Resource*>(in.buffer().ptr()),
+        MTL::ResourceUsageRead);
+    compute_encoder.use_resource(
+        static_cast<const MTL::Resource*>(out.buffer().ptr()),
+        MTL::ResourceUsageWrite);
+
+    compute_encoder.set_buffer(ab->mtl_buffer(), 0);
+
+    auto thread_group_size = ab_kernel->maxTotalThreadsPerThreadgroup();
+    size_t nthreads = ceildiv(in.data_size(), work_per_thread);
+    if (thread_group_size > nthreads) {
+      thread_group_size = nthreads;
+    }
+    MTL::Size group_dims = MTL::Size(thread_group_size, 1, 1);
+    MTL::Size grid_dims;
+    if (large) {
+      grid_dims =
+          get_2d_grid_dims(out.shape(), out.strides(), work_per_thread);
+    } else {
+      grid_dims = MTL::Size(nthreads, 1, 1);
+    }
+    compute_encoder.dispatch_threads(grid_dims, group_dims);
+    compute_encoder.add_temporary_object(
+        std::static_pointer_cast<void>(ab));
+    return;
+  }
+
   auto kernel = get_unary_kernel(d, kernel_name, in.dtype(), out.dtype(), op);
 
   auto thread_group_size = kernel->maxTotalThreadsPerThreadgroup();
