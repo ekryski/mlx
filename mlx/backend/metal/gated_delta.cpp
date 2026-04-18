@@ -36,8 +36,14 @@ void GatedDeltaStep::eval_gpu(
     state_out.set_data(allocator::malloc(state_out.nbytes()));
   }
 
+  // Fall back to float16 on devices without bfloat16 support (pre-M3)
+  auto compute_dtype = y.dtype();
+  if (compute_dtype == bfloat16 && d.get_architecture_gen() < 15) {
+    compute_dtype = float16;
+  }
+
   // Build kernel name from template parameters
-  std::string tname = type_to_name(y.dtype());
+  std::string tname = type_to_name(compute_dtype);
   std::string kname;
   if (fused_) {
     kname = "gated_delta_step_fused_" + tname + "_" +
