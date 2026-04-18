@@ -801,8 +801,49 @@ void CommandEncoder::replay_icb_with_overrides(
     throw std::logic_error(
         "[metal::CommandEncoder] replay_icb_with_overrides while recording is active");
   }
+
+  // Input-side barrier check: for each override buffer recently
+  // written by a live dispatch, flag `needs_barrier_` so a
+  // memoryBarrier is emitted before the replay executes. Without
+  // this, an ICB that reads an override buffer (e.g. the input
+  // hidden state produced by the previous layer's live post)
+  // races with the still-in-flight producer write.
+  for (const auto& [name, buf, offset] : overrides) {
+    (void)name;
+    (void)offset;
+    if (!buf) continue;
+    auto* r =
+        static_cast<MTL::Resource*>(const_cast<MTL::Buffer*>(buf));
+    if (prev_outputs_.find(r) != prev_outputs_.end()) {
+      needs_barrier_ = true;
+    }
+  }
+  if (needs_barrier_) {
+    get_command_encoder()->memoryBarrier(MTL::BarrierScopeBuffers);
+    needs_barrier_ = false;
+    prev_outputs_ = std::move(next_outputs_);
+  } else {
+    prev_outputs_.insert(next_outputs_.begin(), next_outputs_.end());
+  }
+  next_outputs_.clear();
+
   buffer_ops_ += 1;
   recorder.replay_with_overrides(get_command_encoder(), overrides);
+
+  // Output-side: mark every override buffer as a recent output so
+  // a subsequent primitive reading one of them triggers a
+  // memoryBarrier via the existing `needs_barrier_` /
+  // `prev_outputs_` path. Marking all overrides (including
+  // input-only ones) is conservative: an extra barrier on a
+  // read-only buffer is harmless; a missed barrier on a write
+  // buffer is a data race.
+  for (const auto& [name, buf, offset] : overrides) {
+    (void)name;
+    (void)offset;
+    if (!buf) continue;
+    next_outputs_.insert(
+        static_cast<MTL::Resource*>(const_cast<MTL::Buffer*>(buf)));
+  }
 }
 
 MTL::ComputeCommandEncoder* CommandEncoder::get_command_encoder() {
