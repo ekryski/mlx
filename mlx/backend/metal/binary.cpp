@@ -1,5 +1,10 @@
 // Copyright © 2024 Apple Inc.
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+
 #include "mlx/backend/common/binary.h"
+#include "mlx/backend/metal/argument_buffer.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/kernels.h"
 #include "mlx/backend/metal/utils.h"
@@ -17,6 +22,34 @@
   }
 
 namespace mlx::core {
+
+namespace {
+
+// Env-var gate matching the other AB paths. Cached on first call.
+bool binary_ab_enabled() {
+  static const bool v = []() {
+    const char* e = std::getenv("MLX_METAL_AB");
+    return e != nullptr && e[0] == '1';
+  }();
+  return v;
+}
+
+// AB path supports only the vv / vv2 / vvn decode-hot paths for a
+// small whitelist of ops (Add, Multiply) on the float dtypes the
+// kernel file instantiates (float16 / bfloat16 / float32). Everything
+// else falls through to legacy. Kernel names match elementwise_ab.metal.
+bool binary_ab_supports(BinaryOpType bopt, const char* op, Dtype dtype) {
+  if (bopt != BinaryOpType::VectorVector) {
+    return false;
+  }
+  if (dtype != float16 && dtype != bfloat16 && dtype != float32) {
+    return false;
+  }
+  return std::strcmp(op, "Add") == 0 ||
+         std::strcmp(op, "Multiply") == 0;
+}
+
+} // namespace
 
 std::string get_kernel_name(
     BinaryOpType bopt,
@@ -102,6 +135,85 @@ void binary_op_gpu_inplace(
   std::string kernel_name =
       get_kernel_name(bopt, op, a, large, shape.size(), work_per_thread);
   auto& d = metal::device(s.device);
+
+  // AB fast path — only for vv / vv2 / vvn on a whitelist of ops,
+  // single-output (binary_two legacy path untouched).
+  const bool use_ab = binary_ab_enabled() && outputs.size() == 1 &&
+      binary_ab_supports(bopt, op, a.dtype()) && a.dtype() == out.dtype();
+
+  if (use_ab) {
+    // Kernel name format matches elementwise_ab.metal:
+    //   "vv_ab_<op><type>", "vvn_ab_<op><type>", "vv2_ab_<op><type>".
+    // Pick between them using the same `large` / `work_per_thread`
+    // selection logic as the legacy path (for the vv family the name
+    // suffix is large -> "2", wpt>1 -> "n", else no suffix).
+    const char* prefix;
+    if (large) {
+      prefix = "vv2_ab_";
+    } else if (work_per_thread > 1) {
+      prefix = "vvn_ab_";
+    } else {
+      prefix = "vv_ab_";
+    }
+    std::string ab_kname;
+    concatenate(ab_kname, prefix, op, type_to_name(a));
+    auto ab_kernel = d.get_kernel(ab_kname);
+
+    auto& compute_encoder = metal::get_command_encoder(s);
+    compute_encoder.set_compute_pipeline_state(ab_kernel);
+
+    using Slot = metal::ArgumentBuffer::Slot;
+    auto ab = std::make_shared<metal::ArgumentBuffer>(
+        d,
+        std::vector<Slot>{
+            {Slot::Kind::BufferPtrOffset, 0, "a", 0},
+            {Slot::Kind::BufferPtrOffset, 0, "b", 0},
+            {Slot::Kind::BufferPtrOffset, 0, "c", 0},
+            {Slot::Kind::Scalar64, 0, "size", 0},
+        });
+    ab->set_buffer_ptr(
+        0, static_cast<const MTL::Buffer*>(a.buffer().ptr()), a.offset());
+    ab->set_buffer_ptr(
+        1, static_cast<const MTL::Buffer*>(b.buffer().ptr()), b.offset());
+    ab->set_buffer_ptr(
+        2,
+        static_cast<const MTL::Buffer*>(out.buffer().ptr()),
+        out.offset());
+    ab->set_scalar64(3, static_cast<uint64_t>(out.data_size()));
+
+    compute_encoder.register_input_array(a);
+    compute_encoder.register_input_array(b);
+    compute_encoder.register_output_array(out);
+    compute_encoder.use_resource(
+        static_cast<const MTL::Resource*>(a.buffer().ptr()),
+        MTL::ResourceUsageRead);
+    compute_encoder.use_resource(
+        static_cast<const MTL::Resource*>(b.buffer().ptr()),
+        MTL::ResourceUsageRead);
+    compute_encoder.use_resource(
+        static_cast<const MTL::Resource*>(out.buffer().ptr()),
+        MTL::ResourceUsageWrite);
+
+    compute_encoder.set_buffer(ab->mtl_buffer(), 0);
+
+    auto thread_group_size = ab_kernel->maxTotalThreadsPerThreadgroup();
+    size_t nthreads = ceildiv(out.data_size(), work_per_thread);
+    if (thread_group_size > nthreads) {
+      thread_group_size = nthreads;
+    }
+    MTL::Size group_dims = MTL::Size(thread_group_size, 1, 1);
+    MTL::Size grid_dims;
+    if (large) {
+      grid_dims =
+          get_2d_grid_dims(out.shape(), out.strides(), work_per_thread);
+    } else {
+      grid_dims = MTL::Size(nthreads, 1, 1);
+    }
+    compute_encoder.dispatch_threads(grid_dims, group_dims);
+    compute_encoder.add_temporary_object(
+        std::static_pointer_cast<void>(ab));
+    return;
+  }
 
   auto kernel = outputs.size() == 2
       ? get_binary_two_kernel(d, kernel_name, a.dtype(), out.dtype(), op)
