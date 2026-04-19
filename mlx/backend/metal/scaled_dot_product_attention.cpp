@@ -622,7 +622,8 @@ void sdpa_vector_unified(
     float scale,
     bool do_causal,
     const std::optional<array>& mask,
-    const std::optional<array>& sinks) {
+    const std::optional<array>& sinks,
+    const std::shared_ptr<metal::PersistentAb>& ab_handle = {}) {
   // Phase 2: default path is the AB-wrapped kernel. The non-AB Phase
   // 1 body is kept only as an internal bisection escape, reachable
   // via MLX_SDPA_NO_AB=1 (debug-only, not user-facing).
@@ -678,63 +679,90 @@ void sdpa_vector_unified(
     // Pack every kernel argument into a single shared-storage buffer
     // bound at slot 0. Layout must match `SdpaUnifiedArgs` in
     // `kernels/sdpa_unified.h`.
+    //
+    // When a caller-owned PersistentAb handle is supplied, rewrite
+    // its contents in place and bind — no add_temporary_object,
+    // since the caller owns the handle lifetime. Otherwise allocate
+    // a fresh transient AB (same as pre-Option-A behavior).
     using Slot = metal::ArgumentBuffer::Slot;
-    auto ab = std::make_shared<metal::ArgumentBuffer>(
-        d,
-        std::vector<Slot>{
-            {Slot::Kind::BufferPtrOffset, 0, "queries"},
-            {Slot::Kind::BufferPtrOffset, 0, "keys"},
-            {Slot::Kind::BufferPtrOffset, 0, "values"},
-            {Slot::Kind::BufferPtrOffset, 0, "out"},
-            {Slot::Kind::BufferPtrOffset, 0, "mask"},
-            {Slot::Kind::BufferPtrOffset, 0, "sinks"},
-            {Slot::Kind::Scalar64, 0, "k_head_stride"},
-            {Slot::Kind::Scalar64, 0, "k_seq_stride"},
-            {Slot::Kind::Scalar64, 0, "v_head_stride"},
-            {Slot::Kind::Scalar64, 0, "v_seq_stride"},
-            {Slot::Kind::Float32, 0, "scale"},
-            {Slot::Kind::Scalar32, 0, "gqa_factor"},
-            {Slot::Kind::Scalar32, 0, "N"},
-            {Slot::Kind::Scalar32, 0, "blocks"},
-            {Slot::Kind::Scalar32, 0, "mask_kv_seq_stride"},
-            {Slot::Kind::Scalar32, 0, "mask_q_seq_stride"},
-            {Slot::Kind::Scalar32, 0, "mask_head_stride"},
-            {Slot::Kind::Scalar32, 0, "num_q_heads"},
-        });
-    ab->set_buffer_ptr(
-        0, static_cast<const MTL::Buffer*>(q.buffer().ptr()), q.offset());
-    ab->set_buffer_ptr(
-        1, static_cast<const MTL::Buffer*>(k.buffer().ptr()), k.offset());
-    ab->set_buffer_ptr(
-        2, static_cast<const MTL::Buffer*>(v.buffer().ptr()), v.offset());
-    ab->set_buffer_ptr(
-        3, static_cast<const MTL::Buffer*>(out.buffer().ptr()), out.offset());
-    if (has_mask) {
-      const auto& m = *mask;
-      ab->set_buffer_ptr(
-          4, static_cast<const MTL::Buffer*>(m.buffer().ptr()), m.offset());
-      int32_t kv_seq_stride = m.shape(3) > 1 ? m.strides(3) : 0;
-      int32_t q_seq_stride = m.shape(2) > 1 ? m.strides(2) : 0;
-      int32_t head_stride =
-          m.shape(1) > 1 ? m.strides(1) : (m.shape(0) > 1 ? m.strides(0) : 0);
-      ab->set_scalar32(14, static_cast<uint32_t>(kv_seq_stride));
-      ab->set_scalar32(15, static_cast<uint32_t>(q_seq_stride));
-      ab->set_scalar32(16, static_cast<uint32_t>(head_stride));
+    const std::vector<Slot> slot_layout{
+        {Slot::Kind::BufferPtrOffset, 0, "queries"},
+        {Slot::Kind::BufferPtrOffset, 0, "keys"},
+        {Slot::Kind::BufferPtrOffset, 0, "values"},
+        {Slot::Kind::BufferPtrOffset, 0, "out"},
+        {Slot::Kind::BufferPtrOffset, 0, "mask"},
+        {Slot::Kind::BufferPtrOffset, 0, "sinks"},
+        {Slot::Kind::Scalar64, 0, "k_head_stride"},
+        {Slot::Kind::Scalar64, 0, "k_seq_stride"},
+        {Slot::Kind::Scalar64, 0, "v_head_stride"},
+        {Slot::Kind::Scalar64, 0, "v_seq_stride"},
+        {Slot::Kind::Float32, 0, "scale"},
+        {Slot::Kind::Scalar32, 0, "gqa_factor"},
+        {Slot::Kind::Scalar32, 0, "N"},
+        {Slot::Kind::Scalar32, 0, "blocks"},
+        {Slot::Kind::Scalar32, 0, "mask_kv_seq_stride"},
+        {Slot::Kind::Scalar32, 0, "mask_q_seq_stride"},
+        {Slot::Kind::Scalar32, 0, "mask_head_stride"},
+        {Slot::Kind::Scalar32, 0, "num_q_heads"},
+    };
+
+    // Shared setter — called on either the persistent handle or a
+    // fresh transient AB. Takes a generic callable for the setter
+    // methods so we don't need to parameterize over types.
+    auto populate = [&](auto& target) {
+      target.set_buffer_ptr(
+          0, static_cast<const MTL::Buffer*>(q.buffer().ptr()), q.offset());
+      target.set_buffer_ptr(
+          1, static_cast<const MTL::Buffer*>(k.buffer().ptr()), k.offset());
+      target.set_buffer_ptr(
+          2, static_cast<const MTL::Buffer*>(v.buffer().ptr()), v.offset());
+      target.set_buffer_ptr(
+          3, static_cast<const MTL::Buffer*>(out.buffer().ptr()), out.offset());
+      if (has_mask) {
+        const auto& m = *mask;
+        target.set_buffer_ptr(
+            4, static_cast<const MTL::Buffer*>(m.buffer().ptr()), m.offset());
+        int32_t kv_seq_stride = m.shape(3) > 1 ? m.strides(3) : 0;
+        int32_t q_seq_stride = m.shape(2) > 1 ? m.strides(2) : 0;
+        int32_t head_stride =
+            m.shape(1) > 1 ? m.strides(1) : (m.shape(0) > 1 ? m.strides(0) : 0);
+        target.set_scalar32(14, static_cast<uint32_t>(kv_seq_stride));
+        target.set_scalar32(15, static_cast<uint32_t>(q_seq_stride));
+        target.set_scalar32(16, static_cast<uint32_t>(head_stride));
+      }
+      if (has_sinks) {
+        const auto& sn = *sinks;
+        target.set_buffer_ptr(
+            5, static_cast<const MTL::Buffer*>(sn.buffer().ptr()), sn.offset());
+        target.set_scalar32(17, static_cast<uint32_t>(q.shape(1)));
+      }
+      target.set_scalar64(6, static_cast<uint64_t>(k_head_stride));
+      target.set_scalar64(7, static_cast<uint64_t>(k_seq_stride));
+      target.set_scalar64(8, static_cast<uint64_t>(v_head_stride));
+      target.set_scalar64(9, static_cast<uint64_t>(v_seq_stride));
+      target.set_float32(10, scale);
+      target.set_scalar32(11, static_cast<uint32_t>(gqa_factor));
+      target.set_scalar32(12, static_cast<uint32_t>(N));
+      target.set_scalar32(13, static_cast<uint32_t>(blocks));
+    };
+
+    MTL::Buffer* ab_mtl = nullptr;
+    if (ab_handle) {
+      if (ab_handle->layout().size() != slot_layout.size()) {
+        throw std::runtime_error(
+            "[sdpa_vector_unified] persistent AB handle has wrong slot "
+            "count (expected 18, got " +
+            std::to_string(ab_handle->layout().size()) + ")");
+      }
+      populate(*ab_handle);
+      ab_mtl = ab_handle->mtl_buffer();
+    } else {
+      auto ab = std::make_shared<metal::ArgumentBuffer>(d, slot_layout);
+      populate(*ab);
+      ab_mtl = ab->mtl_buffer();
+      compute_encoder.add_temporary_object(
+          std::static_pointer_cast<void>(ab));
     }
-    if (has_sinks) {
-      const auto& sn = *sinks;
-      ab->set_buffer_ptr(
-          5, static_cast<const MTL::Buffer*>(sn.buffer().ptr()), sn.offset());
-      ab->set_scalar32(17, static_cast<uint32_t>(q.shape(1)));
-    }
-    ab->set_scalar64(6, static_cast<uint64_t>(k_head_stride));
-    ab->set_scalar64(7, static_cast<uint64_t>(k_seq_stride));
-    ab->set_scalar64(8, static_cast<uint64_t>(v_head_stride));
-    ab->set_scalar64(9, static_cast<uint64_t>(v_seq_stride));
-    ab->set_float32(10, scale);
-    ab->set_scalar32(11, static_cast<uint32_t>(gqa_factor));
-    ab->set_scalar32(12, static_cast<uint32_t>(N));
-    ab->set_scalar32(13, static_cast<uint32_t>(blocks));
 
     // Fence tracking for resources the kernel reads/writes through
     // the AB (no binding — AB carries the addresses).
@@ -745,11 +773,8 @@ void sdpa_vector_unified(
     if (has_sinks) compute_encoder.register_input_array(*sinks);
     compute_encoder.register_output_array(out);
 
-    compute_encoder.set_buffer(ab->mtl_buffer(), 0);
+    compute_encoder.set_buffer(ab_mtl, 0);
     compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
-
-    compute_encoder.add_temporary_object(
-        std::static_pointer_cast<void>(ab));
   } else {
     // Phase 1 non-AB body — preserved as an internal debug escape
     // (MLX_SDPA_NO_AB=1). Kept for post-ship bisection only.
@@ -970,7 +995,8 @@ void ScaledDotProductAttention::eval_gpu(
     // recorded T_k. MLX_SDPA_FORCE_LEGACY=1 is a debug-only override
     // used by the regression harness for within-binary A/B comparison.
     if (metal::ab_enabled() && !sdpa_force_legacy()) {
-      sdpa_vector_unified(s, d, q, k, v, o, scale_, do_causal, mask, sinks);
+      sdpa_vector_unified(
+          s, d, q, k, v, o, scale_, do_causal, mask, sinks, ab_handle());
     } else if (
         ((devc == 'd' || devc == 's') && k.shape(2) >= 1024) ||
         (k.shape(1) < q.shape(1) && k.shape(2) >= 4096)) {

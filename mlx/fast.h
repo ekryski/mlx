@@ -141,6 +141,22 @@ MLX_API array scaled_dot_product_attention(
     StreamOrDevice s = {},
     int window_size = -1);
 
+// AB-participating overload — caller-owned PersistentAb whose
+// MTLBuffer address is stable across decode steps. Layout must
+// match SdpaUnifiedArgs in kernels/sdpa_unified.h. When ab_handle
+// is null, identical to the plain overload.
+MLX_API array scaled_dot_product_attention(
+    const array& queries,
+    const array& keys,
+    const array& values,
+    const float scale,
+    const std::string& mask_mode,
+    std::optional<array> mask_arr,
+    const std::optional<array>& sinks,
+    std::shared_ptr<metal::PersistentAb> ab_handle,
+    StreamOrDevice s = {},
+    int window_size = -1);
+
 using TemplateArg = std::variant<int, bool, Dtype>;
 using ScalarArg = std::variant<bool, int, float>;
 

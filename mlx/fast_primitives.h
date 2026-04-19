@@ -426,13 +426,22 @@ class ScaledDotProductAttention : public Custom {
       bool do_causal,
       bool has_sinks,
       bool output_logsumexp,
-      int window_size = -1)
+      int window_size = -1,
+      std::shared_ptr<metal::PersistentAb> ab_handle = nullptr)
       : Custom(stream, std::move(fallback)),
         scale_(scale),
         do_causal_(do_causal),
         has_sinks_(has_sinks),
         output_logsumexp_(output_logsumexp),
-        window_size_(window_size) {}
+        window_size_(window_size),
+        ab_handle_(std::move(ab_handle)) {}
+
+  // Caller-owned PersistentAb used in place of a transient AB during
+  // AB-path unified-vector eval_gpu. The layout must match
+  // SdpaUnifiedArgs in kernels/sdpa_unified.h (18 slots).
+  const std::shared_ptr<metal::PersistentAb>& ab_handle() const {
+    return ab_handle_;
+  }
 
   static bool use_fallback(
       const array& q,
@@ -481,6 +490,7 @@ class ScaledDotProductAttention : public Custom {
   bool has_sinks_;
   bool output_logsumexp_;
   int window_size_;
+  std::shared_ptr<metal::PersistentAb> ab_handle_;
 };
 
 class ScaledDotProductAttentionVJP : public Custom {

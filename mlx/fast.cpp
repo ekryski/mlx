@@ -983,16 +983,21 @@ bool RoPE::is_equivalent(const Primitive& other) const {
 }
 
 /** Computes: O = softmax(Q @ K.T) @ V **/
-array scaled_dot_product_attention(
+namespace {
+// Internal impl that carries an optional PersistentAb handle. The
+// two public overloads thread their args through, supplying nullptr
+// for the plain overload and a real handle for the AB overload.
+array scaled_dot_product_attention_impl(
     const array& queries,
     const array& keys,
     const array& values,
     const float scale,
-    const std::string& mask_mode /* = "" */,
-    std::optional<array> mask_arr /* = {} */,
-    const std::optional<array>& sinks /* = {} */,
-    StreamOrDevice s /* = {}*/,
-    int window_size /* = -1 */) {
+    const std::string& mask_mode,
+    std::optional<array> mask_arr,
+    const std::optional<array>& sinks,
+    std::shared_ptr<metal::PersistentAb> ab_handle,
+    StreamOrDevice s,
+    int window_size) {
   for (const auto& tensor : {queries, keys, values}) {
     if (tensor.ndim() != 4) {
       std::ostringstream msg;
@@ -1250,7 +1255,8 @@ array scaled_dot_product_attention(
         do_causal,
         has_sinks,
         output_logsumexp,
-        window_size);
+        window_size,
+        std::move(ab_handle));
     if (output_logsumexp) {
       return array::make_arrays(
           {std::move(out_shape), Shape{q.shape(0), q.shape(1), q.shape(2), 1}},
@@ -1263,6 +1269,39 @@ array scaled_dot_product_attention(
     }
   }
   return fallback(std::move(inputs))[0];
+}
+} // namespace
+
+// Public overloads — thin wrappers over scaled_dot_product_attention_impl.
+array scaled_dot_product_attention(
+    const array& queries,
+    const array& keys,
+    const array& values,
+    const float scale,
+    const std::string& mask_mode /* = "" */,
+    std::optional<array> mask_arr /* = {} */,
+    const std::optional<array>& sinks /* = {} */,
+    StreamOrDevice s /* = {} */,
+    int window_size /* = -1 */) {
+  return scaled_dot_product_attention_impl(
+      queries, keys, values, scale, mask_mode, std::move(mask_arr), sinks,
+      nullptr, s, window_size);
+}
+
+array scaled_dot_product_attention(
+    const array& queries,
+    const array& keys,
+    const array& values,
+    const float scale,
+    const std::string& mask_mode,
+    std::optional<array> mask_arr,
+    const std::optional<array>& sinks,
+    std::shared_ptr<metal::PersistentAb> ab_handle,
+    StreamOrDevice s /* = {} */,
+    int window_size /* = -1 */) {
+  return scaled_dot_product_attention_impl(
+      queries, keys, values, scale, mask_mode, std::move(mask_arr), sinks,
+      std::move(ab_handle), s, window_size);
 }
 
 std::vector<array> ScaledDotProductAttention::vjp(
