@@ -225,9 +225,17 @@ TEST_CASE("icb primitive: SDPA setBytes arena is shape-dependent (T_k varies)") 
   constexpr int D = 64;
 
   auto record_with_k_length = [&](int T_k) {
+    // Pre-materialize inputs OUTSIDE the recording so the recorded
+    // commands are SDPA-only. `ones()` is lazy in mlx — without the
+    // explicit eval() below, the fill-constant kernels end up inside
+    // the recording and their T_k-dependent dispatch sizes pollute
+    // the arena comparison with non-SDPA setBytes.
     auto q = ones({1, H, 1, D}, float16, s);
     auto k = ones({1, H, T_k, D}, float16, s);
     auto v = ones({1, H, T_k, D}, float16, s);
+    eval(q);
+    eval(k);
+    eval(v);
     enc.synchronize();
 
     enc.begin_icb_recording(/*max_commands=*/512);
@@ -261,11 +269,19 @@ TEST_CASE("icb primitive: SDPA setBytes arena is shape-dependent (T_k varies)") 
       " bytes_used=", used_1025);
 
   // Primary diagnostic: compare the used portion of the arenas
-  // byte-by-byte. Note: may only be meaningful when sizes match —
-  // if sizes differ, the command mix itself changed, which is even
-  // stronger evidence of shape dependence.
+  // byte-by-byte. Three verdicts:
+  //   - both arenas empty (bytes_used == 0)  => setBytes eliminated
+  //     (Phase 2 AB success: kernel args live in a single shared
+  //     buffer, no setBytes at all).
+  //   - non-zero and memcmp-equal               => T_k-independent
+  //     setBytes (still safe for ICB replay).
+  //   - sizes or contents differ               => T_k-dependent,
+  //     ICB replay is unsafe.
   bool identical = false;
-  if (used_1024 == used_1025 && used_1024 > 0) {
+  bool both_empty = (used_1024 == 0 && used_1025 == 0);
+  if (both_empty) {
+    identical = true;
+  } else if (used_1024 == used_1025 && used_1024 > 0) {
     const auto* a = static_cast<const uint8_t*>(rec_1024->bytes_arena_ptr());
     const auto* b = static_cast<const uint8_t*>(rec_1025->bytes_arena_ptr());
     REQUIRE(a);
@@ -273,7 +289,14 @@ TEST_CASE("icb primitive: SDPA setBytes arena is shape-dependent (T_k varies)") 
     identical = (std::memcmp(a, b, used_1024) == 0);
   }
 
-  if (identical) {
+  if (both_empty) {
+    MESSAGE(
+        "ARENAS IDENTICAL (both empty) — SDPA emits zero setBytes. "
+        "The AB-migrated unified kernel reads all shape-dependent "
+        "arguments from a single argument-buffer bind whose contents "
+        "are read fresh at replay time. ICB replay across a growing "
+        "KV cache is numerically safe.");
+  } else if (identical) {
     MESSAGE(
         "ARENAS IDENTICAL — SDPA setBytes payload is NOT T_k-dependent. "
         "ICB replay across a growing KV cache is numerically safe for "
@@ -292,6 +315,21 @@ TEST_CASE("icb primitive: SDPA setBytes arena is shape-dependent (T_k varies)") 
   // the integration direction is data-driven.
   CHECK(rec_1024->size() > 0);
   CHECK(rec_1025->size() > 0);
+
+  // Regression gate: when the AB path is on (MLX_METAL_AB=1 or
+  // MLX_METAL_ICB=1), the SDPA arena MUST be empty — Phase 2 of
+  // Option C removed every setBytes from the dispatch. If this check
+  // ever fails, the AB-gated kernel has been regressed or a new
+  // shape-dependent setBytes has snuck in.
+  const char* ab_env = std::getenv("MLX_METAL_AB");
+  const char* icb_env = std::getenv("MLX_METAL_ICB");
+  bool ab_on = (ab_env && ab_env[0] == '1') ||
+      (icb_env && icb_env[0] == '1');
+  if (ab_on) {
+    CHECK(both_empty);
+    CHECK(rec_1024->size() == rec_1025->size());
+    CHECK(rec_1024->num_segments() == rec_1025->num_segments());
+  }
 }
 
 TEST_CASE("icb primitive: sweep T_k to map SDPA segment-topology thresholds") {
