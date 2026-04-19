@@ -558,8 +558,13 @@ bool ScaledDotProductAttention::use_fallback(
     bool do_causal,
     bool is_training,
     bool output_logsumexp,
-    Stream s) {
+    Stream s,
+    int window_size) {
   if (s.device == Device::cpu) {
+    return true;
+  }
+  // Windowed causal is synthesized in the fallback composed path.
+  if (window_size > 0) {
     return true;
   }
 

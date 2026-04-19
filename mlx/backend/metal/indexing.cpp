@@ -1,5 +1,8 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <cstdlib>
+#include <memory>
+
 #include <fmt/format.h>
 
 #include "mlx/backend/common/compiled.h"
@@ -8,6 +11,8 @@
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/gpu/scan.h"
 #include "mlx/backend/gpu/slicing.h"
+#include "mlx/backend/metal/ab_gate.h"
+#include "mlx/backend/metal/argument_buffer.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/jit/includes.h"
 #include "mlx/backend/metal/jit/indexing.h"
@@ -18,6 +23,13 @@
 #include "mlx/utils.h"
 
 namespace mlx::core {
+
+namespace {
+// Delegates to the shared helper (ICB implies AB — see ab_gate.h).
+bool gather_ab_enabled() {
+  return ::mlx::core::metal::ab_enabled();
+}
+} // namespace
 
 constexpr int METAL_MAX_INDEX_ARRAYS = 20;
 
@@ -89,6 +101,68 @@ void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
       inputs[1].flags().row_contiguous && slice_size == src.strides()[0]) {
     int work_per_thread = (slice_size > 8 && src.dtype().size() < 4) ? 2 : 1;
     auto& indices = inputs[1];
+    const bool use_ab = gather_ab_enabled();
+
+    auto& compute_encoder = metal::get_command_encoder(s);
+
+    size_t dim_x = (slice_size + work_per_thread - 1) / work_per_thread;
+    size_t dim_y = indices.size();
+    auto group_dims = get_block_dims(dim_x, dim_y, 1);
+    MTL::Size grid_dims = MTL::Size(dim_x, dim_y, 1);
+
+    if (use_ab) {
+      // AOT-instantiated kernel name (see gather_front_ab.metal).
+      std::string kname = fmt::format(
+          "gather_front_ab_{0}_{1}_{2}_{3}",
+          type_to_name(out),
+          idx_type_name,
+          large ? "int64_t" : "int",
+          work_per_thread);
+      auto kernel = d.get_kernel(kname);
+      compute_encoder.set_compute_pipeline_state(kernel);
+
+      using Slot = metal::ArgumentBuffer::Slot;
+      auto ab = std::make_shared<metal::ArgumentBuffer>(
+          d,
+          std::vector<Slot>{
+              {Slot::Kind::BufferPtrOffset, 0, "src"},
+              {Slot::Kind::BufferPtrOffset, 0, "indices"},
+              {Slot::Kind::BufferPtrOffset, 0, "out"},
+              {Slot::Kind::Scalar64, 0, "stride"},
+              {Slot::Kind::Scalar32, 0, "size"},
+          });
+      ab->set_buffer_ptr(
+          0, static_cast<const MTL::Buffer*>(src.buffer().ptr()), src.offset());
+      ab->set_buffer_ptr(
+          1,
+          static_cast<const MTL::Buffer*>(indices.buffer().ptr()),
+          indices.offset());
+      ab->set_buffer_ptr(
+          2, static_cast<const MTL::Buffer*>(out.buffer().ptr()), out.offset());
+      ab->set_scalar64(3, static_cast<uint64_t>(slice_size));
+      ab->set_scalar32(4, static_cast<uint32_t>(src.shape(0)));
+
+      compute_encoder.register_input_array(src);
+      compute_encoder.register_input_array(indices);
+      compute_encoder.register_output_array(out);
+
+      compute_encoder.use_resource(
+          static_cast<const MTL::Resource*>(src.buffer().ptr()),
+          MTL::ResourceUsageRead);
+      compute_encoder.use_resource(
+          static_cast<const MTL::Resource*>(indices.buffer().ptr()),
+          MTL::ResourceUsageRead);
+      compute_encoder.use_resource(
+          static_cast<const MTL::Resource*>(out.buffer().ptr()),
+          MTL::ResourceUsageWrite);
+
+      compute_encoder.set_buffer(ab->mtl_buffer(), 0);
+      compute_encoder.dispatch_threads(grid_dims, group_dims);
+      compute_encoder.add_temporary_object(
+          std::static_pointer_cast<void>(ab));
+      return;
+    }
+
     std::string kernel_name = fmt::format(
         "gather_front{0}_{1}_{2}_{3}",
         type_to_name(out),
@@ -111,14 +185,8 @@ void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
       return kernel_source;
     });
 
-    auto& compute_encoder = metal::get_command_encoder(s);
     auto kernel = d.get_kernel(kernel_name, lib);
     compute_encoder.set_compute_pipeline_state(kernel);
-
-    size_t dim_x = (slice_size + work_per_thread - 1) / work_per_thread;
-    size_t dim_y = indices.size();
-    auto group_dims = get_block_dims(dim_x, dim_y, 1);
-    MTL::Size grid_dims = MTL::Size(dim_x, dim_y, 1);
 
     compute_encoder.set_input_array(src, 0);
     compute_encoder.set_input_array(indices, 1);

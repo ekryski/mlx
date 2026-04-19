@@ -9,7 +9,7 @@
  * Based on code from:
  * https://stackoverflow.com/questions/35148198/efficient-faithfully-rounded-implementation-of-error-function-erff#answer-35148199
  */
-float erf(float a) {
+inline float erf(float a) {
   float r, s, t, u;
   t = metal::abs(a);
   s = a * a;
@@ -39,7 +39,7 @@ float erf(float a) {
   return r;
 }
 
-float erfinv(float a) {
+inline float erfinv(float a) {
   auto t = metal::fma(a, 0.0f - a, 1.0f);
   t = metal::log(t);
   float p;

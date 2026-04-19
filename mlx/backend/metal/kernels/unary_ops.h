@@ -422,19 +422,19 @@ struct Tanh {
   };
 };
 
-complex64_t ArcCos::operator()(complex64_t x) {
+inline complex64_t ArcCos::operator()(complex64_t x) {
   auto i = complex64_t{0.0, 1.0};
   auto y = Log{}(x + i * Sqrt{}(1.0 - x * x));
   return {y.imag, -y.real};
 };
 
-complex64_t ArcSin::operator()(complex64_t x) {
+inline complex64_t ArcSin::operator()(complex64_t x) {
   auto i = complex64_t{0.0, 1.0};
   auto y = Log{}(i * x + Sqrt{}(1.0 - x * x));
   return {y.imag, -y.real};
 };
 
-complex64_t ArcTan::operator()(complex64_t x) {
+inline complex64_t ArcTan::operator()(complex64_t x) {
   auto i = complex64_t{0.0, 1.0};
   auto ix = i * x;
   return (1.0 / complex64_t{0.0, 2.0}) * Log{}((1.0 + ix) / (1.0 - ix));

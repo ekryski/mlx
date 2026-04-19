@@ -4,6 +4,7 @@
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/metal.h"
 #include "mlx/backend/metal/utils.h"
+#include "mlx/stream.h"
 
 namespace mlx::core::metal {
 
@@ -44,6 +45,35 @@ void stop_capture() {
   auto pool = new_scoped_memory_pool();
   auto manager = MTL::CaptureManager::sharedCaptureManager();
   manager->stopCapture();
+}
+
+void reset_dispatch_counter() {
+  auto stream = default_stream(mlx::core::Device::gpu);
+  auto& encoder = metal::get_command_encoder(stream);
+  encoder.reset_dispatch_counter();
+}
+
+uint64_t total_dispatches() {
+  auto stream = default_stream(mlx::core::Device::gpu);
+  auto& encoder = metal::get_command_encoder(stream);
+  return encoder.total_dispatches();
+}
+
+void start_kernel_log() {
+  CommandEncoder::start_kernel_log();
+}
+
+void stop_kernel_log() {
+  CommandEncoder::stop_kernel_log();
+}
+
+size_t kernel_log_size() {
+  return CommandEncoder::kernel_log_size();
+}
+
+const char* kernel_log_at(size_t i) {
+  auto* p = CommandEncoder::kernel_log_at(i);
+  return p ? p : "";
 }
 
 } // namespace mlx::core::metal

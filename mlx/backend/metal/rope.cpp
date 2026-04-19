@@ -1,9 +1,24 @@
 // Copyright © 2023-2024 Apple Inc.
+#include <cstdlib>
+#include <memory>
+
 #include "mlx/backend/gpu/copy.h"
+#include "mlx/backend/metal/ab_gate.h"
+#include "mlx/backend/metal/argument_buffer.h"
+#include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx/fast_primitives.h"
 
 namespace mlx::core::fast {
+
+namespace {
+
+// Delegates to the shared helper (ICB implies AB — see ab_gate.h).
+bool rope_ab_enabled() {
+  return ::mlx::core::metal::ab_enabled();
+}
+
+} // namespace
 
 constexpr int n_per_thread = 4;
 
@@ -96,14 +111,27 @@ void RoPE::eval_gpu(
   bool single = in.flags().row_contiguous && T == 1 && offset.size() == 1;
 
   bool with_freqs = inputs.size() == 3;
+  // AB path covers only the T==1 contiguous single-token decode case.
+  // Prefill variants (multi-token, non-contiguous, head-seq-transpose)
+  // stay on the legacy path so every RoPE call-site remains correct.
+  const bool use_ab = single && rope_ab_enabled();
+
   std::string kname;
-  concatenate(
-      kname,
-      "rope_",
-      single ? "single_" : "",
-      (with_freqs) ? "freqs_" : "",
-      large ? "large_" : "",
-      type_to_name(in));
+  if (use_ab) {
+    concatenate(
+        kname,
+        "rope_ab_single_",
+        with_freqs ? "freqs_" : "",
+        type_to_name(in));
+  } else {
+    concatenate(
+        kname,
+        "rope_",
+        single ? "single_" : "",
+        (with_freqs) ? "freqs_" : "",
+        large ? "large_" : "",
+        type_to_name(in));
+  }
   std::string hash_name;
   concatenate(
       hash_name,
@@ -112,16 +140,127 @@ void RoPE::eval_gpu(
       forward_ ? "" : "vjp_",
       traditional_ ? "traditional_" : "",
       head_seq_transpose ? "transpose" : "");
-  metal::MTLFCList func_consts = {
-      {&forward_, MTL::DataType::DataTypeBool, 1},
-      {&traditional_, MTL::DataType::DataTypeBool, 2},
-      {&head_seq_transpose, MTL::DataType::DataTypeBool, 3}};
+  metal::MTLFCList func_consts;
+  if (use_ab) {
+    // AB single kernels reference forward / traditional only;
+    // head_seq_transpose is not used in the T==1 path.
+    func_consts = {
+        {&forward_, MTL::DataType::DataTypeBool, 1},
+        {&traditional_, MTL::DataType::DataTypeBool, 2},
+    };
+  } else {
+    func_consts = {
+        {&forward_, MTL::DataType::DataTypeBool, 1},
+        {&traditional_, MTL::DataType::DataTypeBool, 2},
+        {&head_seq_transpose, MTL::DataType::DataTypeBool, 3}};
+  }
 
   auto kernel = d.get_kernel(kname, hash_name, func_consts);
   auto& compute_encoder = metal::get_command_encoder(s);
 
   float base = std::log2(base_);
   compute_encoder.set_compute_pipeline_state(kernel);
+
+  if (use_ab) {
+    // Build the AB for the single-token path. Inputs:
+    //   in  (= `donated ? out : in` per legacy binding)
+    //   out
+    //   offset (device int buffer)
+    //   scale, stride(=out_strides[0]), and either `base` or
+    //   (`freqs`, `freq_stride`).
+    using Slot = metal::ArgumentBuffer::Slot;
+    auto& in_array = donated ? out : in;
+
+    if (with_freqs) {
+      auto& freqs = inputs[2];
+      auto ab = std::make_shared<metal::ArgumentBuffer>(
+          d,
+          std::vector<Slot>{
+              {Slot::Kind::BufferPtrOffset, 0, "in"},
+              {Slot::Kind::BufferPtrOffset, 0, "out"},
+              {Slot::Kind::BufferPtrOffset, 0, "offset"},
+              {Slot::Kind::Float32, 0, "scale"},
+              {Slot::Kind::Scalar64, 0, "stride"},
+              {Slot::Kind::BufferPtrOffset, 0, "freqs"},
+              {Slot::Kind::Scalar64, 0, "freq_stride"},
+          });
+      ab->set_buffer_ptr(
+          0,
+          static_cast<const MTL::Buffer*>(in_array.buffer().ptr()),
+          in_array.offset());
+      ab->set_buffer_ptr(
+          1,
+          static_cast<const MTL::Buffer*>(out.buffer().ptr()),
+          out.offset());
+      ab->set_buffer_ptr(
+          2,
+          static_cast<const MTL::Buffer*>(offset.buffer().ptr()),
+          offset.offset());
+      ab->set_float32(3, scale_);
+      ab->set_scalar64(4, static_cast<uint64_t>(out_strides[0]));
+      ab->set_buffer_ptr(
+          5,
+          static_cast<const MTL::Buffer*>(freqs.buffer().ptr()),
+          freqs.offset());
+      ab->set_scalar64(
+          6, static_cast<uint64_t>(freqs.strides()[0]));
+
+      compute_encoder.register_input_array(in_array);
+      compute_encoder.register_input_array(offset);
+      compute_encoder.register_input_array(freqs);
+      compute_encoder.register_output_array(out);
+
+      compute_encoder.set_buffer(ab->mtl_buffer(), 0);
+
+      uint32_t dim0 = dims_ / 2;
+      auto group_dims = get_block_dims(dim0, N, 1);
+      auto grid_dims = MTL::Size(dim0, N, 1);
+      compute_encoder.dispatch_threads(grid_dims, group_dims);
+      compute_encoder.add_temporary_object(
+          std::static_pointer_cast<void>(ab));
+    } else {
+      auto ab = std::make_shared<metal::ArgumentBuffer>(
+          d,
+          std::vector<Slot>{
+              {Slot::Kind::BufferPtrOffset, 0, "in"},
+              {Slot::Kind::BufferPtrOffset, 0, "out"},
+              {Slot::Kind::BufferPtrOffset, 0, "offset"},
+              {Slot::Kind::Float32, 0, "scale"},
+              {Slot::Kind::Scalar64, 0, "stride"},
+              {Slot::Kind::Float32, 0, "base"},
+          });
+      ab->set_buffer_ptr(
+          0,
+          static_cast<const MTL::Buffer*>(in_array.buffer().ptr()),
+          in_array.offset());
+      ab->set_buffer_ptr(
+          1,
+          static_cast<const MTL::Buffer*>(out.buffer().ptr()),
+          out.offset());
+      ab->set_buffer_ptr(
+          2,
+          static_cast<const MTL::Buffer*>(offset.buffer().ptr()),
+          offset.offset());
+      ab->set_float32(3, scale_);
+      ab->set_scalar64(4, static_cast<uint64_t>(out_strides[0]));
+      ab->set_float32(5, base);
+
+      compute_encoder.register_input_array(in_array);
+      compute_encoder.register_input_array(offset);
+      compute_encoder.register_output_array(out);
+
+      compute_encoder.set_buffer(ab->mtl_buffer(), 0);
+
+      uint32_t dim0 = dims_ / 2;
+      auto group_dims = get_block_dims(dim0, N, 1);
+      auto grid_dims = MTL::Size(dim0, N, 1);
+      compute_encoder.dispatch_threads(grid_dims, group_dims);
+      compute_encoder.add_temporary_object(
+          std::static_pointer_cast<void>(ab));
+    }
+    return;
+  }
+
   compute_encoder.set_input_array(donated ? out : in, 0);
   compute_encoder.set_output_array(out, 1);
 

@@ -1,9 +1,13 @@
 // Copyright © 2023-2024 Apple Inc.
+#include <cstdlib>
 #include <fmt/format.h>
+#include <memory>
 #include <sstream>
 
 #include "mlx/backend/common/compiled.h"
 #include "mlx/backend/common/utils.h"
+#include "mlx/backend/metal/ab_gate.h"
+#include "mlx/backend/metal/argument_buffer.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/jit/includes.h"
 #include "mlx/backend/metal/utils.h"
@@ -12,6 +16,159 @@
 #include "mlx/utils.h"
 
 namespace mlx::core {
+
+namespace {
+
+// Delegates to the shared helper (ICB implies AB — see ab_gate.h).
+bool compiled_ab_enabled() {
+  return ::mlx::core::metal::ab_enabled();
+}
+
+} // namespace
+
+// Shared argument-buffer helper struct emitted once per generated
+// Metal library (see build_kernel_ab). Matches the byte layout
+// written by the C++ ArgumentBuffer at runtime.
+constexpr const char* kAbStructSource =
+    "struct BufferPtrOffset {\n"
+    "  uint64_t addr;\n"
+    "  uint64_t offset;\n"
+    "};\n\n";
+
+// AB variant of build_kernel — covers the contiguous fast paths only.
+// Emits a per-kernel struct containing one BufferPtrOffset per
+// (non-constant) input, one per output, and a `size` scalar. The
+// kernel signature collapses to `constant const ArgsT& args [[buffer(0)]]`.
+// Strided/dynamic kernels stay on the legacy code path; the AB
+// struct for those would need shape + stride arrays inline, which
+// we can add once the contiguous path is measured.
+inline void build_kernel_ab(
+    std::string& os,
+    const std::string& kernel_name,
+    const std::vector<array>& inputs,
+    const std::vector<array>& outputs,
+    const std::vector<array>& tape,
+    const std::function<bool(size_t)>& is_constant,
+    bool use_big_index,
+    int work_per_thread) {
+  NodeNamer namer;
+
+  // Emit the per-kernel Args struct (fields laid out to match the
+  // C++ ArgumentBuffer packing: 16B BufferPtrOffset slots are
+  // 16B-aligned, scalars follow at their natural alignment).
+  std::string struct_name = kernel_name + "_Args";
+  os += "struct " + struct_name + " {\n";
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    if (is_constant(i)) {
+      continue;
+    }
+    os +=
+        fmt::format("  BufferPtrOffset {0};\n", namer.get_name(inputs[i]));
+  }
+  for (auto& x : outputs) {
+    os += fmt::format("  BufferPtrOffset {0};\n", namer.get_name(x));
+  }
+  if (use_big_index) {
+    os += "  int64_t size;\n";
+  } else {
+    os += "  uint size;\n";
+    os += "  uint _pad;\n"; // align to 8B so subsequent ints don't misalign
+  }
+  os += "};\n\n";
+
+  // Kernel header.
+  os += fmt::format(
+      "[[host_name(\"{0}\")]]\n[[kernel]] void {0}(\n", kernel_name);
+  os += fmt::format(
+      "    constant const {0}& args [[buffer(0)]],\n", struct_name);
+  os += "    uint3 pos [[thread_position_in_grid]],\n";
+  os += "    uint3 grid [[threads_per_grid]]) {\n";
+
+  // Unpack input / output pointers from the AB struct.
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    if (is_constant(i)) {
+      continue;
+    }
+    auto& x = inputs[i];
+    auto& xname = namer.get_name(x);
+    os += fmt::format(
+        "  device const {0}* {1} = reinterpret_cast<device const {0}*>(args.{1}.addr + args.{1}.offset);\n",
+        get_type_string(x.dtype()),
+        xname);
+  }
+  for (auto& x : outputs) {
+    auto& xname = namer.get_name(x);
+    os += fmt::format(
+        "  device {0}* {1} = reinterpret_cast<device {0}*>(args.{1}.addr + args.{1}.offset);\n",
+        get_type_string(x.dtype()),
+        xname);
+  }
+
+  // Work-per-thread setup, matching the legacy contiguous-path logic.
+  os += fmt::format("  constexpr int N_ = {0};\n", work_per_thread);
+  if (use_big_index) {
+    os += "  int64_t index = N_ * (pos.x + grid.x * int64_t(pos.y));\n";
+  } else {
+    os += "  uint index = N_ * pos.x;\n";
+  }
+  if (work_per_thread > 1) {
+    os += "  for (int i = 0; i < N_ && index < args.size; ++i) {\n";
+  }
+
+  // Read constant / scalar / contiguous inputs into tmps.
+  for (int i = 0; i < inputs.size(); ++i) {
+    auto& x = inputs[i];
+    auto& xname = namer.get_name(x);
+    if (is_constant(i)) {
+      auto type_str = get_type_string(x.dtype());
+      std::ostringstream ss;
+      print_constant(ss, x);
+      os += fmt::format(
+          "  auto tmp_{0} = static_cast<{1}>({2});\n",
+          xname,
+          type_str,
+          ss.str());
+    } else if (is_scalar(x)) {
+      os += fmt::format(
+          "  {0} tmp_{1} = {1}[0];\n", get_type_string(x.dtype()), xname);
+    } else {
+      // Contiguous: just read at `index`.
+      os += fmt::format(
+          "  {0} tmp_{1} = {1}[index];\n", get_type_string(x.dtype()), xname);
+    }
+  }
+
+  // Actually write the computation (same as legacy).
+  for (auto& x : tape) {
+    os += fmt::format(
+        "  {0} tmp_{1} = ", get_type_string(x.dtype()), namer.get_name(x));
+    if (is_static_cast(x.primitive())) {
+      os += fmt::format(
+          "static_cast<{0}>(tmp_{1});\n",
+          get_type_string(x.dtype()),
+          namer.get_name(x.inputs()[0]));
+    } else {
+      os += x.primitive().name();
+      os += "()(";
+      for (int i = 0; i < x.inputs().size() - 1; i++) {
+        os += fmt::format("tmp_{0}, ", namer.get_name(x.inputs()[i]));
+      }
+      os += fmt::format("tmp_{0});\n", namer.get_name(x.inputs().back()));
+    }
+  }
+
+  // Write the outputs from tmps.
+  for (auto& x : outputs) {
+    os += fmt::format("  {0}[index] = tmp_{0};\n", namer.get_name(x));
+  }
+
+  // Close per-thread loop.
+  if (work_per_thread > 1) {
+    os += "  index++;\n  }\n";
+  }
+
+  os += "}\n\n";
+}
 
 inline void build_kernel(
     std::string& os,
@@ -265,6 +422,8 @@ void Compiled::eval_gpu(
     std::string kernel = metal::utils();
     concatenate(
         kernel, metal::unary_ops(), metal::binary_ops(), metal::ternary_ops());
+    // Shared struct definition for AB variants emitted below.
+    kernel += kAbStructSource;
     build_kernel(
         kernel,
         kernel_lib_ + "_contiguous",
@@ -275,6 +434,15 @@ void Compiled::eval_gpu(
         /* contiguous = */ true,
         /* ndim = */ 0,
         /* dynamic_dims = */ false,
+        /* use_big_index = */ false,
+        /* work_per_thread = */ 1);
+    build_kernel_ab(
+        kernel,
+        kernel_lib_ + "_contiguous_ab",
+        inputs_,
+        outputs_,
+        tape_,
+        is_constant_,
         /* use_big_index = */ false,
         /* work_per_thread = */ 1);
     if (work_per_thread > 1) {
@@ -290,6 +458,15 @@ void Compiled::eval_gpu(
           /* dynamic_dims = */ false,
           /* use_big_index = */ false,
           /* work_per_thread = */ work_per_thread);
+      build_kernel_ab(
+          kernel,
+          kernel_lib_ + "_contiguous_n_ab",
+          inputs_,
+          outputs_,
+          tape_,
+          is_constant_,
+          /* use_big_index = */ false,
+          /* work_per_thread = */ work_per_thread);
     }
     build_kernel(
         kernel,
@@ -301,6 +478,15 @@ void Compiled::eval_gpu(
         /* contiguous = */ true,
         /* ndim = */ 0,
         /* dynamic_dims = */ false,
+        /* use_big_index = */ true,
+        /* work_per_thread = */ work_per_thread);
+    build_kernel_ab(
+        kernel,
+        kernel_lib_ + "_contiguous_large_ab",
+        inputs_,
+        outputs_,
+        tape_,
+        is_constant_,
         /* use_big_index = */ true,
         /* work_per_thread = */ work_per_thread);
     for (int i = 1; i < 8; i++) {
@@ -388,6 +574,88 @@ void Compiled::eval_gpu(
   if (large) {
     kernel_name += "_large";
   }
+
+  // AB fast path: contiguous only; strided/dynamic stays on legacy
+  // because the AB variant would need shape + stride arrays inline,
+  // deferred until the contiguous-path signal is measured.
+  const bool use_ab = compiled_ab_enabled() && contiguous;
+  if (use_ab) {
+    std::string ab_kname = kernel_name + "_ab";
+    auto ab_kernel = d.get_kernel(ab_kname, lib);
+    auto& compute_encoder = metal::get_command_encoder(s);
+    compute_encoder.set_compute_pipeline_state(ab_kernel);
+
+    // Output allocation still goes through the shared helper.
+    compiled_allocate_outputs(inputs, outputs, is_constant_, contiguous);
+
+    // Build the AB layout: 1 BufferPtrOffset slot per non-constant
+    // input + 1 per output + 1 size scalar (scalar32 for small, 64
+    // for large to match the kernel-side struct emitted by
+    // build_kernel_ab).
+    using Slot = metal::ArgumentBuffer::Slot;
+    std::vector<Slot> layout;
+    layout.reserve(inputs.size() + outputs.size() + 1);
+    for (int i = 0; i < inputs.size(); ++i) {
+      if (is_constant_(i)) {
+        continue;
+      }
+      layout.push_back({Slot::Kind::BufferPtrOffset, 0, "in", 0});
+    }
+    for (size_t i = 0; i < outputs.size(); ++i) {
+      layout.push_back({Slot::Kind::BufferPtrOffset, 0, "out", 0});
+    }
+    layout.push_back({
+        large ? Slot::Kind::Scalar64 : Slot::Kind::Scalar32, 0, "size", 0});
+
+    auto ab = std::make_shared<metal::ArgumentBuffer>(d, layout);
+
+    int slot = 0;
+    for (int i = 0; i < inputs.size(); ++i) {
+      if (is_constant_(i)) {
+        continue;
+      }
+      auto& x = inputs[i];
+      ab->set_buffer_ptr(
+          slot++,
+          static_cast<const MTL::Buffer*>(x.buffer().ptr()),
+          x.offset());
+      compute_encoder.register_input_array(x);
+      compute_encoder.use_resource(
+          static_cast<const MTL::Resource*>(x.buffer().ptr()),
+          MTL::ResourceUsageRead);
+    }
+    for (auto& x : outputs) {
+      ab->set_buffer_ptr(
+          slot++,
+          static_cast<const MTL::Buffer*>(x.buffer().ptr()),
+          x.offset());
+      compute_encoder.register_output_array(x);
+      compute_encoder.use_resource(
+          static_cast<const MTL::Resource*>(x.buffer().ptr()),
+          MTL::ResourceUsageWrite);
+    }
+    const auto size = outputs[0].data_size();
+    if (large) {
+      ab->set_scalar64(slot, static_cast<uint64_t>(size));
+    } else {
+      ab->set_scalar32(slot, static_cast<uint32_t>(size));
+    }
+
+    compute_encoder.set_buffer(ab->mtl_buffer(), 0);
+
+    // Dispatch.
+    size_t nthreads = ceildiv(outputs[0].data_size(), work_per_thread);
+    MTL::Size group_dims(
+        std::min(nthreads, ab_kernel->maxTotalThreadsPerThreadgroup()), 1, 1);
+    MTL::Size grid_dims = large
+        ? get_2d_grid_dims(
+              outputs[0].shape(), outputs[0].strides(), work_per_thread)
+        : MTL::Size(nthreads, 1, 1);
+    compute_encoder.dispatch_threads(grid_dims, group_dims);
+    compute_encoder.add_temporary_object(std::static_pointer_cast<void>(ab));
+    return;
+  }
+
   auto kernel = d.get_kernel(kernel_name, lib);
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);

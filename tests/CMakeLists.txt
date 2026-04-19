@@ -10,6 +10,15 @@ if(MLX_BUILD_METAL OR MLX_BUILD_CUDA)
   set(METAL_TEST_SOURCES gpu_tests.cpp)
 endif()
 
+if(MLX_BUILD_METAL)
+  list(APPEND METAL_TEST_SOURCES argument_buffer_tests.cpp)
+  list(APPEND METAL_TEST_SOURCES argument_buffer_bench.cpp)
+  list(APPEND METAL_TEST_SOURCES icb_feasibility_tests.cpp)
+  list(APPEND METAL_TEST_SOURCES icb_recorder_tests.cpp)
+  list(APPEND METAL_TEST_SOURCES icb_real_primitive_tests.cpp)
+  list(APPEND METAL_TEST_SOURCES sdpa_regression_tests.cpp)
+endif()
+
 include(${doctest_SOURCE_DIR}/scripts/cmake/doctest.cmake)
 
 target_sources(

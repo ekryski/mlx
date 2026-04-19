@@ -1,8 +1,13 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <cstdlib>
+#include <memory>
+
 #include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/common/compiled.h"
 #include "mlx/backend/gpu/copy.h"
+#include "mlx/backend/metal/ab_gate.h"
+#include "mlx/backend/metal/argument_buffer.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/kernels.h"
 #include "mlx/backend/metal/reduce.h"
@@ -15,6 +20,12 @@
 namespace mlx::core {
 
 namespace {
+
+// Delegates to the shared helper (ICB implies AB — see ab_gate.h).
+bool qmv_ab_enabled() {
+  return ::mlx::core::metal::ab_enabled();
+}
+
 
 template <typename... Args>
 auto get_quantized_kernel_wrapped(
@@ -253,11 +264,97 @@ void qmv(
   MTL::Size group_dims(bk, 2, 1);
   MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
 
-  std::string kname;
-  kname.reserve(64);
   std::string type_string = get_type_string(x.dtype());
   bool fast = N % bn == 0 && K % 512 == 0;
 
+  // AB path covers only non-batched affine qmv. Other modes
+  // (fp4/fp8/mxfp4) and batched dispatches stay on legacy.
+  const bool use_ab =
+      qmv_ab_enabled() && B == 1 && mode == "affine" && biases.has_value();
+
+  if (use_ab) {
+    // Kernel names use `type_to_name` style (bfloat16, not bfloat16_t)
+    // to match the AOT instantiation in affine_qmv_ab.metal.
+    std::string ab_type_name = type_to_name(x);
+    std::string kname;
+    concatenate(
+        kname,
+        (fast ? "affine_qmv_fast_ab_" : "affine_qmv_ab_"),
+        ab_type_name,
+        "_gs_",
+        group_size,
+        "_b_",
+        bits);
+    auto kernel = d.get_kernel(kname);
+
+    auto& compute_encoder = metal::get_command_encoder(s);
+    compute_encoder.set_compute_pipeline_state(kernel);
+
+    using Slot = metal::ArgumentBuffer::Slot;
+    auto ab = std::make_shared<metal::ArgumentBuffer>(
+        d,
+        std::vector<Slot>{
+            {Slot::Kind::BufferPtrOffset, 0, "w"},
+            {Slot::Kind::BufferPtrOffset, 0, "scales"},
+            {Slot::Kind::BufferPtrOffset, 0, "biases"},
+            {Slot::Kind::BufferPtrOffset, 0, "x"},
+            {Slot::Kind::BufferPtrOffset, 0, "y"},
+            {Slot::Kind::Scalar32, 0, "K"},
+            {Slot::Kind::Scalar32, 0, "N"},
+        });
+    ab->set_buffer_ptr(
+        0, static_cast<const MTL::Buffer*>(w.buffer().ptr()), w.offset());
+    ab->set_buffer_ptr(
+        1,
+        static_cast<const MTL::Buffer*>(scales.buffer().ptr()),
+        scales.offset());
+    ab->set_buffer_ptr(
+        2,
+        static_cast<const MTL::Buffer*>(biases->buffer().ptr()),
+        biases->offset());
+    ab->set_buffer_ptr(
+        3, static_cast<const MTL::Buffer*>(x.buffer().ptr()), x.offset());
+    ab->set_buffer_ptr(
+        4, static_cast<const MTL::Buffer*>(out.buffer().ptr()), out.offset());
+    ab->set_scalar32(5, static_cast<uint32_t>(K));
+    ab->set_scalar32(6, static_cast<uint32_t>(N));
+
+    compute_encoder.register_input_array(w);
+    compute_encoder.register_input_array(scales);
+    compute_encoder.register_input_array(*biases);
+    compute_encoder.register_input_array(x);
+    compute_encoder.register_output_array(out);
+
+    // The AB kernel reads w/scales/biases/x/y via raw gpuAddress()
+    // pointers. register_*_array only handles barrier + cross-encoder
+    // fence tracking; Metal still needs explicit per-encoder
+    // residency declarations for the dispatch to keep those buffers
+    // mapped.
+    compute_encoder.use_resource(
+        static_cast<const MTL::Resource*>(w.buffer().ptr()),
+        MTL::ResourceUsageRead);
+    compute_encoder.use_resource(
+        static_cast<const MTL::Resource*>(scales.buffer().ptr()),
+        MTL::ResourceUsageRead);
+    compute_encoder.use_resource(
+        static_cast<const MTL::Resource*>(biases->buffer().ptr()),
+        MTL::ResourceUsageRead);
+    compute_encoder.use_resource(
+        static_cast<const MTL::Resource*>(x.buffer().ptr()),
+        MTL::ResourceUsageRead);
+    compute_encoder.use_resource(
+        static_cast<const MTL::Resource*>(out.buffer().ptr()),
+        MTL::ResourceUsageWrite);
+
+    compute_encoder.set_buffer(ab->mtl_buffer(), 0);
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+    compute_encoder.add_temporary_object(
+        std::static_pointer_cast<void>(ab));
+    return;
+  }
+
+  std::string kname;
+  kname.reserve(64);
   concatenate(
       kname,
       mode + (fast ? "_qmv_fast_" : "_qmv_"),
@@ -957,6 +1054,27 @@ void gather_qmm(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+// Pack a source container into a fixed-size int / int64 array,
+// padding with zero. Caller guarantees `src.size() <= N`. Used for
+// AB Bytes slot payloads that mirror fixed-size kernel struct
+// members.
+template <size_t N, typename Src>
+void pack_fixed_ints(int (&dst)[N], const Src& src) {
+  std::memset(dst, 0, sizeof(dst));
+  size_t i = 0;
+  for (auto v : src) {
+    dst[i++] = static_cast<int>(v);
+  }
+}
+template <size_t N, typename Src>
+void pack_fixed_int64s(int64_t (&dst)[N], const Src& src) {
+  std::memset(dst, 0, sizeof(dst));
+  size_t i = 0;
+  for (auto v : src) {
+    dst[i++] = static_cast<int64_t>(v);
+  }
+}
+
 void gather_qmv(
     const array& x,
     const array& w,
@@ -980,10 +1098,169 @@ void gather_qmv(
   MTL::Size group_dims(bk, 2, 1);
   MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
 
-  std::string kname;
-  kname.reserve(64);
   std::string type_string = get_type_string(x.dtype());
   bool fast = N % bn == 0 && K % 512 == 0;
+
+  // AB path covers affine mode only, non-batched biases present.
+  // Other modes (fp4/fp8/mxfp4) stay on legacy.
+  constexpr int kAbMaxNdims = 4;
+  int x_batch_ndims = x.ndim() - 2;
+  int w_batch_ndims = w.ndim() - 2;
+  auto [gather_shape, gather_strides] = collapse_contiguous_dims(
+      lhs_indices.shape(), {lhs_indices.strides(), rhs_indices.strides()});
+  int gather_ndims = gather_shape.size();
+  const bool use_ab = qmv_ab_enabled() && mode == "affine" &&
+      biases.has_value() && x_batch_ndims <= kAbMaxNdims &&
+      w_batch_ndims <= kAbMaxNdims && gather_ndims <= kAbMaxNdims;
+
+  if (use_ab) {
+    std::string ab_type_name = type_to_name(x);
+    std::string kname;
+    concatenate(
+        kname,
+        (fast ? "affine_gather_qmv_fast_ab_" : "affine_gather_qmv_ab_"),
+        ab_type_name,
+        "_gs_",
+        group_size,
+        "_b_",
+        bits);
+    auto kernel = d.get_kernel(kname);
+
+    auto& compute_encoder = metal::get_command_encoder(s);
+    compute_encoder.set_compute_pipeline_state(kernel);
+
+    using Slot = metal::ArgumentBuffer::Slot;
+    // Byte layout mirrors the `AffineGatherQmvArgs` struct in
+    // affine_gather_qmv_ab.metal. Shape/stride arrays capped at
+    // kAbMaxNdims (= 4) and packed via Bytes slots.
+    constexpr size_t kIntArrBytes = kAbMaxNdims * sizeof(int);     // 16
+    constexpr size_t kI64ArrBytes = kAbMaxNdims * sizeof(int64_t); // 32
+    std::vector<Slot> layout = {
+        {Slot::Kind::BufferPtrOffset, 0, "w", 0},
+        {Slot::Kind::BufferPtrOffset, 0, "scales", 0},
+        {Slot::Kind::BufferPtrOffset, 0, "biases", 0},
+        {Slot::Kind::BufferPtrOffset, 0, "x", 0},
+        {Slot::Kind::BufferPtrOffset, 0, "lhs_indices", 0},
+        {Slot::Kind::BufferPtrOffset, 0, "rhs_indices", 0},
+        {Slot::Kind::BufferPtrOffset, 0, "y", 0},
+        {Slot::Kind::Scalar32, 0, "in_vec_size", 0},
+        {Slot::Kind::Scalar32, 0, "out_vec_size", 0},
+        {Slot::Kind::Scalar32, 0, "x_batch_ndims", 0},
+        {Slot::Kind::Scalar32, 0, "w_batch_ndims", 0},
+        {Slot::Kind::Scalar32, 0, "batch_ndims", 0},
+        // pad then lhs_strides (offset 136 per kernel struct)
+        {Slot::Kind::Bytes, 0, "lhs_strides", kI64ArrBytes},
+        {Slot::Kind::Bytes, 0, "rhs_strides", kI64ArrBytes},
+        {Slot::Kind::Bytes, 0, "batch_shape", kIntArrBytes},
+        {Slot::Kind::Bytes, 0, "x_strides", kI64ArrBytes},
+        {Slot::Kind::Bytes, 0, "x_shape", kIntArrBytes},
+        {Slot::Kind::Bytes, 0, "w_strides", kI64ArrBytes},
+        {Slot::Kind::Bytes, 0, "w_shape", kIntArrBytes},
+        {Slot::Kind::Bytes, 0, "s_strides", kI64ArrBytes},
+        {Slot::Kind::Bytes, 0, "b_strides", kI64ArrBytes},
+    };
+    auto ab = std::make_shared<metal::ArgumentBuffer>(d, layout);
+
+    // Buffer pointers.
+    ab->set_buffer_ptr(
+        0, static_cast<const MTL::Buffer*>(w.buffer().ptr()), w.offset());
+    ab->set_buffer_ptr(
+        1,
+        static_cast<const MTL::Buffer*>(scales.buffer().ptr()),
+        scales.offset());
+    ab->set_buffer_ptr(
+        2,
+        static_cast<const MTL::Buffer*>(biases->buffer().ptr()),
+        biases->offset());
+    ab->set_buffer_ptr(
+        3, static_cast<const MTL::Buffer*>(x.buffer().ptr()), x.offset());
+    ab->set_buffer_ptr(
+        4,
+        static_cast<const MTL::Buffer*>(lhs_indices.buffer().ptr()),
+        lhs_indices.offset());
+    ab->set_buffer_ptr(
+        5,
+        static_cast<const MTL::Buffer*>(rhs_indices.buffer().ptr()),
+        rhs_indices.offset());
+    ab->set_buffer_ptr(
+        6, static_cast<const MTL::Buffer*>(out.buffer().ptr()), out.offset());
+
+    // Scalars.
+    ab->set_scalar32(7, static_cast<uint32_t>(K));
+    ab->set_scalar32(8, static_cast<uint32_t>(N));
+    ab->set_scalar32(9, static_cast<uint32_t>(x_batch_ndims));
+    ab->set_scalar32(10, static_cast<uint32_t>(w_batch_ndims));
+    ab->set_scalar32(11, static_cast<uint32_t>(gather_ndims));
+
+    // Pack shape/stride payloads.
+    struct {
+      int64_t lhs_strides[kAbMaxNdims];
+      int64_t rhs_strides[kAbMaxNdims];
+      int batch_shape[kAbMaxNdims];
+      int64_t x_strides[kAbMaxNdims];
+      int x_shape[kAbMaxNdims];
+      int64_t w_strides[kAbMaxNdims];
+      int w_shape[kAbMaxNdims];
+      int64_t s_strides[kAbMaxNdims];
+      int64_t b_strides[kAbMaxNdims];
+    } blobs{};
+    pack_fixed_int64s(blobs.lhs_strides, gather_strides[0]);
+    pack_fixed_int64s(blobs.rhs_strides, gather_strides[1]);
+    pack_fixed_ints(blobs.batch_shape, gather_shape);
+    pack_fixed_int64s(blobs.x_strides, x.strides());
+    pack_fixed_ints(blobs.x_shape, x.shape());
+    pack_fixed_int64s(blobs.w_strides, w.strides());
+    pack_fixed_ints(blobs.w_shape, w.shape());
+    pack_fixed_int64s(blobs.s_strides, scales.strides());
+    pack_fixed_int64s(blobs.b_strides, biases->strides());
+    ab->set_bytes(12, blobs.lhs_strides, sizeof(blobs.lhs_strides));
+    ab->set_bytes(13, blobs.rhs_strides, sizeof(blobs.rhs_strides));
+    ab->set_bytes(14, blobs.batch_shape, sizeof(blobs.batch_shape));
+    ab->set_bytes(15, blobs.x_strides, sizeof(blobs.x_strides));
+    ab->set_bytes(16, blobs.x_shape, sizeof(blobs.x_shape));
+    ab->set_bytes(17, blobs.w_strides, sizeof(blobs.w_strides));
+    ab->set_bytes(18, blobs.w_shape, sizeof(blobs.w_shape));
+    ab->set_bytes(19, blobs.s_strides, sizeof(blobs.s_strides));
+    ab->set_bytes(20, blobs.b_strides, sizeof(blobs.b_strides));
+
+    // Dependency + residency tracking for AB-indirect reads/writes.
+    compute_encoder.register_input_array(w);
+    compute_encoder.register_input_array(scales);
+    compute_encoder.register_input_array(*biases);
+    compute_encoder.register_input_array(x);
+    compute_encoder.register_input_array(lhs_indices);
+    compute_encoder.register_input_array(rhs_indices);
+    compute_encoder.register_output_array(out);
+    compute_encoder.use_resource(
+        static_cast<const MTL::Resource*>(w.buffer().ptr()),
+        MTL::ResourceUsageRead);
+    compute_encoder.use_resource(
+        static_cast<const MTL::Resource*>(scales.buffer().ptr()),
+        MTL::ResourceUsageRead);
+    compute_encoder.use_resource(
+        static_cast<const MTL::Resource*>(biases->buffer().ptr()),
+        MTL::ResourceUsageRead);
+    compute_encoder.use_resource(
+        static_cast<const MTL::Resource*>(x.buffer().ptr()),
+        MTL::ResourceUsageRead);
+    compute_encoder.use_resource(
+        static_cast<const MTL::Resource*>(lhs_indices.buffer().ptr()),
+        MTL::ResourceUsageRead);
+    compute_encoder.use_resource(
+        static_cast<const MTL::Resource*>(rhs_indices.buffer().ptr()),
+        MTL::ResourceUsageRead);
+    compute_encoder.use_resource(
+        static_cast<const MTL::Resource*>(out.buffer().ptr()),
+        MTL::ResourceUsageWrite);
+
+    compute_encoder.set_buffer(ab->mtl_buffer(), 0);
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+    compute_encoder.add_temporary_object(std::static_pointer_cast<void>(ab));
+    return;
+  }
+
+  std::string kname;
+  kname.reserve(64);
   concatenate(
       kname,
       mode + (fast ? "_gather_qmv_fast_" : "_gather_qmv_"),

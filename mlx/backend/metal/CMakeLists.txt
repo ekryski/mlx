@@ -103,6 +103,7 @@ endif()
 target_sources(
   mlx
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/allocator.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/argument_buffer.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/binary.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/device_info.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/compiled.cpp
@@ -115,7 +116,9 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/eval.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/fence.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/fft.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/gated_delta.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/hadamard.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/icb.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/indexing.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/logsumexp.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/matmul.cpp
@@ -128,9 +131,11 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/scan.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/slicing.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/softmax.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/ssm.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/sort.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/reduce.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/ternary.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/turbo_quant.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/unary.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/resident.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/utils.cpp)
