@@ -4,6 +4,7 @@
 #include <memory>
 
 #include "mlx/backend/gpu/copy.h"
+#include "mlx/backend/metal/ab_gate.h"
 #include "mlx/backend/metal/argument_buffer.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/kernels/defines.h"
@@ -15,14 +16,10 @@ namespace mlx::core::fast {
 
 namespace {
 
-// Env-var gate, matching the `MLX_METAL_ICB` opt-in pattern. Reads the
-// environment once on first call and caches the result.
+// Delegates to the shared helper so MLX_METAL_ICB=1 also activates
+// this AB path (ICB implies AB — see ab_gate.h).
 bool rms_ab_enabled() {
-  static const bool v = []() {
-    const char* e = std::getenv("MLX_METAL_AB");
-    return e != nullptr && e[0] == '1';
-  }();
-  return v;
+  return ::mlx::core::metal::ab_enabled();
 }
 
 } // namespace

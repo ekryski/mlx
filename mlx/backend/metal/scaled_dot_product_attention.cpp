@@ -1,8 +1,10 @@
 // Copyright © 2024 Apple Inc.
+#include <cstdlib>
 #include <sstream>
 
 #include "mlx/backend/common/compiled.h"
 #include "mlx/backend/gpu/copy.h"
+#include "mlx/backend/metal/ab_gate.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/kernels.h"
 #include "mlx/backend/metal/kernels/defines.h"
@@ -14,6 +16,15 @@
 namespace mlx::core::fast {
 
 namespace {
+
+// Debug-only override for A/B comparison in the regression harness.
+// Forces the legacy `sdpa_vector` / `sdpa_vector_2pass` code paths
+// even when the shared AB gate is on. NOT documented as a user knob —
+// only the Phase 0/1 test binary flips this.
+bool sdpa_force_legacy() {
+  const char* e = std::getenv("MLX_SDPA_FORCE_LEGACY");
+  return e != nullptr && e[0] == '1';
+}
 
 void sdpa_full_self_attention_nax(
     const Stream& s,
@@ -584,6 +595,101 @@ void sdpa_vector_2pass(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+// Phase 1 unified vector-SDPA CPU dispatch. Replaces the
+// `sdpa_vector` / `sdpa_vector_2pass` branch when ab_enabled(). Same
+// kernel argument layout as legacy `sdpa_vector` plus one extra
+// runtime `blocks` scalar at buffer(11). Function-constant slots are
+// disjoint from legacy (30..35 vs 20..25) so PSOs live in separate
+// cache entries.
+void sdpa_vector_unified(
+    const Stream& s,
+    metal::Device& d,
+    const array& q,
+    const array& k,
+    const array& v,
+    array& out,
+    float scale,
+    bool do_causal,
+    const std::optional<array>& mask,
+    const std::optional<array>& sinks) {
+  std::string kname;
+  kname.reserve(64);
+  kname += "sdpa_unified_vector_";
+  kname += get_type_string(q.dtype());
+  kname += "_";
+  kname += std::to_string(q.shape(-1));
+  kname += "_";
+  kname += std::to_string(v.shape(-1));
+
+  int gqa_factor = q.shape(1) / k.shape(1);
+  int N = k.shape(2);
+  size_t k_head_stride = k.shape(1) == 1 ? k.strides(0) : k.strides(1);
+  size_t k_seq_stride = k.strides()[2];
+  size_t v_head_stride = v.shape(1) == 1 ? v.strides(0) : v.strides(1);
+  size_t v_seq_stride = v.strides()[2];
+
+  // Phase 1: single-threadgroup-per-(batch*head, q_seq) layout.
+  // `blocks` is reserved for Phase 2+; always 1 in this phase.
+  int blocks = 1;
+
+  MTL::Size group_dims(1024, 1, 1);
+  MTL::Size grid_dims(q.shape(0) * q.shape(1), q.shape(2), 1);
+
+  bool has_mask = mask.has_value();
+  bool bool_mask = has_mask && (*mask).dtype() == bool_;
+  bool float_mask = has_mask && !bool_mask;
+  bool query_transposed = !q.flags().row_contiguous;
+  bool has_sinks = sinks.has_value();
+  metal::MTLFCList func_consts = {
+      {&has_mask, MTL::DataType::DataTypeBool, 30},
+      {&query_transposed, MTL::DataType::DataTypeBool, 31},
+      {&do_causal, MTL::DataType::DataTypeBool, 32},
+      {&bool_mask, MTL::DataType::DataTypeBool, 33},
+      {&float_mask, MTL::DataType::DataTypeBool, 34},
+      {&has_sinks, MTL::DataType::DataTypeBool, 35},
+  };
+  std::string hash_name = kname;
+  hash_name += has_mask ? (bool_mask ? "_boolmask" : "_floatmask") : "_nomask";
+  hash_name += query_transposed ? "_qt" : "_qnt";
+  hash_name += do_causal ? "_c" : "_nc";
+  hash_name += has_sinks ? "_sinks" : "_nosinks";
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  auto kernel = d.get_kernel(kname, hash_name, func_consts);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  compute_encoder.set_input_array(q, 0);
+  compute_encoder.set_input_array(k, 1);
+  compute_encoder.set_input_array(v, 2);
+  compute_encoder.set_output_array(out, 3);
+  compute_encoder.set_bytes(gqa_factor, 4);
+  compute_encoder.set_bytes(N, 5);
+  compute_encoder.set_bytes(k_head_stride, 6);
+  compute_encoder.set_bytes(k_seq_stride, 7);
+  compute_encoder.set_bytes(v_head_stride, 8);
+  compute_encoder.set_bytes(v_seq_stride, 9);
+  compute_encoder.set_bytes(scale, 10);
+  compute_encoder.set_bytes(blocks, 11);
+
+  if (has_mask) {
+    auto& m = *mask;
+    compute_encoder.set_input_array(m, 12 + float_mask);
+    int32_t kv_seq_stride = m.shape(3) > 1 ? m.strides(3) : 0;
+    int32_t q_seq_stride = m.shape(2) > 1 ? m.strides(2) : 0;
+    int32_t head_stride =
+        m.shape(1) > 1 ? m.strides(1) : (m.shape(0) > 1 ? m.strides(0) : 0);
+    compute_encoder.set_bytes(kv_seq_stride, 14);
+    compute_encoder.set_bytes(q_seq_stride, 15);
+    compute_encoder.set_bytes(head_stride, 16);
+  }
+  if (has_sinks) {
+    compute_encoder.set_input_array(*sinks, 17);
+    compute_encoder.set_bytes(q.shape(1), 18);
+  }
+
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+}
+
 } // namespace
 
 bool ScaledDotProductAttention::use_fallback(
@@ -764,7 +870,15 @@ void ScaledDotProductAttention::eval_gpu(
     // - The sequence length is even longer and we have gqa
     bool do_causal = do_causal_ && q.shape(2) > 1;
     char devc = d.get_architecture().back();
-    if (((devc == 'd' || devc == 's') && k.shape(2) >= 1024) ||
+    // Phase 1 of Option C: when AB gate is on (MLX_METAL_AB or
+    // MLX_METAL_ICB), route to the unified vector kernel for all T_k.
+    // This removes the topology flip that breaks ICB replay past the
+    // recorded T_k. MLX_SDPA_FORCE_LEGACY=1 is a debug-only override
+    // used by the regression harness for within-binary A/B comparison.
+    if (metal::ab_enabled() && !sdpa_force_legacy()) {
+      sdpa_vector_unified(s, d, q, k, v, o, scale_, do_causal, mask, sinks);
+    } else if (
+        ((devc == 'd' || devc == 's') && k.shape(2) >= 1024) ||
         (k.shape(1) < q.shape(1) && k.shape(2) >= 4096)) {
       sdpa_vector_2pass(s, d, q, k, v, o, scale_, do_causal, mask, sinks);
     } else {

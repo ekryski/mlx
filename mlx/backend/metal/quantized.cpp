@@ -6,6 +6,7 @@
 #include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/common/compiled.h"
 #include "mlx/backend/gpu/copy.h"
+#include "mlx/backend/metal/ab_gate.h"
 #include "mlx/backend/metal/argument_buffer.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/kernels.h"
@@ -20,13 +21,9 @@ namespace mlx::core {
 
 namespace {
 
-// Env-var gate matching RMSNorm's `MLX_METAL_AB=1` precedent. Cached.
+// Delegates to the shared helper (ICB implies AB — see ab_gate.h).
 bool qmv_ab_enabled() {
-  static const bool v = []() {
-    const char* e = std::getenv("MLX_METAL_AB");
-    return e != nullptr && e[0] == '1';
-  }();
-  return v;
+  return ::mlx::core::metal::ab_enabled();
 }
 
 

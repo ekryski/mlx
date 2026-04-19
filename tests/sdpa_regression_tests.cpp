@@ -43,10 +43,28 @@ bool sweep_enabled() {
   return e != nullptr && e[0] == '1';
 }
 
+// True when the harness should run each case on BOTH the unified
+// path and the legacy path (via MLX_SDPA_FORCE_LEGACY) and compare.
+// Active when AB gate is on — under AB, the default path is unified,
+// and we validate equivalence to legacy via the debug override.
+bool ab_mode() {
+  const char* ab = std::getenv("MLX_METAL_AB");
+  const char* icb = std::getenv("MLX_METAL_ICB");
+  return (ab && ab[0] == '1') || (icb && icb[0] == '1');
+}
+
 std::string baseline_out_path() {
   const char* e = std::getenv("MLX_SDPA_BASELINE_OUT");
   if (e && *e) return std::string(e);
   return "sdpa-option-c-baseline.md";
+}
+
+// Tolerance per dtype for unified-vs-legacy allclose. Legacy path is
+// reference; unified may differ at the LSB due to kernel-internal
+// ordering (single-pass vs 2-pass across partitions).
+std::pair<double, double> tolerance_for(Dtype dt) {
+  if (dt == float32) return {1e-5, 1e-5};
+  return {1e-3, 1e-3};  // fp16 / bf16
 }
 
 // ---------------------------------------------------------------------------
@@ -204,6 +222,32 @@ struct CaseResult {
   bool ok;
 };
 
+// RAII guard for scoped env var override. Restores previous value on
+// destruction so the harness can flip MLX_SDPA_FORCE_LEGACY per-call
+// without polluting subsequent tests.
+struct ScopedEnv {
+  std::string name;
+  std::string prev;
+  bool had_prev;
+  ScopedEnv(const char* n, const char* v) : name(n) {
+    const char* p = std::getenv(n);
+    had_prev = (p != nullptr);
+    if (had_prev) prev = p;
+    if (v) {
+      setenv(n, v, /*overwrite=*/1);
+    } else {
+      unsetenv(n);
+    }
+  }
+  ~ScopedEnv() {
+    if (had_prev) {
+      setenv(name.c_str(), prev.c_str(), 1);
+    } else {
+      unsetenv(name.c_str());
+    }
+  }
+};
+
 CaseResult run_case(const CaseSpec& c, uint64_t seed) {
   CaseResult r{};
   r.key = case_key(c);
@@ -227,14 +271,32 @@ CaseResult run_case(const CaseSpec& c, uint64_t seed) {
     return out;
   };
 
-  // Two runs — check determinism.
+  // Two runs — check determinism on whatever path ab_enabled()
+  // selects.
   auto out_a = run();
   auto out_b = run();
 
   double cs_a = checksum(out_a);
   double cs_b = checksum(out_b);
   r.checksum_v = cs_a;
-  r.ok = (cs_a == cs_b);  // strict equality: legacy path must be deterministic.
+  r.ok = (cs_a == cs_b);
+
+  // If AB gate is on, also run the legacy path via the debug
+  // override and check numerical equivalence. This is the Phase 1
+  // correctness gate: unified ≡ legacy within tolerance.
+  if (ab_mode()) {
+    array out_legacy = [&]() {
+      ScopedEnv force_legacy("MLX_SDPA_FORCE_LEGACY", "1");
+      auto o = run();
+      return o;
+    }();
+    auto [rtol, atol] = tolerance_for(c.dtype);
+    bool eq = allclose(out_a, out_legacy, rtol, atol).item<bool>();
+    if (!eq) {
+      r.ok = false;
+      MESSAGE("  unified != legacy on ", r.key);
+    }
+  }
 
   r.median_us = time_us_median(
       [&]() {
