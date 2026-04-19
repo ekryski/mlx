@@ -5,6 +5,7 @@
 #include "mlx/backend/common/compiled.h"
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/metal/ab_gate.h"
+#include "mlx/backend/metal/argument_buffer.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/kernels.h"
 #include "mlx/backend/metal/kernels/defines.h"
@@ -23,6 +24,16 @@ namespace {
 // only the Phase 0/1 test binary flips this.
 bool sdpa_force_legacy() {
   const char* e = std::getenv("MLX_SDPA_FORCE_LEGACY");
+  return e != nullptr && e[0] == '1';
+}
+
+// Debug-only override for Phase 2 bisection: when set, the unified
+// path uses the Phase 1 non-AB kernel body (individual setBytes /
+// setBuffer calls) instead of the Phase 2 argument-buffer bind.
+// Harness uses this to diff AB-wrap vs non-AB unified output. NOT a
+// user knob.
+bool sdpa_force_no_ab() {
+  const char* e = std::getenv("MLX_SDPA_NO_AB");
   return e != nullptr && e[0] == '1';
 }
 
@@ -612,9 +623,14 @@ void sdpa_vector_unified(
     bool do_causal,
     const std::optional<array>& mask,
     const std::optional<array>& sinks) {
+  // Phase 2: default path is the AB-wrapped kernel. The non-AB Phase
+  // 1 body is kept only as an internal bisection escape, reachable
+  // via MLX_SDPA_NO_AB=1 (debug-only, not user-facing).
+  const bool use_ab = !sdpa_force_no_ab();
+
   std::string kname;
   kname.reserve(64);
-  kname += "sdpa_unified_vector_";
+  kname += use_ab ? "sdpa_unified_vector_ab_" : "sdpa_unified_vector_";
   kname += get_type_string(q.dtype());
   kname += "_";
   kname += std::to_string(q.shape(-1));
@@ -658,36 +674,114 @@ void sdpa_vector_unified(
   auto kernel = d.get_kernel(kname, hash_name, func_consts);
   compute_encoder.set_compute_pipeline_state(kernel);
 
-  compute_encoder.set_input_array(q, 0);
-  compute_encoder.set_input_array(k, 1);
-  compute_encoder.set_input_array(v, 2);
-  compute_encoder.set_output_array(out, 3);
-  compute_encoder.set_bytes(gqa_factor, 4);
-  compute_encoder.set_bytes(N, 5);
-  compute_encoder.set_bytes(k_head_stride, 6);
-  compute_encoder.set_bytes(k_seq_stride, 7);
-  compute_encoder.set_bytes(v_head_stride, 8);
-  compute_encoder.set_bytes(v_seq_stride, 9);
-  compute_encoder.set_bytes(scale, 10);
-  compute_encoder.set_bytes(blocks, 11);
+  if (use_ab) {
+    // Pack every kernel argument into a single shared-storage buffer
+    // bound at slot 0. Layout must match `SdpaUnifiedArgs` in
+    // `kernels/sdpa_unified.h`.
+    using Slot = metal::ArgumentBuffer::Slot;
+    auto ab = std::make_shared<metal::ArgumentBuffer>(
+        d,
+        std::vector<Slot>{
+            {Slot::Kind::BufferPtrOffset, 0, "queries"},
+            {Slot::Kind::BufferPtrOffset, 0, "keys"},
+            {Slot::Kind::BufferPtrOffset, 0, "values"},
+            {Slot::Kind::BufferPtrOffset, 0, "out"},
+            {Slot::Kind::BufferPtrOffset, 0, "mask"},
+            {Slot::Kind::BufferPtrOffset, 0, "sinks"},
+            {Slot::Kind::Scalar64, 0, "k_head_stride"},
+            {Slot::Kind::Scalar64, 0, "k_seq_stride"},
+            {Slot::Kind::Scalar64, 0, "v_head_stride"},
+            {Slot::Kind::Scalar64, 0, "v_seq_stride"},
+            {Slot::Kind::Float32, 0, "scale"},
+            {Slot::Kind::Scalar32, 0, "gqa_factor"},
+            {Slot::Kind::Scalar32, 0, "N"},
+            {Slot::Kind::Scalar32, 0, "blocks"},
+            {Slot::Kind::Scalar32, 0, "mask_kv_seq_stride"},
+            {Slot::Kind::Scalar32, 0, "mask_q_seq_stride"},
+            {Slot::Kind::Scalar32, 0, "mask_head_stride"},
+            {Slot::Kind::Scalar32, 0, "num_q_heads"},
+        });
+    ab->set_buffer_ptr(
+        0, static_cast<const MTL::Buffer*>(q.buffer().ptr()), q.offset());
+    ab->set_buffer_ptr(
+        1, static_cast<const MTL::Buffer*>(k.buffer().ptr()), k.offset());
+    ab->set_buffer_ptr(
+        2, static_cast<const MTL::Buffer*>(v.buffer().ptr()), v.offset());
+    ab->set_buffer_ptr(
+        3, static_cast<const MTL::Buffer*>(out.buffer().ptr()), out.offset());
+    if (has_mask) {
+      const auto& m = *mask;
+      ab->set_buffer_ptr(
+          4, static_cast<const MTL::Buffer*>(m.buffer().ptr()), m.offset());
+      int32_t kv_seq_stride = m.shape(3) > 1 ? m.strides(3) : 0;
+      int32_t q_seq_stride = m.shape(2) > 1 ? m.strides(2) : 0;
+      int32_t head_stride =
+          m.shape(1) > 1 ? m.strides(1) : (m.shape(0) > 1 ? m.strides(0) : 0);
+      ab->set_scalar32(14, static_cast<uint32_t>(kv_seq_stride));
+      ab->set_scalar32(15, static_cast<uint32_t>(q_seq_stride));
+      ab->set_scalar32(16, static_cast<uint32_t>(head_stride));
+    }
+    if (has_sinks) {
+      const auto& sn = *sinks;
+      ab->set_buffer_ptr(
+          5, static_cast<const MTL::Buffer*>(sn.buffer().ptr()), sn.offset());
+      ab->set_scalar32(17, static_cast<uint32_t>(q.shape(1)));
+    }
+    ab->set_scalar64(6, static_cast<uint64_t>(k_head_stride));
+    ab->set_scalar64(7, static_cast<uint64_t>(k_seq_stride));
+    ab->set_scalar64(8, static_cast<uint64_t>(v_head_stride));
+    ab->set_scalar64(9, static_cast<uint64_t>(v_seq_stride));
+    ab->set_float32(10, scale);
+    ab->set_scalar32(11, static_cast<uint32_t>(gqa_factor));
+    ab->set_scalar32(12, static_cast<uint32_t>(N));
+    ab->set_scalar32(13, static_cast<uint32_t>(blocks));
 
-  if (has_mask) {
-    auto& m = *mask;
-    compute_encoder.set_input_array(m, 12 + float_mask);
-    int32_t kv_seq_stride = m.shape(3) > 1 ? m.strides(3) : 0;
-    int32_t q_seq_stride = m.shape(2) > 1 ? m.strides(2) : 0;
-    int32_t head_stride =
-        m.shape(1) > 1 ? m.strides(1) : (m.shape(0) > 1 ? m.strides(0) : 0);
-    compute_encoder.set_bytes(kv_seq_stride, 14);
-    compute_encoder.set_bytes(q_seq_stride, 15);
-    compute_encoder.set_bytes(head_stride, 16);
-  }
-  if (has_sinks) {
-    compute_encoder.set_input_array(*sinks, 17);
-    compute_encoder.set_bytes(q.shape(1), 18);
-  }
+    // Fence tracking for resources the kernel reads/writes through
+    // the AB (no binding — AB carries the addresses).
+    compute_encoder.register_input_array(q);
+    compute_encoder.register_input_array(k);
+    compute_encoder.register_input_array(v);
+    if (has_mask) compute_encoder.register_input_array(*mask);
+    if (has_sinks) compute_encoder.register_input_array(*sinks);
+    compute_encoder.register_output_array(out);
 
-  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+    compute_encoder.set_buffer(ab->mtl_buffer(), 0);
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+
+    compute_encoder.add_temporary_object(
+        std::static_pointer_cast<void>(ab));
+  } else {
+    // Phase 1 non-AB body — preserved as an internal debug escape
+    // (MLX_SDPA_NO_AB=1). Kept for post-ship bisection only.
+    compute_encoder.set_input_array(q, 0);
+    compute_encoder.set_input_array(k, 1);
+    compute_encoder.set_input_array(v, 2);
+    compute_encoder.set_output_array(out, 3);
+    compute_encoder.set_bytes(gqa_factor, 4);
+    compute_encoder.set_bytes(N, 5);
+    compute_encoder.set_bytes(k_head_stride, 6);
+    compute_encoder.set_bytes(k_seq_stride, 7);
+    compute_encoder.set_bytes(v_head_stride, 8);
+    compute_encoder.set_bytes(v_seq_stride, 9);
+    compute_encoder.set_bytes(scale, 10);
+    compute_encoder.set_bytes(blocks, 11);
+    if (has_mask) {
+      auto& m = *mask;
+      compute_encoder.set_input_array(m, 12 + float_mask);
+      int32_t kv_seq_stride = m.shape(3) > 1 ? m.strides(3) : 0;
+      int32_t q_seq_stride = m.shape(2) > 1 ? m.strides(2) : 0;
+      int32_t head_stride =
+          m.shape(1) > 1 ? m.strides(1) : (m.shape(0) > 1 ? m.strides(0) : 0);
+      compute_encoder.set_bytes(kv_seq_stride, 14);
+      compute_encoder.set_bytes(q_seq_stride, 15);
+      compute_encoder.set_bytes(head_stride, 16);
+    }
+    if (has_sinks) {
+      compute_encoder.set_input_array(*sinks, 17);
+      compute_encoder.set_bytes(q.shape(1), 18);
+    }
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+  }
 }
 
 } // namespace

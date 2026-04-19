@@ -66,4 +66,24 @@ instantiate_sdpa_vector_heads(float16_t)
 instantiate_sdpa_unified_vector_heads(float)
 instantiate_sdpa_unified_vector_heads(bfloat16_t)
 instantiate_sdpa_unified_vector_heads(float16_t)
+
+// AB variant — same (D, V) matrix as the non-AB variant.
+#define instantiate_sdpa_unified_vector_ab(type, qk_dim, value_dim)        \
+  instantiate_kernel(                                                      \
+      "sdpa_unified_vector_ab_" #type "_" #qk_dim "_" #value_dim,          \
+      sdpa_unified_vector_ab,                                              \
+      type,                                                                \
+      qk_dim,                                                              \
+      value_dim)
+
+#define instantiate_sdpa_unified_vector_ab_heads(type)  \
+  instantiate_sdpa_unified_vector_ab(type, 64, 64)      \
+  instantiate_sdpa_unified_vector_ab(type, 96, 96)      \
+  instantiate_sdpa_unified_vector_ab(type, 128, 128)    \
+  instantiate_sdpa_unified_vector_ab(type, 256, 256)    \
+  instantiate_sdpa_unified_vector_ab(type, 512, 512)
+
+instantiate_sdpa_unified_vector_ab_heads(float)
+instantiate_sdpa_unified_vector_ab_heads(bfloat16_t)
+instantiate_sdpa_unified_vector_ab_heads(float16_t)
     // clang-format on
