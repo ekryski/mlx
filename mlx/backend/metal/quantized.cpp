@@ -1953,28 +1953,12 @@ void fast::Quantize::eval_gpu(
   auto& compute_encoder = metal::get_command_encoder(s);
 
   auto w = ensure_row_contiguous(w_pre, d, s);
-  if (dequantize_) {
-    auto scales = ensure_row_contiguous(inputs[1], d, s);
-    if (mode_ == QuantizationMode::Affine) {
-      auto biases = ensure_row_contiguous(inputs[2], d, s);
-      compute_encoder.set_input_array(biases, 2);
-    }
-    compute_encoder.set_input_array(w, 0);
-    compute_encoder.set_input_array(scales, 1);
-    compute_encoder.set_output_array(out, 3);
-  } else {
-    auto& scales = outputs[1];
-    scales.set_data(allocator::malloc(scales.nbytes()));
-    if (mode_ == QuantizationMode::Affine) {
-      auto& biases = outputs[2];
-      biases.set_data(allocator::malloc(biases.nbytes()));
-      compute_encoder.set_output_array(biases, 3);
-    }
-    compute_encoder.set_input_array(w, 0);
-    compute_encoder.set_output_array(out, 1);
-    compute_encoder.set_output_array(scales, 2);
-  }
-
+  // Resolve the kernel and bind the pipeline BEFORE any set_input_array /
+  // set_output_array calls. During ICB recording, bindings staged before
+  // a pipeline is set are swallowed (no command to attach them to), and
+  // the replay would then dispatch this kernel with missing bindings —
+  // producing garbage. All other primitives in this file follow the
+  // pipeline-first order; see e.g. the qmv/qmm paths above.
   auto type_string = dequantize_ ? get_type_string(out.dtype())
                                  : get_type_string(w_pre.dtype());
   auto mode = quantization_mode_to_string(mode_);
@@ -1998,6 +1982,28 @@ void fast::Quantize::eval_gpu(
       bits_);
 
   compute_encoder.set_compute_pipeline_state(kernel);
+
+  if (dequantize_) {
+    auto scales = ensure_row_contiguous(inputs[1], d, s);
+    if (mode_ == QuantizationMode::Affine) {
+      auto biases = ensure_row_contiguous(inputs[2], d, s);
+      compute_encoder.set_input_array(biases, 2);
+    }
+    compute_encoder.set_input_array(w, 0);
+    compute_encoder.set_input_array(scales, 1);
+    compute_encoder.set_output_array(out, 3);
+  } else {
+    auto& scales = outputs[1];
+    scales.set_data(allocator::malloc(scales.nbytes()));
+    if (mode_ == QuantizationMode::Affine) {
+      auto& biases = outputs[2];
+      biases.set_data(allocator::malloc(biases.nbytes()));
+      compute_encoder.set_output_array(biases, 3);
+    }
+    compute_encoder.set_input_array(w, 0);
+    compute_encoder.set_output_array(out, 1);
+    compute_encoder.set_output_array(scales, 2);
+  }
 
   // Treat uint32 as uint8 in kernel
   constexpr int uint8_per_uint32 = 4;
