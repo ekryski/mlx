@@ -5204,6 +5204,11 @@ bool DynamicSliceUpdate::is_equivalent(const Primitive& other) const {
   return axes_ == s_other.axes_;
 }
 
+bool SliceUpdateInPlace::is_equivalent(const Primitive& other) const {
+  const auto& s_other = static_cast<const SliceUpdateInPlace&>(other);
+  return axes_ == s_other.axes_;
+}
+
 std::pair<std::vector<array>, std::vector<int>> Softmax::vmap(
     const std::vector<array>& inputs,
     const std::vector<int>& axes) {

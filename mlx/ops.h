@@ -224,6 +224,23 @@ MLX_API array slice_update(
     std::vector<int> axes,
     StreamOrDevice s = {});
 
+/** In-place slice update with dynamic starting indices.
+ *
+ *  Mutates the input's buffer rather than allocating a fresh output —
+ *  the returned array's storage is the same MTLBuffer as `src`.
+ *  Used for decode-loop KV-cache writes in Indirect Command Buffer
+ *  replay: the stable output address is a hard prerequisite for the
+ *  recorded ICB's input bindings to remain valid across replays.
+ *
+ *  No autograd / vmap support. Use `slice_update` for those cases.
+ */
+MLX_API array slice_update_inplace(
+    const array& src,
+    const array& update,
+    const array& start,
+    std::vector<int> axes,
+    StreamOrDevice s = {});
+
 /** Slice update and add updates to given slice. */
 MLX_API array slice_update_add(
     const array& src,

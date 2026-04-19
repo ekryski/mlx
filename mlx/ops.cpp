@@ -899,6 +899,41 @@ array slice_update(
       {src, upd, start});
 }
 
+/** In-place slice-update factory — see SliceUpdateInPlace's class
+ *  comment in primitives.h. Same broadcast / normalization behavior
+ *  as `slice_update(src, update, start, axes, s)`; the only
+ *  difference is the underlying primitive asserts the output shares
+ *  the input's MTLBuffer so the result's storage address is stable
+ *  across calls.
+ */
+array slice_update_inplace(
+    const array& src,
+    const array& update,
+    const array& start,
+    std::vector<int> axes,
+    StreamOrDevice s /* = {} */) {
+  normalize_dynamic_slice_inputs(src, start, axes, "[slice_update_inplace]");
+
+  auto up_shape = update.shape();
+  auto dim_diff = std::max(src.ndim() - update.ndim(), size_t(0));
+  up_shape.insert(
+      up_shape.begin(), src.shape().begin(), src.shape().begin() + dim_diff);
+  for (int d = dim_diff; d < src.ndim(); ++d) {
+    up_shape[d] = std::min(up_shape[d], src.shape(d));
+  }
+  for (auto ax : axes) {
+    if (ax < dim_diff) {
+      up_shape[ax] = 1;
+    }
+  }
+  auto upd = broadcast_to(astype(update, src.dtype(), s), up_shape, s);
+  return array(
+      src.shape(),
+      src.dtype(),
+      std::make_shared<SliceUpdateInPlace>(to_stream(s), std::move(axes)),
+      {src, upd, start});
+}
+
 array slice_update(
     const array& src,
     const array& update,

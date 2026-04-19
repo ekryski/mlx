@@ -398,6 +398,45 @@ void DynamicSliceUpdate::eval_cpu(
   }
 }
 
+void SliceUpdateInPlace::eval_cpu(
+    const std::vector<array>& inputs,
+    array& out) {
+  if (out.size() == 0) {
+    out.set_data(allocator::malloc(0));
+    return;
+  }
+
+  auto& in = inputs[0];
+  auto& upd = inputs[1];
+
+  // In-place: out shares in's buffer by construction (see the GPU
+  // eval_gpu comment — this primitive's contract is that the output
+  // mutates the input rather than allocating a fresh destination).
+  out.copy_shared_buffer(in);
+
+  if (upd.size() == 0) {
+    return;
+  }
+
+  auto [out_offset, donated] =
+      compute_dynamic_offset(inputs[2], out.strides(), axes_, stream());
+  copy_cpu_inplace(
+      /* const array& src = */ upd,
+      /* array& dst = */ out,
+      /* const std::vector<int>& data_shape = */ upd.shape(),
+      /* const std::vector<stride_t>& i_strides = */ upd.strides(),
+      /* const std::vector<stride_t>& o_strides = */ out.strides(),
+      /* int64_t i_offset = */ 0,
+      /* int64_t o_offset = */ 0,
+      /* CopyType ctype = */ CopyType::GeneralGeneral,
+      stream(),
+      /* const std::optional<array>& dynamic_i_offset = */ std::nullopt,
+      /* const std::optional<array>& dynamic_o_offset = */ out_offset);
+  if (!donated) {
+    cpu::get_command_encoder(stream()).add_temporary(std::move(out_offset));
+  }
+}
+
 void View::eval_cpu(const std::vector<array>& inputs, array& out) {
   assert(inputs.size() == 1);
   auto& in = inputs[0];

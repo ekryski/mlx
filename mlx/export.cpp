@@ -420,6 +420,7 @@ struct PrimitiveFactory {
       SERIALIZE_PRIMITIVE(Sinh),
       SERIALIZE_PRIMITIVE(Slice),
       SERIALIZE_PRIMITIVE(SliceUpdate),
+      SERIALIZE_PRIMITIVE(SliceUpdateInPlace),
       SERIALIZE_PRIMITIVE(Softmax),
       SERIALIZE_PRIMITIVE(Sort),
       SERIALIZE_PRIMITIVE(Split),

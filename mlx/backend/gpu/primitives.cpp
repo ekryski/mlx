@@ -148,6 +148,50 @@ void DynamicSliceUpdate::eval_gpu(
       /* std::optional<array> dynamic_o_offset = */ std::move(out_offset));
 }
 
+void SliceUpdateInPlace::eval_gpu(
+    const std::vector<array>& inputs,
+    array& out) {
+  MLX_PROFILER_RANGE("SliceUpdateInPlace::eval_gpu");
+  if (out.size() == 0) {
+    out.set_data(allocator::malloc(0));
+    return;
+  }
+
+  auto& in = inputs[0];
+  auto& upd = inputs[1];
+  auto& start_indices = inputs[2];
+
+  // Unconditionally share the input's buffer. Unlike
+  // `DynamicSliceUpdate::eval_gpu`, which calls `copy_gpu(in, out)`
+  // and lets the donation logic decide between a shared or fresh
+  // buffer, the in-place variant asserts "these are the same buffer"
+  // at the semantic level. The caller has opted in to mutating the
+  // input's contents, which is exactly what decode-loop KV-cache
+  // updates need for ICB replay: the output's MTLBuffer address must
+  // match the input's so the recorded ICB's bindings stay valid.
+  out.copy_shared_buffer(in);
+
+  if (upd.size() == 0) {
+    return;
+  }
+
+  auto s = stream();
+  auto out_offset =
+      compute_dynamic_offset(start_indices, out.strides(), axes_, s);
+  copy_gpu_inplace(
+      /* const array& src = */ upd,
+      /* array& dst = */ out,
+      /* const Shape& data_shape = */ upd.shape(),
+      /* const Strides& i_strides = */ upd.strides(),
+      /* const Strides& o_strides = */ out.strides(),
+      /* int64_t i_offset = */ 0,
+      /* int64_t o_offset = */ 0,
+      /* CopyType ctype = */ CopyType::GeneralGeneral,
+      /* const Stream& s = */ s,
+      /* std::optional<array> dynamic_i_offset = */ std::nullopt,
+      /* std::optional<array> dynamic_o_offset = */ std::move(out_offset));
+}
+
 void ExpandDims::eval_gpu(const std::vector<array>& inputs, array& out) {
   MLX_PROFILER_RANGE("ExpandDims::eval_gpu");
   eval(inputs, out);

@@ -2152,6 +2152,43 @@ class DynamicSliceUpdate : public UnaryPrimitive {
   std::vector<int> axes_;
 };
 
+// Same public contract as `DynamicSliceUpdate` — writes `update` into
+// `src` at the per-axis positions in `start_indices` — but commits
+// to an *in-place* semantics: the primitive's output shares the
+// input's MTLBuffer (no copy_gpu preamble that allocates a fresh
+// destination).
+//
+// Intended for decode-loop ICB replay, where the output MLXArray's
+// buffer address must remain stable across steps so the recorded
+// ICB's bindings continue to reference valid memory. A normal
+// `DynamicSliceUpdate` always produces a fresh output buffer (MLX's
+// donation check fails whenever Swift holds a persistent reference
+// to the input — e.g. `KVCacheSimple.keys`), forcing the recorded
+// input binding to be stale on every replay. This primitive bypasses
+// the donation decision entirely.
+//
+// vjp/jvp/vmap are deliberately not supported — the operation is
+// observationally mutating and has no clean autograd story. Callers
+// who need gradients should use `DynamicSliceUpdate`.
+class SliceUpdateInPlace : public UnaryPrimitive {
+ public:
+  explicit SliceUpdateInPlace(Stream stream, std::vector<int> axes)
+      : UnaryPrimitive(stream), axes_(std::move(axes)) {}
+
+  void eval_cpu(const std::vector<array>& inputs, array& out) override;
+  void eval_gpu(const std::vector<array>& inputs, array& out) override;
+
+  DEFINE_NAME(SliceUpdateInPlace)
+  bool is_equivalent(const Primitive& other) const override;
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  auto state() const {
+    return axes_;
+  }
+
+ private:
+  std::vector<int> axes_;
+};
+
 class Softmax : public UnaryPrimitive {
  public:
   explicit Softmax(Stream stream, bool precise)
