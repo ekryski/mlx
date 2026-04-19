@@ -284,6 +284,9 @@ void CommandEncoder::set_buffer(
     const MTL::Buffer* buf,
     int idx,
     int64_t offset /* = 0 */) {
+  if (build_only_) {
+    return;
+  }
   if (recording_) {
     if (!has_pending_command_) {
       // Matches the set_input_array policy: tolerate pre-pipeline staging.
@@ -306,6 +309,9 @@ void CommandEncoder::set_input_array(
     const array& a,
     int idx,
     int64_t offset /* = 0 */) {
+  if (build_only_) {
+    return;
+  }
   // Barrier tracking runs whether recording or not — during recording
   // the flag drives ICB segment splitting via maybeInsertBarrier; outside
   // recording it drives memory-barrier emission on the live encoder.
@@ -337,6 +343,9 @@ void CommandEncoder::set_output_array(
     array& a,
     int idx,
     int64_t offset /* = 0 */) {
+  if (build_only_) {
+    return;
+  }
   if (recording_) {
     // Track outputs in next_outputs_ so a subsequent read of this array
     // raises needs_barrier_ and triggers an ICB segment split.
@@ -350,6 +359,9 @@ void CommandEncoder::set_output_array(
 }
 
 void CommandEncoder::set_threadgroup_memory_length(size_t length, int idx) {
+  if (build_only_) {
+    return;
+  }
   if (recording_) {
     active_recorder_->set_threadgroup_memory(length, idx);
     return;
@@ -358,6 +370,9 @@ void CommandEncoder::set_threadgroup_memory_length(size_t length, int idx) {
 }
 
 void CommandEncoder::set_bytes_raw(const void* data, size_t length, int idx) {
+  if (build_only_) {
+    return;
+  }
   if (recording_) {
     if (!active_recorder_->set_bytes(data, length, idx)) {
       // Arena exhausted. Abort the whole recording session so the caller
@@ -377,6 +392,9 @@ void CommandEncoder::set_bytes_raw(const void* data, size_t length, int idx) {
 void CommandEncoder::use_resource(
     const MTL::Resource* res,
     MTL::ResourceUsage usage) {
+  if (build_only_) {
+    return;
+  }
   if (recording_) {
     // ICB recording path not supported for now; callers using AB +
     // ICB must arrange residency through heap declarations.
@@ -386,6 +404,9 @@ void CommandEncoder::use_resource(
 }
 
 void CommandEncoder::register_input_array(const array& a) {
+  if (build_only_) {
+    return;
+  }
   // Mirrors the dependency-tracking half of `set_input_array` but skips
   // the `setBuffer` emit. Used by primitives that bind their inputs
   // indirectly (e.g. via an ArgumentBuffer at buffer(0)) — the buffer
@@ -403,6 +424,9 @@ void CommandEncoder::register_input_array(const array& a) {
 }
 
 void CommandEncoder::register_output_array(const array& a) {
+  if (build_only_) {
+    return;
+  }
   all_outputs_.insert(a.buffer().ptr());
 
   auto buf = static_cast<MTL::Resource*>(const_cast<void*>(a.buffer().ptr()));
@@ -414,10 +438,21 @@ void CommandEncoder::register_output_array(const array& a) {
 }
 
 void CommandEncoder::add_temporary(array arr) {
+  if (build_only_) {
+    build_only_array_temporaries_.push_back(std::move(arr));
+    return;
+  }
   temporaries_.push_back(std::move(arr));
 }
 
 void CommandEncoder::add_temporaries(std::vector<array> arrays) {
+  if (build_only_) {
+    build_only_array_temporaries_.insert(
+        build_only_array_temporaries_.end(),
+        std::make_move_iterator(arrays.begin()),
+        std::make_move_iterator(arrays.end()));
+    return;
+  }
   temporaries_.insert(
       temporaries_.end(),
       std::make_move_iterator(arrays.begin()),
@@ -425,10 +460,24 @@ void CommandEncoder::add_temporaries(std::vector<array> arrays) {
 }
 
 void CommandEncoder::add_temporary_object(std::shared_ptr<void> obj) {
+  if (build_only_) {
+    build_only_retentions_.push_back(std::move(obj));
+    return;
+  }
   temporary_objects_.push_back(std::move(obj));
 }
 
 void CommandEncoder::maybeInsertBarrier() {
+  if (build_only_) {
+    // Build-only mode never dispatches, so no barriers are ever needed.
+    // Clear any dependency-tracking state that snuck in via a mode that
+    // forgot to early-return (paranoia — none of the set_* methods
+    // mutate these under build_only_).
+    prev_outputs_.clear();
+    next_outputs_.clear();
+    needs_barrier_ = false;
+    return;
+  }
   if (recording_) {
     // MTLIndirectComputeCommand cannot emit memory barriers. When a RAW
     // dependency is detected, split the recording into a new ICB segment
@@ -503,6 +552,9 @@ std::string kernel_name_for(const MTL::ComputePipelineState* pipeline) {
 
 void CommandEncoder::set_compute_pipeline_state(
     MTL::ComputePipelineState* kernel) {
+  if (build_only_) {
+    return;
+  }
   if (g_kernel_log_enabled_.load(std::memory_order_relaxed)) {
     auto name = kernel_name_for(kernel);
     if (name.empty()) {
@@ -524,6 +576,9 @@ void CommandEncoder::set_compute_pipeline_state(
 void CommandEncoder::dispatch_threadgroups(
     MTL::Size grid_dims,
     MTL::Size group_dims) {
+  if (build_only_) {
+    return;
+  }
   if (recording_) {
     if (!has_pending_command_) {
       throw std::logic_error(
@@ -555,6 +610,9 @@ void CommandEncoder::dispatch_threadgroups(
 void CommandEncoder::dispatch_threads(
     MTL::Size grid_dims,
     MTL::Size group_dims) {
+  if (build_only_) {
+    return;
+  }
   if (recording_) {
     if (!has_pending_command_) {
       throw std::logic_error(
@@ -721,6 +779,14 @@ void CommandEncoder::synchronize() {
 // because `get_command_encoder` is defined later in the file.
 extern thread_local CommandEncoder* t_icb_steer_target_;
 
+// Forward decl — defined later in this file. Returns true iff compute
+// pipelines being compiled now will carry
+// `supportIndirectCommandBuffers=true`, which is a hard prerequisite
+// for ICB capture: calling `setComputePipelineState` on an
+// MTLIndirectComputeCommand with a pipeline that lacks the flag
+// segfaults inside Metal.
+static bool icb_pipeline_flag_enabled_();
+
 void CommandEncoder::begin_icb_recording(
     size_t max_commands,
     size_t bytes_arena_cap) {
@@ -732,6 +798,18 @@ void CommandEncoder::begin_icb_recording(
     throw std::logic_error(
         "[metal::CommandEncoder] begin_icb_recording while a different recording "
         "is steering this thread");
+  }
+  if (!icb_pipeline_flag_enabled_()) {
+    // Pipelines compiled without `supportIndirectCommandBuffers=true`
+    // cannot be bound into an MTLIndirectComputeCommand — the
+    // `setComputePipelineState` call segfaults inside Metal during ICB
+    // materialization. Fail loudly here rather than letting the user
+    // hit a bare SIGSEGV deep in a replay path.
+    throw std::runtime_error(
+        "[metal::CommandEncoder] begin_icb_recording requires ICB-capable "
+        "pipelines. Set MLX_METAL_ICB=1 before loading the model, or call "
+        "mlx::core::metal::set_icb_pipeline_support(true) before any kernel "
+        "is compiled. Pipelines cached without the flag are not ICB-eligible.");
   }
   // Flush anything the live encoder had pending so it doesn't interleave
   // with the ICB we're about to build. The live encoder is left in a
@@ -810,6 +888,50 @@ void CommandEncoder::abort_icb_recording() {
   abort_icb_recording_();
 }
 
+void CommandEncoder::begin_build_only() {
+  if (build_only_) {
+    throw std::logic_error(
+        "[metal::CommandEncoder] begin_build_only while already in build-only");
+  }
+  if (recording_) {
+    throw std::logic_error(
+        "[metal::CommandEncoder] begin_build_only while recording");
+  }
+  if (t_icb_steer_target_ != nullptr) {
+    throw std::logic_error(
+        "[metal::CommandEncoder] begin_build_only while a different session "
+        "is steering this thread");
+  }
+  // Flush the live encoder so any pending direct commands issue before we
+  // start swallowing subsequent dispatches.
+  end_encoding();
+
+  build_only_ = true;
+  build_only_tag_counter_ = 0;
+  build_only_ab_bindings_.clear();
+  build_only_retentions_.clear();
+  build_only_array_temporaries_.clear();
+
+  // Steer every stream's encoder lookup on this thread through us so
+  // secondary-stream primitives (MoE expert gathers, fast kernels on
+  // caller-supplied streams) also hit the build-only short-circuits.
+  t_icb_steer_target_ = this;
+}
+
+CommandEncoder::BuildOnlyResult CommandEncoder::end_build_only() {
+  if (!build_only_) {
+    throw std::logic_error(
+        "[metal::CommandEncoder] end_build_only without begin");
+  }
+  build_only_ = false;
+  t_icb_steer_target_ = nullptr;
+  BuildOnlyResult out;
+  out.ab_overrides = std::move(build_only_ab_bindings_);
+  out.retentions = std::move(build_only_retentions_);
+  out.array_temporaries = std::move(build_only_array_temporaries_);
+  return out;
+}
+
 void CommandEncoder::replay_icb(const IndirectCommandRecorder& recorder) {
   if (recording_) {
     throw std::logic_error(
@@ -836,6 +958,29 @@ void CommandEncoder::tag_binding(uint32_t name_id, const MTL::Buffer* buf) {
 }
 
 uint32_t CommandEncoder::tag_ab_binding(const MTL::Buffer* buf) {
+  if (build_only_) {
+    // Build-only mode: collect the per-step AB MTLBuffer into a vector
+    // indexed by sequential tag ID. Caller passes the collection to
+    // replay_icb_with_overrides so the recorded ICB's AB slot bindings
+    // get patched to this step's ABs.
+    //
+    // Order must match the recording's tag assignment exactly. Since
+    // begin_build_only / begin_icb_recording both reset their
+    // respective counters to 0 and the forward-pass graph walk is
+    // deterministic, the K-th tag_ab_binding call here corresponds to
+    // the K-th tag_ab_binding call during recording.
+    uint64_t next = ++build_only_tag_counter_;
+    uint32_t id = static_cast<uint32_t>(next);
+    if (id == 0) {
+      build_only_tag_counter_ = 1;
+      id = 1;
+    }
+    // Offset is always 0 for AB MTLBuffers — they're standalone packed
+    // buffers allocated for the AB's own storage (not sub-ranges of a
+    // larger allocation).
+    build_only_ab_bindings_.emplace_back(id, buf, int64_t{0});
+    return id;
+  }
   if (!recording_) {
     return 0;
   }

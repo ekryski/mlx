@@ -8,8 +8,10 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "mlx/array.h"
 #include "mlx/backend/metal/resident.h"
@@ -187,6 +189,58 @@ class MLX_API CommandEncoder {
   bool is_recording() const {
     return recording_;
   }
+
+  // Result of a build-only session — paired AB overrides and the
+  // heap-allocated objects (ArgumentBuffer shared_ptrs, output-array
+  // Data shared_ptrs via temporaries, etc.) that must stay alive
+  // until the replay using those overrides completes.
+  struct BuildOnlyResult {
+    // (tag_id, MTLBuffer*, offset) triples — hand directly to
+    // `replay_icb_with_overrides`.
+    std::vector<std::tuple<uint32_t, const MTL::Buffer*, int64_t>>
+        ab_overrides;
+    // ArgumentBuffer/other shared_ptrs staged via `add_temporary_object`
+    // during the build pass. Retains the MTLBuffers referenced by
+    // `ab_overrides` so their addresses stay valid during replay.
+    std::vector<std::shared_ptr<void>> retentions;
+    // `array` temporaries staged via `add_temporary` / `add_temporaries`
+    // during the build pass. Holds the output MLXArray::Data
+    // allocations that are referenced indirectly via AB packed ptrs.
+    std::vector<array> array_temporaries;
+  };
+
+  // ── Build-only mode ──────────────────────────────────────────────────
+  //
+  // Decode-loop ICB orchestration needs to re-run the model forward each
+  // step to obtain fresh transient ArgumentBuffer MTLBuffer pointers (whose
+  // packed contents encode that step's activation/cache pointers), but
+  // **without** dispatching any kernels — the recorded ICB handles the
+  // actual compute on replay.
+  //
+  // Between `begin_build_only()` and `end_build_only()`, every binding
+  // call (set_buffer / set_input_array / set_output_array / set_bytes /
+  // set_threadgroup_memory_length / set_compute_pipeline_state) and every
+  // dispatch (dispatch_threads / dispatch_threadgroups) becomes a no-op.
+  // Primitives still run their `eval_gpu` scaffolding — allocating
+  // outputs, constructing transient ABs, writing activation/scale pointers
+  // into the AB's packed layout — and each AB is registered with the
+  // build-only collector via `tag_ab_binding`.
+  //
+  // `end_build_only()` returns the collected `(tag_id, MTLBuffer*, offset)`
+  // triples in the same sequential order as the recording's tags. The
+  // caller hands these to `replay_icb_with_overrides` so the recorded
+  // ICB's bindings are patched to the current-step ABs before replay.
+  //
+  // Like recording, build-only mode is steered across all streams on the
+  // calling thread via `t_icb_steer_target_`, so secondary-stream primitives
+  // also route through this encoder (and therefore short-circuit).
+  //
+  // Build-only and recording are mutually exclusive.
+  void begin_build_only();
+  BuildOnlyResult end_build_only();
+  bool is_build_only() const {
+    return build_only_;
+  }
   // Number of set_input_array / set_buffer calls that were silently
   // skipped during the most recent recording session because no
   // pipeline command was in progress. High counts indicate primitives
@@ -240,6 +294,15 @@ class MLX_API CommandEncoder {
   // recording. Stored as uint64_t to avoid overflow for very long
   // recording sessions even though the public API exposes a uint32.
   uint64_t ab_tag_counter_{0};
+
+  // Build-only mode state. See `begin_build_only` / `end_build_only`.
+  // Mutually exclusive with `recording_`.
+  bool build_only_{false};
+  uint64_t build_only_tag_counter_{0};
+  std::vector<std::tuple<uint32_t, const MTL::Buffer*, int64_t>>
+      build_only_ab_bindings_;
+  std::vector<std::shared_ptr<void>> build_only_retentions_;
+  std::vector<array> build_only_array_temporaries_;
 
   // Buffer that stores encoded commands.
   NS::SharedPtr<MTL::CommandQueue> queue_;
