@@ -2,16 +2,11 @@
 
 #pragma once
 
-#include <memory>
 #include <optional>
 #include <variant>
 
 #include "mlx/api.h"
 #include "mlx/utils.h"
-
-namespace mlx::core::metal {
-class PersistentAb;
-} // namespace mlx::core::metal
 
 namespace mlx::core::fast {
 
@@ -19,23 +14,6 @@ MLX_API array rms_norm(
     const array& x,
     const std::optional<array>& weight,
     float eps,
-    StreamOrDevice s = {});
-
-// AB-participating overload — caller owns a PersistentAb that is
-// reused across calls. Used by the decode-loop ICB integration (see
-// benchmarks/notes/persistent-ab-pilot-design-2026-04-18.md): the
-// handle's MTLBuffer address is stable, so an ICB recording of this
-// call replays correctly after the caller rewrites the handle's
-// contents for the next step.
-//
-// When `ab_handle == nullptr` the call is identical to the
-// non-handle overload (allocates a fresh transient AB). Provides
-// no behavior change for callers that don't opt in.
-MLX_API array rms_norm(
-    const array& x,
-    const std::optional<array>& weight,
-    float eps,
-    std::shared_ptr<metal::PersistentAb> ab_handle,
     StreamOrDevice s = {});
 
 MLX_API array rms_norm_residual(
@@ -129,22 +107,6 @@ MLX_API array rope(
     const std::optional<array>& freqs = std::nullopt,
     StreamOrDevice s = {});
 
-// AB-participating overload — caller-owned PersistentAb whose
-// MTLBuffer address is stable across decode steps. Layout is either
-// 6 slots (base path) or 7 slots (freqs path); see rope.cpp for the
-// exact slot order. When ab_handle is null, identical to the plain
-// (array offset) overload.
-MLX_API array rope(
-    const array& x,
-    int dims,
-    bool traditional,
-    std::optional<float> base,
-    float scale,
-    const array& offset,
-    const std::optional<array>& freqs,
-    std::shared_ptr<metal::PersistentAb> ab_handle,
-    StreamOrDevice s = {});
-
 /** Computes: O = softmax(Q @ K.T) @ V **/
 MLX_API array scaled_dot_product_attention(
     const array& queries,
@@ -154,22 +116,6 @@ MLX_API array scaled_dot_product_attention(
     const std::string& mask_mode = "",
     std::optional<array> mask_arr = {},
     const std::optional<array>& sinks = {},
-    StreamOrDevice s = {},
-    int window_size = -1);
-
-// AB-participating overload — caller-owned PersistentAb whose
-// MTLBuffer address is stable across decode steps. Layout must
-// match SdpaUnifiedArgs in kernels/sdpa_unified.h. When ab_handle
-// is null, identical to the plain overload.
-MLX_API array scaled_dot_product_attention(
-    const array& queries,
-    const array& keys,
-    const array& values,
-    const float scale,
-    const std::string& mask_mode,
-    std::optional<array> mask_arr,
-    const std::optional<array>& sinks,
-    std::shared_ptr<metal::PersistentAb> ab_handle,
     StreamOrDevice s = {},
     int window_size = -1);
 

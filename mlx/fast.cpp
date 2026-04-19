@@ -120,89 +120,6 @@ array rms_norm(
   return fallback({x, passed_weight})[0];
 }
 
-array rms_norm(
-    const array& x,
-    const std::optional<array>& weight,
-    float eps,
-    std::shared_ptr<metal::PersistentAb> ab_handle,
-    StreamOrDevice s_ /* = {} */) {
-  // Handle-accepting overload. When ab_handle is null, delegates to
-  // the plain overload (unchanged behavior). Otherwise, constructs
-  // the RMSNorm primitive with the handle so its eval_gpu reuses
-  // the caller-owned AB instead of allocating a transient one.
-  //
-  // Validation + fallback identical to the plain rms_norm above;
-  // kept duplicated (rather than refactored into a shared helper)
-  // because this is the pilot and the duplication is localized.
-  if (ab_handle == nullptr) {
-    return rms_norm(x, weight, eps, s_);
-  }
-
-  bool has_weight = weight.has_value();
-
-  if (x.ndim() == 0) {
-    std::ostringstream msg;
-    msg << "[rms_norm] Input must have at least 1 dimension but got input with "
-           "0 dimensions.";
-    throw std::invalid_argument(msg.str());
-  }
-  if (has_weight) {
-    if ((*weight).ndim() != 1) {
-      std::ostringstream msg;
-      msg << "[rms_norm] (*weight) must have 1 dimension but has "
-          << (*weight).ndim() << " dimensions.";
-      throw std::invalid_argument(msg.str());
-    }
-    if ((*weight).size() != x.shape(-1)) {
-      std::ostringstream msg;
-      msg << "[rms_norm] (*weight) must have the same size as the last dimension of"
-             " x but has "
-          << (*weight).size() << " elements.";
-      throw std::invalid_argument(msg.str());
-    }
-  }
-
-  auto out_type = (weight.has_value()) ? result_type(x, (*weight)) : x.dtype();
-  if (!issubdtype(out_type, floating)) {
-    std::ostringstream msg;
-    msg << "[rms_norm] Received unsupported type " << out_type << ".";
-    throw std::invalid_argument(msg.str());
-  }
-
-  auto s = to_stream(s_);
-  auto fallback =
-      [has_weight, eps, out_type, s](const std::vector<array>& inputs) {
-        auto x = astype(inputs[0], float32, s);
-        x = multiply(
-            x,
-            rsqrt(
-                add(mean(square(x, s), -1, /* keepdims */ true, s),
-                    array(eps, float32),
-                    s),
-                s),
-            s);
-        x = astype(x, out_type, s);
-
-        if (has_weight) {
-          x = multiply(x, inputs[1], s);
-        }
-
-        return std::vector<array>{x};
-      };
-
-  auto passed_weight =
-      (has_weight) ? astype(*weight, out_type, s) : array(1, out_type);
-
-  if (!RMSNorm::use_fallback(s)) {
-    return array(
-        x.shape(),
-        out_type,
-        std::make_shared<RMSNorm>(s, fallback, eps, std::move(ab_handle)),
-        {astype(x, out_type, s), passed_weight});
-  }
-  return fallback({x, passed_weight})[0];
-}
-
 array rms_norm_residual(
     const array& x,
     const array& residual,
@@ -737,18 +654,13 @@ bool LayerNormVJP::is_equivalent(const Primitive& other) const {
   return eps_ == a_other.eps_;
 }
 
-namespace {
-// Internal impl that carries an optional PersistentAb handle. The
-// public overloads thread their args through, supplying nullptr for
-// the plain overload and a real handle for the AB overload.
-array rope_impl(
+array rope(
     std::vector<array> inputs,
     int dims,
     bool traditional,
     float base,
     float scale,
     bool forward,
-    std::shared_ptr<metal::PersistentAb> ab_handle,
     StreamOrDevice s) {
   auto& x = inputs[0];
   auto& offset = inputs[1];
@@ -900,31 +812,10 @@ array rope_impl(
         x.shape(),
         x.dtype(),
         std::make_shared<RoPE>(
-            stream,
-            fallback,
-            dims,
-            traditional,
-            base,
-            scale,
-            forward,
-            std::move(ab_handle)),
+            stream, fallback, dims, traditional, base, scale, forward),
         std::move(inputs));
   }
   return fallback(std::move(inputs))[0];
-}
-} // namespace
-
-// Internal entry preserved for the int-offset overload below.
-array rope(
-    std::vector<array> inputs,
-    int dims,
-    bool traditional,
-    float base,
-    float scale,
-    bool forward,
-    StreamOrDevice s) {
-  return rope_impl(
-      std::move(inputs), dims, traditional, base, scale, forward, nullptr, s);
 }
 
 array rope(
@@ -946,48 +837,13 @@ array rope(
   } else if (!base) {
     throw std::invalid_argument("[rope] Neither base nor freqs has a value.");
   }
-  return rope_impl(
+  return rope(
       std::move(inputs),
       dims,
       traditional,
       base.has_value() ? *base : 1.0,
       scale,
       true,
-      nullptr,
-      s);
-}
-
-// AB-participating overload — same as the plain (array offset)
-// overload but wires the caller-owned PersistentAb through to
-// RoPE::eval_gpu via the primitive.
-array rope(
-    const array& x,
-    int dims,
-    bool traditional,
-    std::optional<float> base,
-    float scale,
-    const array& offset,
-    const std::optional<array>& freqs,
-    std::shared_ptr<metal::PersistentAb> ab_handle,
-    StreamOrDevice s /* = {} */) {
-  std::vector<array> inputs = {x, offset};
-  if (freqs) {
-    inputs.push_back(astype(*freqs, float32, s));
-    if (base) {
-      throw std::invalid_argument(
-          "[rope] Only one of base or freqs can have a value.");
-    }
-  } else if (!base) {
-    throw std::invalid_argument("[rope] Neither base nor freqs has a value.");
-  }
-  return rope_impl(
-      std::move(inputs),
-      dims,
-      traditional,
-      base.has_value() ? *base : 1.0,
-      scale,
-      true,
-      std::move(ab_handle),
       s);
 }
 
@@ -1044,21 +900,16 @@ bool RoPE::is_equivalent(const Primitive& other) const {
 }
 
 /** Computes: O = softmax(Q @ K.T) @ V **/
-namespace {
-// Internal impl that carries an optional PersistentAb handle. The
-// two public overloads thread their args through, supplying nullptr
-// for the plain overload and a real handle for the AB overload.
-array scaled_dot_product_attention_impl(
+array scaled_dot_product_attention(
     const array& queries,
     const array& keys,
     const array& values,
     const float scale,
-    const std::string& mask_mode,
-    std::optional<array> mask_arr,
-    const std::optional<array>& sinks,
-    std::shared_ptr<metal::PersistentAb> ab_handle,
-    StreamOrDevice s,
-    int window_size) {
+    const std::string& mask_mode /* = "" */,
+    std::optional<array> mask_arr /* = {} */,
+    const std::optional<array>& sinks /* = {} */,
+    StreamOrDevice s /* = {}*/,
+    int window_size /* = -1 */) {
   for (const auto& tensor : {queries, keys, values}) {
     if (tensor.ndim() != 4) {
       std::ostringstream msg;
@@ -1316,8 +1167,7 @@ array scaled_dot_product_attention_impl(
         do_causal,
         has_sinks,
         output_logsumexp,
-        window_size,
-        std::move(ab_handle));
+        window_size);
     if (output_logsumexp) {
       return array::make_arrays(
           {std::move(out_shape), Shape{q.shape(0), q.shape(1), q.shape(2), 1}},
@@ -1330,39 +1180,6 @@ array scaled_dot_product_attention_impl(
     }
   }
   return fallback(std::move(inputs))[0];
-}
-} // namespace
-
-// Public overloads — thin wrappers over scaled_dot_product_attention_impl.
-array scaled_dot_product_attention(
-    const array& queries,
-    const array& keys,
-    const array& values,
-    const float scale,
-    const std::string& mask_mode /* = "" */,
-    std::optional<array> mask_arr /* = {} */,
-    const std::optional<array>& sinks /* = {} */,
-    StreamOrDevice s /* = {} */,
-    int window_size /* = -1 */) {
-  return scaled_dot_product_attention_impl(
-      queries, keys, values, scale, mask_mode, std::move(mask_arr), sinks,
-      nullptr, s, window_size);
-}
-
-array scaled_dot_product_attention(
-    const array& queries,
-    const array& keys,
-    const array& values,
-    const float scale,
-    const std::string& mask_mode,
-    std::optional<array> mask_arr,
-    const std::optional<array>& sinks,
-    std::shared_ptr<metal::PersistentAb> ab_handle,
-    StreamOrDevice s /* = {} */,
-    int window_size /* = -1 */) {
-  return scaled_dot_product_attention_impl(
-      queries, keys, values, scale, mask_mode, std::move(mask_arr), sinks,
-      std::move(ab_handle), s, window_size);
 }
 
 std::vector<array> ScaledDotProductAttention::vjp(

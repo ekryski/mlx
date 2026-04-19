@@ -6,7 +6,6 @@
 #include "mlx/backend/metal/ab_gate.h"
 #include "mlx/backend/metal/argument_buffer.h"
 #include "mlx/backend/metal/device.h"
-#include "mlx/backend/metal/persistent_ab.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx/fast_primitives.h"
 
@@ -169,143 +168,95 @@ void RoPE::eval_gpu(
     //   offset (device int buffer)
     //   scale, stride(=out_strides[0]), and either `base` or
     //   (`freqs`, `freq_stride`).
-    //
-    // If the primitive carries a caller-owned PersistentAb handle
-    // (Option A / decode-loop ICB path), rewrite its contents in
-    // place and bind it — don't add as a temporary object, since the
-    // caller owns the lifetime. Otherwise allocate a fresh transient
-    // AB, same as pre-Option-A behavior.
     using Slot = metal::ArgumentBuffer::Slot;
     auto& in_array = donated ? out : in;
-    const auto& persistent_handle = ab_handle();
 
     if (with_freqs) {
       auto& freqs = inputs[2];
-      const std::vector<Slot> slot_layout{
-          {Slot::Kind::BufferPtrOffset, 0, "in"},
-          {Slot::Kind::BufferPtrOffset, 0, "out"},
-          {Slot::Kind::BufferPtrOffset, 0, "offset"},
-          {Slot::Kind::Float32, 0, "scale"},
-          {Slot::Kind::Scalar64, 0, "stride"},
-          {Slot::Kind::BufferPtrOffset, 0, "freqs"},
-          {Slot::Kind::Scalar64, 0, "freq_stride"},
-      };
-
-      auto populate = [&](auto& target) {
-        target.set_buffer_ptr(
-            0,
-            static_cast<const MTL::Buffer*>(in_array.buffer().ptr()),
-            in_array.offset());
-        target.set_buffer_ptr(
-            1,
-            static_cast<const MTL::Buffer*>(out.buffer().ptr()),
-            out.offset());
-        target.set_buffer_ptr(
-            2,
-            static_cast<const MTL::Buffer*>(offset.buffer().ptr()),
-            offset.offset());
-        target.set_float32(3, scale_);
-        target.set_scalar64(4, static_cast<uint64_t>(out_strides[0]));
-        target.set_buffer_ptr(
-            5,
-            static_cast<const MTL::Buffer*>(freqs.buffer().ptr()),
-            freqs.offset());
-        target.set_scalar64(6, static_cast<uint64_t>(freqs.strides()[0]));
-      };
-
-      MTL::Buffer* ab_mtl = nullptr;
-      std::shared_ptr<metal::ArgumentBuffer> transient;
-      if (persistent_handle) {
-        const auto& actual = persistent_handle->layout();
-        if (actual.size() != slot_layout.size()) {
-          throw std::runtime_error(
-              "[RoPE::eval_gpu] persistent AB handle has wrong slot "
-              "count for freqs path (expected 7, got " +
-              std::to_string(actual.size()) + ")");
-        }
-        populate(*persistent_handle);
-        ab_mtl = persistent_handle->mtl_buffer();
-      } else {
-        transient = std::make_shared<metal::ArgumentBuffer>(d, slot_layout);
-        populate(*transient);
-        ab_mtl = transient->mtl_buffer();
-      }
+      auto ab = std::make_shared<metal::ArgumentBuffer>(
+          d,
+          std::vector<Slot>{
+              {Slot::Kind::BufferPtrOffset, 0, "in"},
+              {Slot::Kind::BufferPtrOffset, 0, "out"},
+              {Slot::Kind::BufferPtrOffset, 0, "offset"},
+              {Slot::Kind::Float32, 0, "scale"},
+              {Slot::Kind::Scalar64, 0, "stride"},
+              {Slot::Kind::BufferPtrOffset, 0, "freqs"},
+              {Slot::Kind::Scalar64, 0, "freq_stride"},
+          });
+      ab->set_buffer_ptr(
+          0,
+          static_cast<const MTL::Buffer*>(in_array.buffer().ptr()),
+          in_array.offset());
+      ab->set_buffer_ptr(
+          1,
+          static_cast<const MTL::Buffer*>(out.buffer().ptr()),
+          out.offset());
+      ab->set_buffer_ptr(
+          2,
+          static_cast<const MTL::Buffer*>(offset.buffer().ptr()),
+          offset.offset());
+      ab->set_float32(3, scale_);
+      ab->set_scalar64(4, static_cast<uint64_t>(out_strides[0]));
+      ab->set_buffer_ptr(
+          5,
+          static_cast<const MTL::Buffer*>(freqs.buffer().ptr()),
+          freqs.offset());
+      ab->set_scalar64(
+          6, static_cast<uint64_t>(freqs.strides()[0]));
 
       compute_encoder.register_input_array(in_array);
       compute_encoder.register_input_array(offset);
       compute_encoder.register_input_array(freqs);
       compute_encoder.register_output_array(out);
 
-      compute_encoder.set_buffer(ab_mtl, 0);
+      compute_encoder.set_buffer(ab->mtl_buffer(), 0);
 
       uint32_t dim0 = dims_ / 2;
       auto group_dims = get_block_dims(dim0, N, 1);
       auto grid_dims = MTL::Size(dim0, N, 1);
       compute_encoder.dispatch_threads(grid_dims, group_dims);
-      if (transient) {
-        compute_encoder.add_temporary_object(
-            std::static_pointer_cast<void>(transient));
-      }
+      compute_encoder.add_temporary_object(
+          std::static_pointer_cast<void>(ab));
     } else {
-      const std::vector<Slot> slot_layout{
-          {Slot::Kind::BufferPtrOffset, 0, "in"},
-          {Slot::Kind::BufferPtrOffset, 0, "out"},
-          {Slot::Kind::BufferPtrOffset, 0, "offset"},
-          {Slot::Kind::Float32, 0, "scale"},
-          {Slot::Kind::Scalar64, 0, "stride"},
-          {Slot::Kind::Float32, 0, "base"},
-      };
-
-      auto populate = [&](auto& target) {
-        target.set_buffer_ptr(
-            0,
-            static_cast<const MTL::Buffer*>(in_array.buffer().ptr()),
-            in_array.offset());
-        target.set_buffer_ptr(
-            1,
-            static_cast<const MTL::Buffer*>(out.buffer().ptr()),
-            out.offset());
-        target.set_buffer_ptr(
-            2,
-            static_cast<const MTL::Buffer*>(offset.buffer().ptr()),
-            offset.offset());
-        target.set_float32(3, scale_);
-        target.set_scalar64(4, static_cast<uint64_t>(out_strides[0]));
-        target.set_float32(5, base);
-      };
-
-      MTL::Buffer* ab_mtl = nullptr;
-      std::shared_ptr<metal::ArgumentBuffer> transient;
-      if (persistent_handle) {
-        const auto& actual = persistent_handle->layout();
-        if (actual.size() != slot_layout.size()) {
-          throw std::runtime_error(
-              "[RoPE::eval_gpu] persistent AB handle has wrong slot "
-              "count for base path (expected 6, got " +
-              std::to_string(actual.size()) + ")");
-        }
-        populate(*persistent_handle);
-        ab_mtl = persistent_handle->mtl_buffer();
-      } else {
-        transient = std::make_shared<metal::ArgumentBuffer>(d, slot_layout);
-        populate(*transient);
-        ab_mtl = transient->mtl_buffer();
-      }
+      auto ab = std::make_shared<metal::ArgumentBuffer>(
+          d,
+          std::vector<Slot>{
+              {Slot::Kind::BufferPtrOffset, 0, "in"},
+              {Slot::Kind::BufferPtrOffset, 0, "out"},
+              {Slot::Kind::BufferPtrOffset, 0, "offset"},
+              {Slot::Kind::Float32, 0, "scale"},
+              {Slot::Kind::Scalar64, 0, "stride"},
+              {Slot::Kind::Float32, 0, "base"},
+          });
+      ab->set_buffer_ptr(
+          0,
+          static_cast<const MTL::Buffer*>(in_array.buffer().ptr()),
+          in_array.offset());
+      ab->set_buffer_ptr(
+          1,
+          static_cast<const MTL::Buffer*>(out.buffer().ptr()),
+          out.offset());
+      ab->set_buffer_ptr(
+          2,
+          static_cast<const MTL::Buffer*>(offset.buffer().ptr()),
+          offset.offset());
+      ab->set_float32(3, scale_);
+      ab->set_scalar64(4, static_cast<uint64_t>(out_strides[0]));
+      ab->set_float32(5, base);
 
       compute_encoder.register_input_array(in_array);
       compute_encoder.register_input_array(offset);
       compute_encoder.register_output_array(out);
 
-      compute_encoder.set_buffer(ab_mtl, 0);
+      compute_encoder.set_buffer(ab->mtl_buffer(), 0);
 
       uint32_t dim0 = dims_ / 2;
       auto group_dims = get_block_dims(dim0, N, 1);
       auto grid_dims = MTL::Size(dim0, N, 1);
       compute_encoder.dispatch_threads(grid_dims, group_dims);
-      if (transient) {
-        compute_encoder.add_temporary_object(
-            std::static_pointer_cast<void>(transient));
-      }
+      compute_encoder.add_temporary_object(
+          std::static_pointer_cast<void>(ab));
     }
     return;
   }
