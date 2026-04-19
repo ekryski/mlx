@@ -346,10 +346,6 @@ void qmv(
         static_cast<const MTL::Resource*>(out.buffer().ptr()),
         MTL::ResourceUsageWrite);
 
-    // Class-1 ICB replay support: tag this transient AB so the
-    // decode-loop orchestrator can override at replay.
-    compute_encoder.tag_ab_binding(ab->mtl_buffer());
-
     compute_encoder.set_buffer(ab->mtl_buffer(), 0);
     compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
     compute_encoder.add_temporary_object(
@@ -1256,10 +1252,6 @@ void gather_qmv(
     compute_encoder.use_resource(
         static_cast<const MTL::Resource*>(out.buffer().ptr()),
         MTL::ResourceUsageWrite);
-
-    // Class-1 ICB replay support: tag this transient AB so the
-    // decode-loop orchestrator can override at replay.
-    compute_encoder.tag_ab_binding(ab->mtl_buffer());
 
     compute_encoder.set_buffer(ab->mtl_buffer(), 0);
     compute_encoder.dispatch_threadgroups(grid_dims, group_dims);

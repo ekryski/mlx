@@ -191,12 +191,6 @@ void binary_op_gpu_inplace(
         static_cast<const MTL::Resource*>(out.buffer().ptr()),
         MTL::ResourceUsageWrite);
 
-    // Class-1 ICB replay support: when recording, tag this AB so the
-    // decode-loop orchestrator can override the binding at replay
-    // time with the next step's freshly-built AB. No-op when not
-    // recording.
-    compute_encoder.tag_ab_binding(ab->mtl_buffer());
-
     compute_encoder.set_buffer(ab->mtl_buffer(), 0);
 
     auto thread_group_size = ab_kernel->maxTotalThreadsPerThreadgroup();

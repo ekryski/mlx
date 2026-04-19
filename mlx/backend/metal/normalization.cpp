@@ -176,11 +176,6 @@ void RMSNorm::eval_gpu(
         compute_encoder.register_input_array(w);
         compute_encoder.register_output_array(out);
 
-        // Class-1 ICB replay support: tag this transient AB so the
-        // decode-loop orchestrator can override at replay. No-op when
-        // not recording.
-        compute_encoder.tag_ab_binding(ab->mtl_buffer());
-
         compute_encoder.set_buffer(ab->mtl_buffer(), 0);
         compute_encoder.dispatch_threads(grid_dims, group_dims);
 

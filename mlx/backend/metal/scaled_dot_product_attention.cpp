@@ -763,11 +763,6 @@ void sdpa_vector_unified(
       ab_mtl = ab->mtl_buffer();
       compute_encoder.add_temporary_object(
           std::static_pointer_cast<void>(ab));
-      // Class-1 ICB replay support for the transient path: tag this AB
-      // so the decode-loop orchestrator can override at replay time.
-      // The persistent path (above) doesn't need tagging — its
-      // MTLBuffer is stable across decode steps by construction.
-      compute_encoder.tag_ab_binding(ab_mtl);
     }
 
     // Fence tracking for resources the kernel reads/writes through

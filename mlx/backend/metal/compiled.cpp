@@ -641,10 +641,6 @@ void Compiled::eval_gpu(
       ab->set_scalar32(slot, static_cast<uint32_t>(size));
     }
 
-    // Class-1 ICB replay support: tag this transient AB so the
-    // decode-loop orchestrator can override at replay.
-    compute_encoder.tag_ab_binding(ab->mtl_buffer());
-
     compute_encoder.set_buffer(ab->mtl_buffer(), 0);
 
     // Dispatch.
