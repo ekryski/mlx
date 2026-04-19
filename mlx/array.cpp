@@ -10,6 +10,173 @@
 
 namespace mlx::core {
 
+namespace detail {
+
+// ─────────────────────────────────────────────────────────────────────
+// PinSession — stable-address allocator reuse for decode-loop ICB
+// ─────────────────────────────────────────────────────────────────────
+//
+// A PinSession captures the shared_ptr<array::Data> produced by every
+// `array::set_data` call on the current thread during a "record"
+// phase, and reuses those same Data instances during a subsequent
+// "replay" phase. When a primitive's `eval_gpu` does
+// `out.set_data(allocator::malloc(nbytes))`, the pin session (in
+// replay phase) discards the freshly-allocated buffer and attaches
+// `out` to the recorded Data — so `out.buffer().ptr()` returns the
+// *same* MTLBuffer address across steps.
+//
+// This is the foundation for Option (b) of decode-loop ICB
+// orchestration: the recorded ICB's every binding remains valid
+// across replays because every allocation in the forward pass has a
+// stable address. No per-binding override mechanism is needed.
+//
+// One session per thread (matches mlx's single-threaded-decode
+// assumption). Sessions carry no cross-thread state.
+
+struct PinSession {
+  enum class Phase { None, Record, Replay };
+  Phase phase{Phase::None};
+  // Captured shared_ptrs — one per set_data call during Record.
+  // During Replay, slot_idx walks this vector and each reused Data
+  // is written back into the caller's `array_desc_->data`.
+  std::vector<std::shared_ptr<array::Data>> slots;
+  size_t slot_idx{0};
+  // Diagnostic: total calls seen during the current phase. Helps
+  // detect record/replay divergence (different graph topology).
+  size_t calls{0};
+
+  void begin_record() {
+    phase = Phase::Record;
+    slots.clear();
+    slot_idx = 0;
+    calls = 0;
+  }
+  size_t end_record() {
+    phase = Phase::None;
+    return slots.size();
+  }
+  void begin_replay() {
+    phase = Phase::Replay;
+    slot_idx = 0;
+    calls = 0;
+  }
+  size_t end_replay() {
+    size_t consumed = slot_idx;
+    phase = Phase::None;
+    return consumed;
+  }
+
+  // Called from array::set_data with the just-constructed Data.
+  // In Record: capture.
+  // In Replay: replace with the next recorded slot.
+  // In None: no-op.
+  void on_set_data(std::shared_ptr<array::Data>& data) {
+    if (phase == Phase::Record) {
+      slots.push_back(data);
+      ++calls;
+    } else if (phase == Phase::Replay) {
+      ++calls;
+      if (slot_idx < slots.size()) {
+        // Swap: the freshly-allocated Data falls out of scope and
+        // returns its buffer to the pool; the recorded Data takes
+        // its place so the caller's array pins at the recorded
+        // buffer address.
+        data = slots[slot_idx++];
+      }
+      // Underflow (more set_data calls than recorded): fall through
+      // with the fresh Data. Indicates record/replay divergence;
+      // caller should detect via the count mismatch returned by
+      // end_replay.
+    }
+  }
+};
+
+static thread_local PinSession* t_pin_session_ = nullptr;
+
+MLX_API PinSession* current_pin_session() {
+  return t_pin_session_;
+}
+
+MLX_API PinSession* begin_pin_record_session() {
+  if (t_pin_session_) {
+    throw std::logic_error(
+        "[mlx::detail] pin session already active on this thread");
+  }
+  auto* sess = new PinSession();
+  sess->begin_record();
+  t_pin_session_ = sess;
+  return sess;
+}
+
+MLX_API size_t end_pin_record_session() {
+  if (!t_pin_session_) {
+    throw std::logic_error(
+        "[mlx::detail] end_pin_record_session without begin");
+  }
+  if (t_pin_session_->phase != PinSession::Phase::Record) {
+    throw std::logic_error(
+        "[mlx::detail] end_pin_record_session while not in Record phase");
+  }
+  size_t n = t_pin_session_->end_record();
+  // Detach from TLS so the session can be re-attached later via
+  // begin_pin_replay. The caller still owns the session handle.
+  t_pin_session_ = nullptr;
+  return n;
+}
+
+MLX_API void begin_pin_replay(PinSession* sess) {
+  if (!sess) {
+    throw std::invalid_argument(
+        "[mlx::detail] begin_pin_replay: null session");
+  }
+  if (t_pin_session_) {
+    throw std::logic_error(
+        "[mlx::detail] begin_pin_replay while another session is active");
+  }
+  t_pin_session_ = sess;
+  sess->begin_replay();
+}
+
+MLX_API size_t end_pin_replay() {
+  if (!t_pin_session_) {
+    throw std::logic_error(
+        "[mlx::detail] end_pin_replay without begin");
+  }
+  if (t_pin_session_->phase != PinSession::Phase::Replay) {
+    throw std::logic_error(
+        "[mlx::detail] end_pin_replay while not in Replay phase");
+  }
+  size_t consumed = t_pin_session_->end_replay();
+  t_pin_session_ = nullptr;
+  return consumed;
+}
+
+MLX_API void free_pin_session(PinSession* sess) {
+  // Caller is responsible for not freeing a session that's still
+  // t_pin_session_ — we defensively null the TLS if it happens to
+  // match, but deleting mid-session is a bug.
+  if (t_pin_session_ == sess) {
+    t_pin_session_ = nullptr;
+  }
+  delete sess;
+}
+
+MLX_API size_t pin_session_slot_count(PinSession* sess) {
+  if (!sess) {
+    return 0;
+  }
+  return sess->slots.size();
+}
+
+MLX_API size_t pin_session_slot_idx(PinSession* sess) {
+  if (!sess) {
+    return 0;
+  }
+  return sess->slot_idx;
+}
+
+} // namespace detail
+
 array::array(const std::complex<float>& val, Dtype dtype /* = complex64 */)
     : array_desc_(std::make_shared<ArrayDesc>(Shape{}, dtype)) {
   auto cval = static_cast<complex64_t>(val);
@@ -166,7 +333,11 @@ bool array::is_tracer() const {
 }
 
 void array::set_data(allocator::Buffer buffer, Deleter d) {
-  array_desc_->data = std::make_shared<Data>(buffer, d);
+  auto data = std::make_shared<Data>(buffer, d);
+  if (auto* sess = detail::current_pin_session()) {
+    sess->on_set_data(data);
+  }
+  array_desc_->data = std::move(data);
   array_desc_->offset = 0;
   array_desc_->data_size = size();
   array_desc_->flags.contiguous = true;
@@ -181,7 +352,11 @@ void array::set_data(
     Strides strides,
     Flags flags,
     Deleter d) {
-  array_desc_->data = std::make_shared<Data>(buffer, d);
+  auto data = std::make_shared<Data>(buffer, d);
+  if (auto* sess = detail::current_pin_session()) {
+    sess->on_set_data(data);
+  }
+  array_desc_->data = std::move(data);
   array_desc_->offset = 0;
   array_desc_->data_size = data_size;
   array_desc_->strides = std::move(strides);
