@@ -16,6 +16,7 @@ if(MLX_BUILD_METAL)
   list(APPEND METAL_TEST_SOURCES icb_feasibility_tests.cpp)
   list(APPEND METAL_TEST_SOURCES icb_recorder_tests.cpp)
   list(APPEND METAL_TEST_SOURCES icb_real_primitive_tests.cpp)
+  list(APPEND METAL_TEST_SOURCES persistent_ab_tests.cpp)
   list(APPEND METAL_TEST_SOURCES sdpa_regression_tests.cpp)
 endif()
 
