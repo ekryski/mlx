@@ -161,6 +161,19 @@ class MLX_API CommandEncoder {
   void tag_binding(uint32_t name_id, const array& a);
   void tag_binding(uint32_t name_id, const MTL::Buffer* buf);
 
+  // Tag a transient ArgumentBuffer's MTLBuffer with an auto-generated
+  // sequential ID. No-op when not recording. Used by Class-1 AB-aware
+  // primitives (binary, unary, gather, quantized affine, compiled JIT)
+  // so a recorded forward pass can be replayed at a later step with
+  // each AB's pointer overridden by the caller's per-step rebuild.
+  //
+  // The returned tag ID is the ordinal of this AB bind within the
+  // current recording session (0-based, monotonically increasing on
+  // each call). Returns `0` when not recording — caller can ignore.
+  // The replay-time override mechanism is decode-loop ICB
+  // orchestration in mlx-swift-lm; primitives don't need to know.
+  uint32_t tag_ab_binding(const MTL::Buffer* buf);
+
   // Replay a recorded IndirectCommandRecorder with per-name buffer
   // overrides. Each override triple is (name_id, override_buffer,
   // override_offset). See
@@ -221,6 +234,12 @@ class MLX_API CommandEncoder {
   // twice in a row clobbered `cur_`) or the primitive called dispatch
   // via a path we don't route through `recording_`.
   size_t icb_dispatch_calls_{0};
+  // Auto-incrementing counter for tag_ab_binding. Reset on
+  // begin_icb_recording so each recording session restarts at 0,
+  // making tag IDs match the ordinal index of AB binds in the
+  // recording. Stored as uint64_t to avoid overflow for very long
+  // recording sessions even though the public API exposes a uint32.
+  uint64_t ab_tag_counter_{0};
 
   // Buffer that stores encoded commands.
   NS::SharedPtr<MTL::CommandQueue> queue_;

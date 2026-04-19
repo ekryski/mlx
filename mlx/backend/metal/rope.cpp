@@ -236,6 +236,12 @@ void RoPE::eval_gpu(
       compute_encoder.register_input_array(freqs);
       compute_encoder.register_output_array(out);
 
+      // Tag transient ABs for ICB replay override (no-op for the
+      // persistent path: its MTLBuffer is stable across decode steps).
+      if (transient) {
+        compute_encoder.tag_ab_binding(ab_mtl);
+      }
+
       compute_encoder.set_buffer(ab_mtl, 0);
 
       uint32_t dim0 = dims_ / 2;
@@ -295,6 +301,10 @@ void RoPE::eval_gpu(
       compute_encoder.register_input_array(in_array);
       compute_encoder.register_input_array(offset);
       compute_encoder.register_output_array(out);
+
+      if (transient) {
+        compute_encoder.tag_ab_binding(ab_mtl);
+      }
 
       compute_encoder.set_buffer(ab_mtl, 0);
 

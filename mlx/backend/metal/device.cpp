@@ -743,6 +743,7 @@ void CommandEncoder::begin_icb_recording(
   has_pending_command_ = false;
   icb_skipped_set_input_ = 0;
   icb_dispatch_calls_ = 0;
+  ab_tag_counter_ = 0;
 
   // Steer every stream's encoder lookup on this thread through us until
   // end / abort. A secondary-stream primitive (MoE expert gather, a
@@ -824,6 +825,28 @@ void CommandEncoder::tag_binding(uint32_t name_id, const MTL::Buffer* buf) {
         "[metal::CommandEncoder] tag_binding requires active recording");
   }
   active_recorder_->tag_binding(name_id, buf);
+}
+
+uint32_t CommandEncoder::tag_ab_binding(const MTL::Buffer* buf) {
+  if (!recording_) {
+    return 0;
+  }
+  // Sequential IDs starting at 1 so callers can use 0 as a sentinel
+  // for "not tagged" if they ever care. The decode-loop ICB
+  // orchestrator (mlx-swift-lm side) needs to call into this same
+  // encoder during a "build-only" forward pass to obtain the matching
+  // sequence at replay time.
+  uint64_t next = ++ab_tag_counter_;
+  uint32_t id = static_cast<uint32_t>(next);
+  if (id == 0) {
+    // Wrapped past 2^32; bump to 1 so 0 stays the sentinel. A single
+    // recording session would have to bind 4B AB transients to hit
+    // this — diagnostic, not a real concern.
+    ab_tag_counter_ = 1;
+    id = 1;
+  }
+  active_recorder_->tag_binding(id, buf);
+  return id;
 }
 
 void CommandEncoder::replay_icb_with_overrides(

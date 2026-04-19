@@ -156,6 +156,9 @@ void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
           static_cast<const MTL::Resource*>(out.buffer().ptr()),
           MTL::ResourceUsageWrite);
 
+      // Class-1 ICB replay support: tag transient AB.
+      compute_encoder.tag_ab_binding(ab->mtl_buffer());
+
       compute_encoder.set_buffer(ab->mtl_buffer(), 0);
       compute_encoder.dispatch_threads(grid_dims, group_dims);
       compute_encoder.add_temporary_object(

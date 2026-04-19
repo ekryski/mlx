@@ -133,6 +133,10 @@ void unary_op_gpu_inplace(
         static_cast<const MTL::Resource*>(out.buffer().ptr()),
         MTL::ResourceUsageWrite);
 
+    // Class-1 ICB replay support: tag this transient AB so the
+    // decode-loop orchestrator can override it at replay time.
+    compute_encoder.tag_ab_binding(ab->mtl_buffer());
+
     compute_encoder.set_buffer(ab->mtl_buffer(), 0);
 
     auto thread_group_size = ab_kernel->maxTotalThreadsPerThreadgroup();
