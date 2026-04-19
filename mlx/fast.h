@@ -129,6 +129,22 @@ MLX_API array rope(
     const std::optional<array>& freqs = std::nullopt,
     StreamOrDevice s = {});
 
+// AB-participating overload — caller-owned PersistentAb whose
+// MTLBuffer address is stable across decode steps. Layout is either
+// 6 slots (base path) or 7 slots (freqs path); see rope.cpp for the
+// exact slot order. When ab_handle is null, identical to the plain
+// (array offset) overload.
+MLX_API array rope(
+    const array& x,
+    int dims,
+    bool traditional,
+    std::optional<float> base,
+    float scale,
+    const array& offset,
+    const std::optional<array>& freqs,
+    std::shared_ptr<metal::PersistentAb> ab_handle,
+    StreamOrDevice s = {});
+
 /** Computes: O = softmax(Q @ K.T) @ V **/
 MLX_API array scaled_dot_product_attention(
     const array& queries,

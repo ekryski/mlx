@@ -378,13 +378,22 @@ class RoPE : public Custom {
       bool traditional,
       float base,
       float scale,
-      bool forward)
+      bool forward,
+      std::shared_ptr<metal::PersistentAb> ab_handle = nullptr)
       : Custom(stream, std::move(fallback)),
         dims_(dims),
         traditional_(traditional),
         base_(base),
         scale_(scale),
-        forward_(forward) {}
+        forward_(forward),
+        ab_handle_(std::move(ab_handle)) {}
+
+  // Caller-owned PersistentAb used in place of a transient AB during
+  // AB-path single-token eval_gpu. Layout depends on whether the call
+  // uses `freqs` (7 slots) or `base` (6 slots).
+  const std::shared_ptr<metal::PersistentAb>& ab_handle() const {
+    return ab_handle_;
+  }
 
   static bool use_fallback(Stream s);
 
@@ -415,6 +424,7 @@ class RoPE : public Custom {
   float base_;
   float scale_;
   bool forward_;
+  std::shared_ptr<metal::PersistentAb> ab_handle_;
 };
 
 class ScaledDotProductAttention : public Custom {

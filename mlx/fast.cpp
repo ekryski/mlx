@@ -737,13 +737,18 @@ bool LayerNormVJP::is_equivalent(const Primitive& other) const {
   return eps_ == a_other.eps_;
 }
 
-array rope(
+namespace {
+// Internal impl that carries an optional PersistentAb handle. The
+// public overloads thread their args through, supplying nullptr for
+// the plain overload and a real handle for the AB overload.
+array rope_impl(
     std::vector<array> inputs,
     int dims,
     bool traditional,
     float base,
     float scale,
     bool forward,
+    std::shared_ptr<metal::PersistentAb> ab_handle,
     StreamOrDevice s) {
   auto& x = inputs[0];
   auto& offset = inputs[1];
@@ -895,10 +900,31 @@ array rope(
         x.shape(),
         x.dtype(),
         std::make_shared<RoPE>(
-            stream, fallback, dims, traditional, base, scale, forward),
+            stream,
+            fallback,
+            dims,
+            traditional,
+            base,
+            scale,
+            forward,
+            std::move(ab_handle)),
         std::move(inputs));
   }
   return fallback(std::move(inputs))[0];
+}
+} // namespace
+
+// Internal entry preserved for the int-offset overload below.
+array rope(
+    std::vector<array> inputs,
+    int dims,
+    bool traditional,
+    float base,
+    float scale,
+    bool forward,
+    StreamOrDevice s) {
+  return rope_impl(
+      std::move(inputs), dims, traditional, base, scale, forward, nullptr, s);
 }
 
 array rope(
@@ -920,13 +946,48 @@ array rope(
   } else if (!base) {
     throw std::invalid_argument("[rope] Neither base nor freqs has a value.");
   }
-  return rope(
+  return rope_impl(
       std::move(inputs),
       dims,
       traditional,
       base.has_value() ? *base : 1.0,
       scale,
       true,
+      nullptr,
+      s);
+}
+
+// AB-participating overload — same as the plain (array offset)
+// overload but wires the caller-owned PersistentAb through to
+// RoPE::eval_gpu via the primitive.
+array rope(
+    const array& x,
+    int dims,
+    bool traditional,
+    std::optional<float> base,
+    float scale,
+    const array& offset,
+    const std::optional<array>& freqs,
+    std::shared_ptr<metal::PersistentAb> ab_handle,
+    StreamOrDevice s /* = {} */) {
+  std::vector<array> inputs = {x, offset};
+  if (freqs) {
+    inputs.push_back(astype(*freqs, float32, s));
+    if (base) {
+      throw std::invalid_argument(
+          "[rope] Only one of base or freqs can have a value.");
+    }
+  } else if (!base) {
+    throw std::invalid_argument("[rope] Neither base nor freqs has a value.");
+  }
+  return rope_impl(
+      std::move(inputs),
+      dims,
+      traditional,
+      base.has_value() ? *base : 1.0,
+      scale,
+      true,
+      std::move(ab_handle),
       s);
 }
 

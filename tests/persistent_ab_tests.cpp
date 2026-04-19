@@ -304,3 +304,107 @@ TEST_CASE(
   auto y = mlx::core::fast::rms_norm(x, w, 1e-5f, handle, stream);
   CHECK_THROWS_AS(mlx::core::eval(y), std::runtime_error);
 }
+
+// --------------------------------------------------------------------------
+// End-to-end: RoPE single-token AB path with shared PersistentAb handle.
+// --------------------------------------------------------------------------
+//
+// RoPE's AB layout depends on whether `freqs` is supplied:
+//   - base path: 6 slots  (in, out, offset, scale, stride, base)
+//   - freqs path: 7 slots (in, out, offset, scale, stride, freqs, freq_stride)
+//
+// The single-token AB path is only taken for T==1 contiguous decode
+// inputs with a single offset. Test exercises both layouts.
+
+TEST_CASE(
+    "persistent_ab: RoPE base-path with reused handle matches transient-AB") {
+  if (!ab_env_on()) {
+    MESSAGE("skipping — AB path gated by MLX_METAL_AB=1 / MLX_METAL_ICB=1");
+    return;
+  }
+
+  // T=1, head_dim=64, n_heads=8 — typical decode-step RoPE shape.
+  auto stream = mlx::core::default_stream(mlx::core::Device::gpu);
+  const int B = 1, H = 8, T = 1, D = 64;
+  const int dims = D;
+  const float base_theta = 10000.0f;
+  const float scale = 1.0f;
+
+  auto key = mlx::core::random::key(0xF00DBABEull);
+  auto keys = mlx::core::random::split(key, 2, stream);
+
+  auto x_a = mlx::core::random::normal(
+      {B, H, T, D}, mlx::core::float32, 0.0f, 1.0f,
+      mlx::core::take(keys, 0, 0, stream), stream);
+  auto x_b = mlx::core::random::normal(
+      {B, H, T, D}, mlx::core::float32, 0.0f, 1.0f,
+      mlx::core::take(keys, 1, 0, stream), stream);
+  auto offset_a = mlx::core::array(101, mlx::core::int32);
+  auto offset_b = mlx::core::array(102, mlx::core::int32);
+  mlx::core::eval(x_a);
+  mlx::core::eval(x_b);
+
+  auto y_a_ref = mlx::core::fast::rope(
+      x_a, dims, /*traditional=*/false, base_theta, scale, offset_a,
+      std::nullopt, stream);
+  auto y_b_ref = mlx::core::fast::rope(
+      x_b, dims, /*traditional=*/false, base_theta, scale, offset_b,
+      std::nullopt, stream);
+  mlx::core::eval(y_a_ref);
+  mlx::core::eval(y_b_ref);
+
+  auto& d = device(mlx::core::Device::gpu);
+  auto handle = std::make_shared<PersistentAb>(
+      d,
+      std::vector<Slot>{
+          {Slot::Kind::BufferPtrOffset, 0, "in"},
+          {Slot::Kind::BufferPtrOffset, 0, "out"},
+          {Slot::Kind::BufferPtrOffset, 0, "offset"},
+          {Slot::Kind::Float32, 0, "scale"},
+          {Slot::Kind::Scalar64, 0, "stride"},
+          {Slot::Kind::Float32, 0, "base"},
+      });
+  auto* handle_mtl = handle->mtl_buffer();
+  REQUIRE(handle_mtl);
+
+  auto y_a_pers = mlx::core::fast::rope(
+      x_a, dims, /*traditional=*/false, base_theta, scale, offset_a,
+      std::nullopt, handle, stream);
+  auto y_b_pers = mlx::core::fast::rope(
+      x_b, dims, /*traditional=*/false, base_theta, scale, offset_b,
+      std::nullopt, handle, stream);
+  mlx::core::eval(y_a_pers);
+  mlx::core::eval(y_b_pers);
+
+  CHECK(handle->mtl_buffer() == handle_mtl);
+  CHECK(mlx::core::allclose(y_a_pers, y_a_ref, 0.0, 0.0).item<bool>());
+  CHECK(mlx::core::allclose(y_b_pers, y_b_ref, 0.0, 0.0).item<bool>());
+}
+
+TEST_CASE(
+    "persistent_ab: RoPE throws on mismatched handle slot count") {
+  if (!ab_env_on()) {
+    MESSAGE("skipping — AB path gated by MLX_METAL_AB=1 / MLX_METAL_ICB=1");
+    return;
+  }
+
+  auto stream = mlx::core::default_stream(mlx::core::Device::gpu);
+  auto& d = device(mlx::core::Device::gpu);
+
+  // Wrong layout — 3 slots instead of 6.
+  auto handle = std::make_shared<PersistentAb>(
+      d,
+      std::vector<Slot>{
+          {Slot::Kind::BufferPtrOffset, 0, "in"},
+          {Slot::Kind::BufferPtrOffset, 0, "out"},
+          {Slot::Kind::BufferPtrOffset, 0, "offset"},
+      });
+
+  auto x = mlx::core::ones({1, 8, 1, 64}, mlx::core::float32, stream);
+  auto offset = mlx::core::array(0, mlx::core::int32);
+  mlx::core::eval(x);
+
+  auto y = mlx::core::fast::rope(
+      x, 64, false, 10000.0f, 1.0f, offset, std::nullopt, handle, stream);
+  CHECK_THROWS_AS(mlx::core::eval(y), std::runtime_error);
+}
