@@ -7,6 +7,7 @@
 #include "mlx/backend/metal/ab_gate.h"
 #include "mlx/backend/metal/argument_buffer.h"
 #include "mlx/backend/metal/device.h"
+#include "mlx/backend/metal/persistent_ab.h"
 #include "mlx/backend/metal/kernels.h"
 #include "mlx/backend/metal/kernels/defines.h"
 #include "mlx/backend/metal/kernels/steel/attn/params.h"
