@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <iostream>
 #include <sstream>
+#include <thread>
 
 #include <fmt/format.h>
 
@@ -744,6 +745,13 @@ void CommandEncoder::begin_icb_recording(
   icb_skipped_set_input_ = 0;
   icb_dispatch_calls_ = 0;
   ab_tag_counter_ = 0;
+  if (const char* dbg = std::getenv("MLX_ICB_STEER_DEBUG")) {
+    if (dbg[0] == '1') {
+      std::cerr << "[ICB-STEER-DBG] begin_icb_recording set steer to "
+                << this << " on thread "
+                << std::this_thread::get_id() << "\n";
+    }
+  }
 
   // Steer every stream's encoder lookup on this thread through us until
   // end / abort. A secondary-stream primitive (MoE expert gather, a
@@ -1313,6 +1321,14 @@ CommandEncoder& get_command_encoder(Stream s) {
   // bypassing it via a sibling encoder.
   if (t_icb_steer_target_ != nullptr) {
     return *t_icb_steer_target_;
+  }
+  if (const char* dbg = std::getenv("MLX_ICB_STEER_DEBUG")) {
+    if (dbg[0] == '1') {
+      std::cerr << "[ICB-STEER-DBG] get_command_encoder(s.index="
+                << s.index << ") on thread "
+                << std::this_thread::get_id()
+                << " — steer=nullptr\n";
+    }
   }
   auto& encoders = get_command_encoders();
   auto it = encoders.find(s.index);
