@@ -1319,16 +1319,24 @@ CommandEncoder& get_command_encoder(Stream s) {
   // target secondary streams (MoE expert scheduling, fast kernels
   // taking caller-supplied streams) still land in the ICB instead of
   // bypassing it via a sibling encoder.
+  static const bool steer_dbg = []() {
+    const char* d = std::getenv("MLX_ICB_STEER_DEBUG");
+    return d && d[0] == '1';
+  }();
   if (t_icb_steer_target_ != nullptr) {
-    return *t_icb_steer_target_;
-  }
-  if (const char* dbg = std::getenv("MLX_ICB_STEER_DEBUG")) {
-    if (dbg[0] == '1') {
+    if (steer_dbg) {
       std::cerr << "[ICB-STEER-DBG] get_command_encoder(s.index="
                 << s.index << ") on thread "
                 << std::this_thread::get_id()
-                << " — steer=nullptr\n";
+                << " — STEERED to " << t_icb_steer_target_ << "\n";
     }
+    return *t_icb_steer_target_;
+  }
+  if (steer_dbg) {
+    std::cerr << "[ICB-STEER-DBG] get_command_encoder(s.index="
+              << s.index << ") on thread "
+              << std::this_thread::get_id()
+              << " — steer=nullptr\n";
   }
   auto& encoders = get_command_encoders();
   auto it = encoders.find(s.index);
