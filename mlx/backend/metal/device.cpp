@@ -14,6 +14,7 @@
 #define MTL_PRIVATE_IMPLEMENTATION
 
 #include "mlx/backend/common/utils.h"
+#include "mlx/dtype_utils.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/icb.h"
 #include "mlx/backend/metal/metal.h"
@@ -280,6 +281,21 @@ CommandEncoder::~CommandEncoder() {
   queue_.reset();
 }
 
+// ICB skip trace — forward-declared above set_buffer / set_input_array
+// so those sites can call icb_skip_trace_enabled_() / read
+// g_icb_last_kernel_for_skip_. Populated by set_compute_pipeline_state
+// (below). When MLX_ICB_SKIP_TRACE=1, the skip sites print the last
+// kernel to identify which primitive stages buffers before binding a
+// pipeline.
+static thread_local std::string g_icb_last_kernel_for_skip_;
+static bool icb_skip_trace_enabled_() {
+  static const bool v = []() {
+    const char* s = std::getenv("MLX_ICB_SKIP_TRACE");
+    return s && s[0] == '1';
+  }();
+  return v;
+}
+
 void CommandEncoder::set_buffer(
     const MTL::Buffer* buf,
     int idx,
@@ -289,6 +305,16 @@ void CommandEncoder::set_buffer(
   }
   if (recording_) {
     if (!has_pending_command_) {
+      if (icb_skip_trace_enabled_()) {
+        std::cerr << "[ICB-SKIP] set_buffer skip idx=" << idx
+                  << " offset=" << offset
+                  << " buf=" << buf
+                  << " last_kernel=\""
+                  << (g_icb_last_kernel_for_skip_.empty()
+                          ? "<none-yet>"
+                          : g_icb_last_kernel_for_skip_)
+                  << "\" dispatches_so_far=" << icb_dispatch_calls_ << "\n";
+      }
       // Matches the set_input_array policy: tolerate pre-pipeline staging.
       return;
     }
@@ -325,6 +351,28 @@ void CommandEncoder::set_input_array(
     // splitting but are meaningless to the ICB (they'd bind to no command).
     // Swallow them silently when no command is in progress.
     if (!has_pending_command_) {
+      if (icb_skip_trace_enabled_()) {
+        std::ostringstream shape;
+        shape << "[";
+        const auto& sh = a.shape();
+        for (size_t i = 0; i < sh.size(); ++i) {
+          if (i) shape << ",";
+          shape << sh[i];
+        }
+        shape << "]";
+        std::cerr << "[ICB-SKIP] set_input_array skip #"
+                  << (icb_skipped_set_input_ + 1)
+                  << " idx=" << idx
+                  << " offset=" << offset
+                  << " shape=" << shape.str()
+                  << " dtype=" << dtype_to_string(a.dtype())
+                  << " buf=" << a.buffer().ptr()
+                  << " last_kernel=\""
+                  << (g_icb_last_kernel_for_skip_.empty()
+                          ? "<none-yet>"
+                          : g_icb_last_kernel_for_skip_)
+                  << "\" dispatches_so_far=" << icb_dispatch_calls_ << "\n";
+      }
       icb_skipped_set_input_++;
       return;
     }
@@ -566,6 +614,26 @@ void CommandEncoder::set_compute_pipeline_state(
     g_last_kernel_label_ = std::move(name);
   }
   if (recording_) {
+    if (icb_skip_trace_enabled_()) {
+      auto name = kernel_name_for(kernel);
+      if (name.empty()) {
+        auto* label = kernel->label();
+        name = label
+            ? std::string(label->utf8String())
+            : std::string("<unnamed>");
+      }
+      // If we just witnessed one or more skipped set_input_array /
+      // set_buffer calls, log the kernel that's now being bound so we
+      // can identify which primitive swallowed the bindings.
+      static thread_local int last_seen_skip_count_ = 0;
+      if (icb_skipped_set_input_ > last_seen_skip_count_) {
+        std::cerr << "[ICB-SKIP] next pipeline after skip: \"" << name
+                  << "\" (skips_so_far=" << icb_skipped_set_input_
+                  << ", dispatches_so_far=" << icb_dispatch_calls_ << ")\n";
+        last_seen_skip_count_ = icb_skipped_set_input_;
+      }
+      g_icb_last_kernel_for_skip_ = std::move(name);
+    }
     active_recorder_->begin_command(kernel);
     has_pending_command_ = true;
     return;
@@ -814,7 +882,47 @@ void CommandEncoder::begin_icb_recording(
   // Flush anything the live encoder had pending so it doesn't interleave
   // with the ICB we're about to build. The live encoder is left in a
   // clean state and will be lazily recreated on the next direct call.
-  end_encoding();
+  //
+  // Opt-in: MLX_ICB_PRE_RECORD_SYNC=1 upgrades this to a full commit +
+  // waitUntilCompleted on THIS encoder's command buffer (plus all
+  // sibling thread-local encoders when "=all"), so any dispatches
+  // queued by pre-record live steps — including MoE / secondary-stream
+  // work whose Swift-side `Stream.defaultStream(.gpu).synchronize()`
+  // wouldn't reach — are fully drained before the recorder starts
+  // capturing. Diagnostic for the "step-3 record-replay diverges from
+  // live" bug (see icb-decode-loop-checkpoint-2026-04-19.md).
+  if (const char* v = std::getenv("MLX_ICB_PRE_RECORD_SYNC")) {
+    const bool all_streams = (v[0] == 'a' && v[1] == 'l' && v[2] == 'l');
+    const bool enabled = (v[0] == '1') || all_streams;
+    if (enabled) {
+      // Drain this encoder (the recording target).
+      synchronize();
+      if (all_streams) {
+        // Drain every thread-local encoder, including any secondary
+        // GPU streams (e.g. MoE expert dispatches). Skip `this` since
+        // we just drained it. Snapshot the keys first so synchronize()
+        // doesn't invalidate the iterator.
+        auto& encoders = get_command_encoders();
+        std::vector<int> indices;
+        indices.reserve(encoders.size());
+        for (auto& [idx, _] : encoders) indices.push_back(idx);
+        for (int idx : indices) {
+          auto it = encoders.find(idx);
+          if (it != encoders.end() && &it->second != this) {
+            it->second.synchronize();
+          }
+        }
+      }
+      std::cerr << "[ICB-PRE-SYNC] drained "
+                << (all_streams ? "all encoders" : "this encoder")
+                << " before begin_icb_recording on thread "
+                << std::this_thread::get_id() << "\n";
+    } else {
+      end_encoding();
+    }
+  } else {
+    end_encoding();
+  }
 
   active_recorder_ = std::make_unique<IndirectCommandRecorder>(
       device_, max_commands, bytes_arena_cap);
@@ -1459,6 +1567,15 @@ Device& device(mlx::core::Device) {
 thread_local CommandEncoder* t_icb_steer_target_ = nullptr;
 
 CommandEncoder& get_command_encoder(Stream s) {
+  // Stream audit: log non-default GPU stream lookups when NOT steered
+  // (i.e. during live decode, not during ICB recording). Catches
+  // secondary-stream dispatches — MoE experts, fast primitives with
+  // caller-supplied streams — that `Stream.defaultStream.synchronize()`
+  // wouldn't drain.
+  static const bool audit_ = []() {
+    const char* v = std::getenv("MLX_DECODE_STREAM_AUDIT");
+    return v && v[0] == '1';
+  }();
   // If an ICB recording is active on this thread, every stream's
   // dispatches route to the recording encoder so primitives that
   // target secondary streams (MoE expert scheduling, fast kernels
@@ -1468,6 +1585,19 @@ CommandEncoder& get_command_encoder(Stream s) {
     const char* d = std::getenv("MLX_ICB_STEER_DEBUG");
     return d && d[0] == '1';
   }();
+  if (audit_ && t_icb_steer_target_ == nullptr && s.device == ::mlx::core::Device::gpu) {
+    static thread_local int default_gpu_idx_ = -1;
+    if (default_gpu_idx_ == -1) {
+      // default_stream() is a plain thread_local lookup — no encoder
+      // creation, so calling it here can't recurse.
+      default_gpu_idx_ = default_stream(::mlx::core::Device::gpu).index;
+    }
+    if (s.index != default_gpu_idx_) {
+      std::cerr << "[STREAM-AUDIT] non-default GPU stream.index="
+                << s.index << " (default=" << default_gpu_idx_
+                << ") tid=" << std::this_thread::get_id() << "\n";
+    }
+  }
   if (t_icb_steer_target_ != nullptr) {
     if (steer_dbg) {
       std::cerr << "[ICB-STEER-DBG] get_command_encoder(s.index="

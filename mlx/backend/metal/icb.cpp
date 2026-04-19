@@ -2,7 +2,9 @@
 
 #include "mlx/backend/metal/icb.h"
 
+#include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <stdexcept>
 
 #include "mlx/backend/metal/device.h"
@@ -144,6 +146,17 @@ void IndirectCommandRecorder::begin_command(
         "[metal::IndirectCommandRecorder] null pipeline");
   }
 
+  if (const char* dbg = std::getenv("MLX_ICB_ORDER_TRACE"); dbg && dbg[0] == '1') {
+    auto name = kernel_name_for(pipeline);
+    if (name.empty()) {
+      auto* lbl = pipeline->label();
+      name = lbl ? std::string(lbl->utf8String()) : std::string("<unnamed>");
+    }
+    std::cerr << "[ICB-ORD] seg=" << (segments_.size() - 1)
+              << " cmd=" << segments_.back().commands.size()
+              << " " << name << "\n";
+  }
+
   cur_ = Command{};
   cur_.pipeline = pipeline;
   cur_active_ = true;
@@ -251,6 +264,32 @@ void IndirectCommandRecorder::end_command(
         tags_[name_id].push_back({seg_idx, cmd_idx, slot, b.offset});
       }
     }
+  }
+
+  // Buffer trace for ICB diagnostics — logs the first few commands'
+  // bound buffers so we can see what the recorder captured. Gate on
+  // MLX_ICB_BUFFER_TRACE=1.
+  static const bool buf_trace_ = []() {
+    const char* v = std::getenv("MLX_ICB_BUFFER_TRACE");
+    return v && v[0] == '1';
+  }();
+  if (buf_trace_ && total_commands_ < 10) {
+    std::cerr << "[ICB-BUF] cmd=" << total_commands_ << " bindings:";
+    for (int slot = 0; slot < kMaxKernelBufferBindCount; ++slot) {
+      const auto& b = cur_.bindings[slot];
+      if (b.buffer) {
+        std::cerr << " [" << slot << "=" << b.buffer
+                  << "+" << b.offset << "]";
+      }
+    }
+    std::cerr << "\n";
+  }
+  if (buf_trace_ && !pending_tags_by_buffer_.empty() && total_commands_ < 20) {
+    std::cerr << "[ICB-BUF] pending_tags:";
+    for (const auto& [buf, names] : pending_tags_by_buffer_) {
+      std::cerr << " buf=" << buf << "(n_names=" << names.size() << ")";
+    }
+    std::cerr << "\n";
   }
 
   seg.commands.push_back(cur_);
@@ -408,12 +447,23 @@ void IndirectCommandRecorder::replay_with_overrides(
   // TagLocation registered under that name and rewrite the ICB's
   // indirect compute command's slot binding. Missing names are skipped
   // silently — caller may choose to override only a subset.
+  static const bool override_trace_ = []() {
+    const char* v = std::getenv("MLX_ICB_OVERRIDE_TRACE");
+    return v && v[0] == '1';
+  }();
   for (const auto& [name_id, new_buf, new_offset] : overrides) {
     if (!new_buf) {
       throw std::invalid_argument(
           "[metal::IndirectCommandRecorder] null buffer in overrides");
     }
     auto it = tags_.find(name_id);
+    if (override_trace_) {
+      size_t n = (it == tags_.end()) ? 0 : it->second.size();
+      std::cerr << "[ICB-OVERRIDE] name_id=" << name_id
+                << " new_buf=" << new_buf
+                << " new_offset=" << new_offset
+                << " tag_locations=" << n << "\n";
+    }
     if (it == tags_.end()) {
       continue;
     }
