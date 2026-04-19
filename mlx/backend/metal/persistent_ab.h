@@ -77,3 +77,24 @@ class MLX_API PersistentAb {
 };
 
 } // namespace mlx::core::metal
+
+namespace mlx::core {
+
+// Push a caller-owned PersistentAb onto the thread-local handoff
+// queue for upcoming Gather::eval_gpu invocations that enter the
+// `gather_front_ab` AB path (indexing.cpp). FIFO: the next matching
+// gather consumes the front handle; additional gathers consume
+// subsequent handles. When the queue is drained, further gathers
+// fall back to transient ABs.
+//
+// Used by the decode-loop ICB orchestrator to keep the embedding
+// gather's indices-pointer mutable between replays. Pushed in
+// sequence because QuantizedEmbedding issues multiple back-to-back
+// gathers (`weight[x]`, `scales[x]`, `biases[x]`) per lookup.
+MLX_API void push_next_gather_front_persistent_ab(
+    metal::PersistentAb* handle);
+MLX_API metal::PersistentAb* consume_next_gather_front_persistent_ab();
+MLX_API void clear_next_gather_front_persistent_abs();
+MLX_API size_t pending_gather_front_persistent_abs();
+
+} // namespace mlx::core

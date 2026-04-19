@@ -17,6 +17,7 @@
 #include "mlx/backend/metal/jit/includes.h"
 #include "mlx/backend/metal/jit/indexing.h"
 #include "mlx/backend/metal/kernels.h"
+#include "mlx/backend/metal/persistent_ab.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx/dtype.h"
 #include "mlx/primitives.h"
@@ -30,6 +31,56 @@ bool gather_ab_enabled() {
   return ::mlx::core::metal::ab_enabled();
 }
 } // namespace
+
+// Thread-local handoff queue used by the ICB decode-loop orchestrator
+// (mlx-swift-lm) to hand caller-owned PersistentAbs into upcoming
+// Gather::eval_gpu invocations that enter the gather_front_ab AB path.
+// FIFO: each push corresponds to one upcoming gather; each gather
+// consumes and pops the front handle. Gathers after the queue is
+// drained fall back to allocating a transient AB.
+//
+// The queue (vs a single slot) exists because QuantizedEmbedding
+// dispatches *three* gather_front_ab calls per embedding lookup —
+// `weight[x]`, `scales[x]`, `biases[x]` — each needing its own AB
+// (slot 0 `src` differs per gather, even though slot 1 `indices` is
+// the same `x` across all three). Sharing one AB would corrupt
+// slot 0 on replay.
+//
+// Motivation: gather_front_ab packs the indices buffer pointer
+// *inside* its AB (slot 1), so the embedded-input-token binding isn't
+// reachable via the usual set_kernel_buffer + tag_binding override
+// path — the ICB records a set_buffer(ab_mtl, 0) and the indices
+// pointer is invisible to replay_with_overrides. With persistent ABs
+// we can mutate slot 1 between replays via
+// PersistentAb::set_buffer_ptr and have the next replay read the new
+// input token without re-recording.
+namespace {
+thread_local std::vector<metal::PersistentAb*>
+    t_next_gather_front_persistent_abs_;
+} // namespace
+
+void push_next_gather_front_persistent_ab(metal::PersistentAb* handle) {
+  t_next_gather_front_persistent_abs_.push_back(handle);
+}
+
+metal::PersistentAb* consume_next_gather_front_persistent_ab() {
+  if (t_next_gather_front_persistent_abs_.empty()) {
+    return nullptr;
+  }
+  // FIFO: front handle is consumed by the next gather.
+  auto* h = t_next_gather_front_persistent_abs_.front();
+  t_next_gather_front_persistent_abs_.erase(
+      t_next_gather_front_persistent_abs_.begin());
+  return h;
+}
+
+void clear_next_gather_front_persistent_abs() {
+  t_next_gather_front_persistent_abs_.clear();
+}
+
+size_t pending_gather_front_persistent_abs() {
+  return t_next_gather_front_persistent_abs_.size();
+}
 
 constexpr int METAL_MAX_INDEX_ARRAYS = 20;
 
@@ -122,25 +173,54 @@ void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
       compute_encoder.set_compute_pipeline_state(kernel);
 
       using Slot = metal::ArgumentBuffer::Slot;
-      auto ab = std::make_shared<metal::ArgumentBuffer>(
-          d,
-          std::vector<Slot>{
-              {Slot::Kind::BufferPtrOffset, 0, "src"},
-              {Slot::Kind::BufferPtrOffset, 0, "indices"},
-              {Slot::Kind::BufferPtrOffset, 0, "out"},
-              {Slot::Kind::Scalar64, 0, "stride"},
-              {Slot::Kind::Scalar32, 0, "size"},
-          });
-      ab->set_buffer_ptr(
-          0, static_cast<const MTL::Buffer*>(src.buffer().ptr()), src.offset());
-      ab->set_buffer_ptr(
-          1,
-          static_cast<const MTL::Buffer*>(indices.buffer().ptr()),
-          indices.offset());
-      ab->set_buffer_ptr(
-          2, static_cast<const MTL::Buffer*>(out.buffer().ptr()), out.offset());
-      ab->set_scalar64(3, static_cast<uint64_t>(slice_size));
-      ab->set_scalar32(4, static_cast<uint32_t>(src.shape(0)));
+      const std::vector<Slot> slot_layout{
+          {Slot::Kind::BufferPtrOffset, 0, "src"},
+          {Slot::Kind::BufferPtrOffset, 0, "indices"},
+          {Slot::Kind::BufferPtrOffset, 0, "out"},
+          {Slot::Kind::Scalar64, 0, "stride"},
+          {Slot::Kind::Scalar32, 0, "size"},
+      };
+
+      // If the decode-loop orchestrator handed us a PersistentAb,
+      // populate ITS storage and bind its stable MTLBuffer instead of
+      // allocating a transient. That lets the caller retarget slot 1
+      // (indices buffer ptr) between ICB replays without re-recording.
+      metal::PersistentAb* persistent =
+          consume_next_gather_front_persistent_ab();
+      auto populate = [&](auto& target) {
+        target.set_buffer_ptr(
+            0,
+            static_cast<const MTL::Buffer*>(src.buffer().ptr()),
+            src.offset());
+        target.set_buffer_ptr(
+            1,
+            static_cast<const MTL::Buffer*>(indices.buffer().ptr()),
+            indices.offset());
+        target.set_buffer_ptr(
+            2,
+            static_cast<const MTL::Buffer*>(out.buffer().ptr()),
+            out.offset());
+        target.set_scalar64(3, static_cast<uint64_t>(slice_size));
+        target.set_scalar32(4, static_cast<uint32_t>(src.shape(0)));
+      };
+
+      MTL::Buffer* ab_mtl = nullptr;
+      std::shared_ptr<metal::ArgumentBuffer> transient;
+      if (persistent) {
+        const auto& actual = persistent->layout();
+        if (actual.size() != slot_layout.size()) {
+          throw std::runtime_error(
+              "[Gather::eval_gpu] persistent gather_front AB handle has "
+              "wrong slot count (expected 5, got " +
+              std::to_string(actual.size()) + ")");
+        }
+        populate(*persistent);
+        ab_mtl = persistent->mtl_buffer();
+      } else {
+        transient = std::make_shared<metal::ArgumentBuffer>(d, slot_layout);
+        populate(*transient);
+        ab_mtl = transient->mtl_buffer();
+      }
 
       compute_encoder.register_input_array(src);
       compute_encoder.register_input_array(indices);
@@ -156,13 +236,19 @@ void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
           static_cast<const MTL::Resource*>(out.buffer().ptr()),
           MTL::ResourceUsageWrite);
 
-      // Class-1 ICB replay support: tag transient AB.
-      compute_encoder.tag_ab_binding(ab->mtl_buffer());
+      // Tag transient ABs for Class-1 ICB replay override. Persistent
+      // ABs have stable MTLBuffer addresses across decode steps, so
+      // there's nothing to override at replay-time.
+      if (transient) {
+        compute_encoder.tag_ab_binding(ab_mtl);
+      }
 
-      compute_encoder.set_buffer(ab->mtl_buffer(), 0);
+      compute_encoder.set_buffer(ab_mtl, 0);
       compute_encoder.dispatch_threads(grid_dims, group_dims);
-      compute_encoder.add_temporary_object(
-          std::static_pointer_cast<void>(ab));
+      if (transient) {
+        compute_encoder.add_temporary_object(
+            std::static_pointer_cast<void>(transient));
+      }
       return;
     }
 
