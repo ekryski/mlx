@@ -1,9 +1,14 @@
 // Copyright © 2024 Apple Inc.
 
+#include <memory>
 #include <optional>
 #include <variant>
 
 #include "mlx/primitives.h"
+
+namespace mlx::core::metal {
+class PersistentAb;
+} // namespace mlx::core::metal
 
 namespace mlx::core::fast {
 
@@ -41,8 +46,11 @@ class RMSNorm : public Custom {
   RMSNorm(
       Stream stream,
       std::function<std::vector<array>(std::vector<array>)> fallback,
-      float eps)
-      : Custom(stream, std::move(fallback)), eps_(eps) {}
+      float eps,
+      std::shared_ptr<metal::PersistentAb> ab_handle = nullptr)
+      : Custom(stream, std::move(fallback)),
+        eps_(eps),
+        ab_handle_(std::move(ab_handle)) {}
 
   static bool use_fallback(Stream stream);
 
@@ -67,8 +75,19 @@ class RMSNorm : public Custom {
     return std::make_pair(nullptr, eps_);
   }
 
+  // Caller-owned PersistentAb used in place of a transient AB during
+  // AB-path eval_gpu. nullptr means "allocate fresh transient AB"
+  // (unchanged pre-Option-A behavior). The layout must match the
+  // standard RMSNorm AB: 3 BufferPtrOffset (x/w/out) + Float32 (eps)
+  // + 2 Scalar32 (axis_size, w_stride). Not part of `is_equivalent`
+  // — same computation either way, just different eval storage.
+  const std::shared_ptr<metal::PersistentAb>& ab_handle() const {
+    return ab_handle_;
+  }
+
  private:
   float eps_;
+  std::shared_ptr<metal::PersistentAb> ab_handle_;
 };
 
 class RMSNormQuantizedGEMV : public Custom {
@@ -359,13 +378,22 @@ class RoPE : public Custom {
       bool traditional,
       float base,
       float scale,
-      bool forward)
+      bool forward,
+      std::shared_ptr<metal::PersistentAb> ab_handle = nullptr)
       : Custom(stream, std::move(fallback)),
         dims_(dims),
         traditional_(traditional),
         base_(base),
         scale_(scale),
-        forward_(forward) {}
+        forward_(forward),
+        ab_handle_(std::move(ab_handle)) {}
+
+  // Caller-owned PersistentAb used in place of a transient AB during
+  // AB-path single-token eval_gpu. Layout depends on whether the call
+  // uses `freqs` (7 slots) or `base` (6 slots).
+  const std::shared_ptr<metal::PersistentAb>& ab_handle() const {
+    return ab_handle_;
+  }
 
   static bool use_fallback(Stream s);
 
@@ -396,6 +424,7 @@ class RoPE : public Custom {
   float base_;
   float scale_;
   bool forward_;
+  std::shared_ptr<metal::PersistentAb> ab_handle_;
 };
 
 class ScaledDotProductAttention : public Custom {
@@ -407,13 +436,22 @@ class ScaledDotProductAttention : public Custom {
       bool do_causal,
       bool has_sinks,
       bool output_logsumexp,
-      int window_size = -1)
+      int window_size = -1,
+      std::shared_ptr<metal::PersistentAb> ab_handle = nullptr)
       : Custom(stream, std::move(fallback)),
         scale_(scale),
         do_causal_(do_causal),
         has_sinks_(has_sinks),
         output_logsumexp_(output_logsumexp),
-        window_size_(window_size) {}
+        window_size_(window_size),
+        ab_handle_(std::move(ab_handle)) {}
+
+  // Caller-owned PersistentAb used in place of a transient AB during
+  // AB-path unified-vector eval_gpu. The layout must match
+  // SdpaUnifiedArgs in kernels/sdpa_unified.h (18 slots).
+  const std::shared_ptr<metal::PersistentAb>& ab_handle() const {
+    return ab_handle_;
+  }
 
   static bool use_fallback(
       const array& q,
@@ -462,6 +500,7 @@ class ScaledDotProductAttention : public Custom {
   bool has_sinks_;
   bool output_logsumexp_;
   int window_size_;
+  std::shared_ptr<metal::PersistentAb> ab_handle_;
 };
 
 class ScaledDotProductAttentionVJP : public Custom {

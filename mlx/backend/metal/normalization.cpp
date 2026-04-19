@@ -7,6 +7,7 @@
 #include "mlx/backend/metal/ab_gate.h"
 #include "mlx/backend/metal/argument_buffer.h"
 #include "mlx/backend/metal/device.h"
+#include "mlx/backend/metal/persistent_ab.h"
 #include "mlx/backend/metal/kernels/defines.h"
 #include "mlx/backend/metal/reduce.h"
 #include "mlx/backend/metal/utils.h"
@@ -109,39 +110,79 @@ void RMSNorm::eval_gpu(
       // individual `setBuffer`/`setBytes` calls with one `setBuffer`
       // at slot 0. Layout must match `RmsArgs` in
       // `kernels/rms_norm_ab.metal`.
+      //
+      // If the primitive carries a caller-owned PersistentAb handle
+      // (Option A / decode-loop ICB path), rewrite its contents in
+      // place and bind it — don't add as a temporary object, since
+      // the caller owns the lifetime. Otherwise allocate a fresh
+      // transient AB, same as pre-Option-A behavior.
       using Slot = metal::ArgumentBuffer::Slot;
-      auto ab = std::make_shared<metal::ArgumentBuffer>(
-          d,
-          std::vector<Slot>{
-              {Slot::Kind::BufferPtrOffset, 0, "x"},
-              {Slot::Kind::BufferPtrOffset, 0, "w"},
-              {Slot::Kind::BufferPtrOffset, 0, "out"},
-              {Slot::Kind::Float32, 0, "eps"},
-              {Slot::Kind::Scalar32, 0, "axis_size"},
-              {Slot::Kind::Scalar32, 0, "w_stride"},
-          });
-      ab->set_buffer_ptr(
-          0, static_cast<const MTL::Buffer*>(x.buffer().ptr()), x.offset());
-      ab->set_buffer_ptr(
-          1, static_cast<const MTL::Buffer*>(w.buffer().ptr()), w.offset());
-      ab->set_buffer_ptr(
-          2, static_cast<const MTL::Buffer*>(out.buffer().ptr()), out.offset());
-      ab->set_float32(3, eps_);
-      ab->set_scalar32(4, axis_size);
-      ab->set_scalar32(5, w_stride);
+      const std::vector<Slot> slot_layout{
+          {Slot::Kind::BufferPtrOffset, 0, "x"},
+          {Slot::Kind::BufferPtrOffset, 0, "w"},
+          {Slot::Kind::BufferPtrOffset, 0, "out"},
+          {Slot::Kind::Float32, 0, "eps"},
+          {Slot::Kind::Scalar32, 0, "axis_size"},
+          {Slot::Kind::Scalar32, 0, "w_stride"},
+      };
 
-      // Barrier + cross-encoder fence tracking for the indirect reads
-      // and writes the kernel performs through the AB.
-      compute_encoder.register_input_array(x);
-      compute_encoder.register_input_array(w);
-      compute_encoder.register_output_array(out);
+      const auto& persistent_handle = ab_handle();
+      MTL::Buffer* ab_mtl = nullptr;
 
-      compute_encoder.set_buffer(ab->mtl_buffer(), 0);
-      compute_encoder.dispatch_threads(grid_dims, group_dims);
+      if (persistent_handle) {
+        // Caller-owned AB path. Validate slot layout matches — this
+        // is a cheap runtime check that catches handle-misuse early.
+        const auto& actual = persistent_handle->layout();
+        if (actual.size() != slot_layout.size()) {
+          throw std::runtime_error(
+              "[RMSNorm::eval_gpu] persistent AB handle has wrong slot "
+              "count (expected 6, got " +
+              std::to_string(actual.size()) + ")");
+        }
+        persistent_handle->set_buffer_ptr(
+            0, static_cast<const MTL::Buffer*>(x.buffer().ptr()), x.offset());
+        persistent_handle->set_buffer_ptr(
+            1, static_cast<const MTL::Buffer*>(w.buffer().ptr()), w.offset());
+        persistent_handle->set_buffer_ptr(
+            2, static_cast<const MTL::Buffer*>(out.buffer().ptr()), out.offset());
+        persistent_handle->set_float32(3, eps_);
+        persistent_handle->set_scalar32(4, axis_size);
+        persistent_handle->set_scalar32(5, w_stride);
+        ab_mtl = persistent_handle->mtl_buffer();
 
-      // Keep the AB alive until the command buffer completes.
-      compute_encoder.add_temporary_object(
-          std::static_pointer_cast<void>(ab));
+        // Fence tracking for the kernel's indirect reads/writes. No
+        // add_temporary_object — caller owns the handle lifetime.
+        compute_encoder.register_input_array(x);
+        compute_encoder.register_input_array(w);
+        compute_encoder.register_output_array(out);
+
+        compute_encoder.set_buffer(ab_mtl, 0);
+        compute_encoder.dispatch_threads(grid_dims, group_dims);
+      } else {
+        auto ab = std::make_shared<metal::ArgumentBuffer>(d, slot_layout);
+        ab->set_buffer_ptr(
+            0, static_cast<const MTL::Buffer*>(x.buffer().ptr()), x.offset());
+        ab->set_buffer_ptr(
+            1, static_cast<const MTL::Buffer*>(w.buffer().ptr()), w.offset());
+        ab->set_buffer_ptr(
+            2, static_cast<const MTL::Buffer*>(out.buffer().ptr()), out.offset());
+        ab->set_float32(3, eps_);
+        ab->set_scalar32(4, axis_size);
+        ab->set_scalar32(5, w_stride);
+
+        // Barrier + cross-encoder fence tracking for the indirect reads
+        // and writes the kernel performs through the AB.
+        compute_encoder.register_input_array(x);
+        compute_encoder.register_input_array(w);
+        compute_encoder.register_output_array(out);
+
+        compute_encoder.set_buffer(ab->mtl_buffer(), 0);
+        compute_encoder.dispatch_threads(grid_dims, group_dims);
+
+        // Keep the AB alive until the command buffer completes.
+        compute_encoder.add_temporary_object(
+            std::static_pointer_cast<void>(ab));
+      }
     } else {
       compute_encoder.set_input_array(x, 0);
       compute_encoder.set_input_array(w, 1);

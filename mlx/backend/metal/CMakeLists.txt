@@ -104,6 +104,7 @@ target_sources(
   mlx
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/allocator.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/argument_buffer.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/persistent_ab.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/binary.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/device_info.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/compiled.cpp
