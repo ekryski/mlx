@@ -2,11 +2,16 @@
 
 #pragma once
 
+#include <memory>
 #include <optional>
 #include <variant>
 
 #include "mlx/api.h"
 #include "mlx/utils.h"
+
+namespace mlx::core::metal {
+class PersistentAb;
+} // namespace mlx::core::metal
 
 namespace mlx::core::fast {
 
@@ -14,6 +19,23 @@ MLX_API array rms_norm(
     const array& x,
     const std::optional<array>& weight,
     float eps,
+    StreamOrDevice s = {});
+
+// AB-participating overload — caller owns a PersistentAb that is
+// reused across calls. Used by the decode-loop ICB integration (see
+// benchmarks/notes/persistent-ab-pilot-design-2026-04-18.md): the
+// handle's MTLBuffer address is stable, so an ICB recording of this
+// call replays correctly after the caller rewrites the handle's
+// contents for the next step.
+//
+// When `ab_handle == nullptr` the call is identical to the
+// non-handle overload (allocates a fresh transient AB). Provides
+// no behavior change for callers that don't opt in.
+MLX_API array rms_norm(
+    const array& x,
+    const std::optional<array>& weight,
+    float eps,
+    std::shared_ptr<metal::PersistentAb> ab_handle,
     StreamOrDevice s = {});
 
 MLX_API array rms_norm_residual(

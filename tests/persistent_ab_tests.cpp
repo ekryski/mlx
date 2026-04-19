@@ -11,14 +11,17 @@
 // contract.
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 #include "doctest/doctest.h"
 
 #include <Metal/Metal.hpp>
 
+#include "mlx/mlx.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/persistent_ab.h"
+#include "mlx/fast.h"
 
 using namespace mlx::core::metal;
 using Slot = ArgumentBuffer::Slot;
@@ -179,4 +182,125 @@ TEST_CASE("persistent_ab: multiple independent instances have distinct buffers")
   REQUIRE(ab_a.mtl_buffer());
   REQUIRE(ab_b.mtl_buffer());
   CHECK(ab_a.mtl_buffer() != ab_b.mtl_buffer());
+}
+
+// --------------------------------------------------------------------------
+// End-to-end: RMSNorm with a shared PersistentAb matches transient-AB path.
+// --------------------------------------------------------------------------
+//
+// This is the real integration validation for Step 2. We call the
+// AB-participating `rms_norm` overload twice on different inputs,
+// both times passing the SAME PersistentAb. Output must match what
+// the transient-AB path produces for the same inputs. This proves:
+//
+//   1. Reusing a PersistentAb across calls doesn't corrupt contents.
+//   2. eval_gpu correctly rewrites the handle's contents per call.
+//   3. The AB-handle dispatch path is numerically equivalent to the
+//      fresh-AB path (and by extension, to the non-AB legacy path —
+//      the 8-primitive AB stack has been sweep-tested against legacy).
+//
+// Requires MLX_METAL_AB=1 (or MLX_METAL_ICB=1) because the AB code
+// paths are gated behind it. Gracefully skips when the env is off.
+
+namespace {
+bool ab_env_on() {
+  const char* a = std::getenv("MLX_METAL_AB");
+  const char* i = std::getenv("MLX_METAL_ICB");
+  return (a && a[0] == '1') || (i && i[0] == '1');
+}
+} // namespace
+
+TEST_CASE(
+    "persistent_ab: RMSNorm with reused handle matches transient-AB output") {
+  if (!ab_env_on()) {
+    MESSAGE(
+        "skipping — AB path gated by MLX_METAL_AB=1 / MLX_METAL_ICB=1");
+    return;
+  }
+
+  // Skeleton RMSNorm shapes: batch=1, seq=1, hidden=128.
+  auto stream = mlx::core::default_stream(mlx::core::Device::gpu);
+  const int hidden = 128;
+  const float eps = 1e-5f;
+
+  auto key = mlx::core::random::key(0xCAFEBABEull);
+  auto keys = mlx::core::random::split(key, 4, stream);
+
+  auto x_a = mlx::core::random::normal(
+      {1, 1, hidden}, mlx::core::float32, 0.0f, 1.0f,
+      mlx::core::take(keys, 0, 0, stream), stream);
+  auto x_b = mlx::core::random::normal(
+      {1, 1, hidden}, mlx::core::float32, 0.0f, 1.0f,
+      mlx::core::take(keys, 1, 0, stream), stream);
+  auto w = mlx::core::random::normal(
+      {hidden}, mlx::core::float32, 0.0f, 1.0f,
+      mlx::core::take(keys, 2, 0, stream), stream);
+  mlx::core::eval(x_a);
+  mlx::core::eval(x_b);
+  mlx::core::eval(w);
+
+  // Reference: two calls through the regular (transient-AB) overload.
+  auto y_a_ref = mlx::core::fast::rms_norm(x_a, w, eps, stream);
+  auto y_b_ref = mlx::core::fast::rms_norm(x_b, w, eps, stream);
+  mlx::core::eval(y_a_ref);
+  mlx::core::eval(y_b_ref);
+
+  // Test: two calls sharing a single PersistentAb handle. The layout
+  // must match what RMSNorm::eval_gpu expects.
+  auto& d = device(mlx::core::Device::gpu);
+  auto handle = std::make_shared<PersistentAb>(
+      d,
+      std::vector<Slot>{
+          {Slot::Kind::BufferPtrOffset, 0, "x"},
+          {Slot::Kind::BufferPtrOffset, 0, "w"},
+          {Slot::Kind::BufferPtrOffset, 0, "out"},
+          {Slot::Kind::Float32, 0, "eps"},
+          {Slot::Kind::Scalar32, 0, "axis_size"},
+          {Slot::Kind::Scalar32, 0, "w_stride"},
+      });
+  auto* handle_mtl = handle->mtl_buffer();
+  REQUIRE(handle_mtl);
+
+  auto y_a_pers = mlx::core::fast::rms_norm(x_a, w, eps, handle, stream);
+  auto y_b_pers = mlx::core::fast::rms_norm(x_b, w, eps, handle, stream);
+  mlx::core::eval(y_a_pers);
+  mlx::core::eval(y_b_pers);
+
+  // Handle's MTLBuffer pointer must still be the same we observed
+  // before the calls — ICB replay depends on this invariant.
+  CHECK(handle->mtl_buffer() == handle_mtl);
+
+  // Outputs must match the transient-AB reference bit-for-bit (same
+  // kernel, same inputs, same scalars — both paths write the same
+  // AB contents before dispatch).
+  CHECK(mlx::core::allclose(y_a_pers, y_a_ref, 0.0, 0.0).item<bool>());
+  CHECK(mlx::core::allclose(y_b_pers, y_b_ref, 0.0, 0.0).item<bool>());
+}
+
+TEST_CASE(
+    "persistent_ab: RMSNorm throws on mismatched handle slot count") {
+  if (!ab_env_on()) {
+    MESSAGE("skipping — AB path gated by MLX_METAL_AB=1 / MLX_METAL_ICB=1");
+    return;
+  }
+
+  auto stream = mlx::core::default_stream(mlx::core::Device::gpu);
+  auto& d = device(mlx::core::Device::gpu);
+
+  // Wrong layout — only 3 slots instead of 6.
+  auto handle = std::make_shared<PersistentAb>(
+      d,
+      std::vector<Slot>{
+          {Slot::Kind::BufferPtrOffset, 0, "x"},
+          {Slot::Kind::BufferPtrOffset, 0, "w"},
+          {Slot::Kind::BufferPtrOffset, 0, "out"},
+      });
+
+  auto x = mlx::core::ones({1, 1, 128}, mlx::core::float32, stream);
+  auto w = mlx::core::ones({128}, mlx::core::float32, stream);
+  mlx::core::eval(x);
+  mlx::core::eval(w);
+
+  auto y = mlx::core::fast::rms_norm(x, w, 1e-5f, handle, stream);
+  CHECK_THROWS_AS(mlx::core::eval(y), std::runtime_error);
 }

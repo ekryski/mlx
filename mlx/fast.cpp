@@ -120,6 +120,89 @@ array rms_norm(
   return fallback({x, passed_weight})[0];
 }
 
+array rms_norm(
+    const array& x,
+    const std::optional<array>& weight,
+    float eps,
+    std::shared_ptr<metal::PersistentAb> ab_handle,
+    StreamOrDevice s_ /* = {} */) {
+  // Handle-accepting overload. When ab_handle is null, delegates to
+  // the plain overload (unchanged behavior). Otherwise, constructs
+  // the RMSNorm primitive with the handle so its eval_gpu reuses
+  // the caller-owned AB instead of allocating a transient one.
+  //
+  // Validation + fallback identical to the plain rms_norm above;
+  // kept duplicated (rather than refactored into a shared helper)
+  // because this is the pilot and the duplication is localized.
+  if (ab_handle == nullptr) {
+    return rms_norm(x, weight, eps, s_);
+  }
+
+  bool has_weight = weight.has_value();
+
+  if (x.ndim() == 0) {
+    std::ostringstream msg;
+    msg << "[rms_norm] Input must have at least 1 dimension but got input with "
+           "0 dimensions.";
+    throw std::invalid_argument(msg.str());
+  }
+  if (has_weight) {
+    if ((*weight).ndim() != 1) {
+      std::ostringstream msg;
+      msg << "[rms_norm] (*weight) must have 1 dimension but has "
+          << (*weight).ndim() << " dimensions.";
+      throw std::invalid_argument(msg.str());
+    }
+    if ((*weight).size() != x.shape(-1)) {
+      std::ostringstream msg;
+      msg << "[rms_norm] (*weight) must have the same size as the last dimension of"
+             " x but has "
+          << (*weight).size() << " elements.";
+      throw std::invalid_argument(msg.str());
+    }
+  }
+
+  auto out_type = (weight.has_value()) ? result_type(x, (*weight)) : x.dtype();
+  if (!issubdtype(out_type, floating)) {
+    std::ostringstream msg;
+    msg << "[rms_norm] Received unsupported type " << out_type << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto s = to_stream(s_);
+  auto fallback =
+      [has_weight, eps, out_type, s](const std::vector<array>& inputs) {
+        auto x = astype(inputs[0], float32, s);
+        x = multiply(
+            x,
+            rsqrt(
+                add(mean(square(x, s), -1, /* keepdims */ true, s),
+                    array(eps, float32),
+                    s),
+                s),
+            s);
+        x = astype(x, out_type, s);
+
+        if (has_weight) {
+          x = multiply(x, inputs[1], s);
+        }
+
+        return std::vector<array>{x};
+      };
+
+  auto passed_weight =
+      (has_weight) ? astype(*weight, out_type, s) : array(1, out_type);
+
+  if (!RMSNorm::use_fallback(s)) {
+    return array(
+        x.shape(),
+        out_type,
+        std::make_shared<RMSNorm>(s, fallback, eps, std::move(ab_handle)),
+        {astype(x, out_type, s), passed_weight});
+  }
+  return fallback({x, passed_weight})[0];
+}
+
 array rms_norm_residual(
     const array& x,
     const array& residual,

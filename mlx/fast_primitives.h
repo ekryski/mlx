@@ -1,9 +1,14 @@
 // Copyright © 2024 Apple Inc.
 
+#include <memory>
 #include <optional>
 #include <variant>
 
 #include "mlx/primitives.h"
+
+namespace mlx::core::metal {
+class PersistentAb;
+} // namespace mlx::core::metal
 
 namespace mlx::core::fast {
 
@@ -41,8 +46,11 @@ class RMSNorm : public Custom {
   RMSNorm(
       Stream stream,
       std::function<std::vector<array>(std::vector<array>)> fallback,
-      float eps)
-      : Custom(stream, std::move(fallback)), eps_(eps) {}
+      float eps,
+      std::shared_ptr<metal::PersistentAb> ab_handle = nullptr)
+      : Custom(stream, std::move(fallback)),
+        eps_(eps),
+        ab_handle_(std::move(ab_handle)) {}
 
   static bool use_fallback(Stream stream);
 
@@ -67,8 +75,19 @@ class RMSNorm : public Custom {
     return std::make_pair(nullptr, eps_);
   }
 
+  // Caller-owned PersistentAb used in place of a transient AB during
+  // AB-path eval_gpu. nullptr means "allocate fresh transient AB"
+  // (unchanged pre-Option-A behavior). The layout must match the
+  // standard RMSNorm AB: 3 BufferPtrOffset (x/w/out) + Float32 (eps)
+  // + 2 Scalar32 (axis_size, w_stride). Not part of `is_equivalent`
+  // — same computation either way, just different eval storage.
+  const std::shared_ptr<metal::PersistentAb>& ab_handle() const {
+    return ab_handle_;
+  }
+
  private:
   float eps_;
+  std::shared_ptr<metal::PersistentAb> ab_handle_;
 };
 
 class RMSNormQuantizedGEMV : public Custom {
