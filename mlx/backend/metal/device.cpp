@@ -1,6 +1,8 @@
 // Copyright © 2023-2024 Apple Inc.
 
 #include <cstdlib>
+#include <os/log.h>
+#include <os/signpost.h>
 #include <sstream>
 
 #include <fmt/format.h>
@@ -28,6 +30,39 @@ struct hash<NS::SharedPtr<T>> {
 } // namespace std
 
 namespace mlx::core::metal {
+
+// ─────────────────────────────────────────────────────────────────────
+// os_signpost — per-kernel-dispatch tracing (opt-in)
+// ─────────────────────────────────────────────────────────────────────
+//
+// Gated on `MLX_METAL_PROFILE=1`. When unset, `signpost_log()` returns
+// `OS_LOG_DISABLED` — `os_signpost_*` calls against that handle
+// short-circuit on a kernel-level atomic check and never touch the
+// trace buffer. Overhead when off: one branch on `OS_LOG_DISABLED`.
+//
+// Subsystem `ai.mlx.metal`, category `PointsOfInterest`. Each kernel
+// dispatch produces an interval labelled with the compute pipeline's
+// `label()`, which Instruments Metal System Trace cross-references
+// against the GPU-side kernel track so you can read CPU encoding and
+// GPU execution on the same timeline.
+os_log_t signpost_log() {
+  static os_log_t g_log = []() -> os_log_t {
+    const char* v = std::getenv("MLX_METAL_PROFILE");
+    if (v && v[0] == '1') {
+      return os_log_create("ai.mlx.metal", OS_LOG_CATEGORY_POINTS_OF_INTEREST);
+    }
+    return OS_LOG_DISABLED;
+  }();
+  return g_log;
+}
+
+bool signposts_enabled() {
+  static bool g_enabled = []() {
+    const char* v = std::getenv("MLX_METAL_PROFILE");
+    return v && v[0] == '1';
+  }();
+  return g_enabled;
+}
 
 namespace {
 
@@ -342,12 +377,39 @@ void CommandEncoder::maybeInsertBarrier() {
   next_outputs_.clear();
 }
 
+void CommandEncoder::set_compute_pipeline_state(
+    MTL::ComputePipelineState* kernel) {
+  get_command_encoder()->setComputePipelineState(kernel);
+  if (signposts_enabled()) {
+    // Open a `kernel_dispatch` interval for this CPU encoding
+    // window (set_compute_pipeline_state → set_buffer(s) →
+    // dispatch_*). The dispatch_* call closes it. Label comes from
+    // the pipeline state's debug name — set by `get_kernel` when
+    // the PSO was first compiled, so every dispatch is self-
+    // identifying in Instruments.
+    auto log = signpost_log();
+    cur_dispatch_signpost_id_ = os_signpost_id_generate(log);
+    const char* name = device_.pso_name(kernel);
+    os_signpost_interval_begin(
+        log,
+        cur_dispatch_signpost_id_,
+        "kernel_dispatch",
+        "%{public}s",
+        name);
+  }
+}
+
 void CommandEncoder::dispatch_threadgroups(
     MTL::Size grid_dims,
     MTL::Size group_dims) {
   maybeInsertBarrier();
   buffer_ops_++;
   get_command_encoder()->dispatchThreadgroups(grid_dims, group_dims);
+  if (cur_dispatch_signpost_id_ != OS_SIGNPOST_ID_NULL) {
+    os_signpost_interval_end(
+        signpost_log(), cur_dispatch_signpost_id_, "kernel_dispatch");
+    cur_dispatch_signpost_id_ = OS_SIGNPOST_ID_NULL;
+  }
 }
 
 void CommandEncoder::dispatch_threads(
@@ -356,6 +418,11 @@ void CommandEncoder::dispatch_threads(
   maybeInsertBarrier();
   buffer_ops_++;
   get_command_encoder()->dispatchThreads(grid_dims, group_dims);
+  if (cur_dispatch_signpost_id_ != OS_SIGNPOST_ID_NULL) {
+    os_signpost_interval_end(
+        signpost_log(), cur_dispatch_signpost_id_, "kernel_dispatch");
+    cur_dispatch_signpost_id_ = OS_SIGNPOST_ID_NULL;
+  }
 }
 
 void CommandEncoder::barrier() {
@@ -755,8 +822,26 @@ MTL::ComputePipelineState* Device::get_kernel_(
 
   // Add kernel to cache
   kernel_map_.insert({hash_name, kernel});
+  // Index the raw PSO pointer against its hash name so the
+  // `os_signpost`-based kernel tracer in `CommandEncoder::
+  // set_compute_pipeline_state` can recover a human-readable label
+  // (metal-cpp exposes `label()` but no setter for PSOs, and the
+  // underlying API only accepts labels via the pipeline descriptor
+  // — which the simple `newComputePipelineState(function, ...)`
+  // path used above does not plumb through).
+  pso_names_[kernel.get()] = hash_name;
 
   return kernel.get();
+}
+
+const char* Device::pso_name(const MTL::ComputePipelineState* pso) const {
+  std::shared_lock lock(
+      const_cast<std::shared_mutex&>(kernel_mtx_));
+  auto it = pso_names_.find(pso);
+  if (it == pso_names_.end()) {
+    return "?";
+  }
+  return it->second.c_str();
 }
 
 MTL::ComputePipelineState* Device::get_kernel(
