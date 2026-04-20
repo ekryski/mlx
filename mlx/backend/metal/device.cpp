@@ -445,6 +445,19 @@ void CommandEncoder::end_encoding() {
   if (!encoder_) {
     return;
   }
+  // Signpost the full fence/completion-handler lifecycle. Fires on
+  // every compute-encoder boundary — barrier injection, command-
+  // buffer rotation (`needs_commit`), the `synchronize` call after
+  // a decode step, etc. Dispatch count varies by workload; typical
+  // decode pattern commits a new buffer every ~200 ops (M-series
+  // default `max_ops_per_buffer`), so end_encoding is called
+  // several times per token.
+  os_signpost_id_t sid = OS_SIGNPOST_ID_NULL;
+  if (signposts_enabled()) {
+    sid = os_signpost_id_generate(signpost_log());
+    os_signpost_interval_begin(
+        signpost_log(), sid, "end_encoding");
+  }
 
   // Remove temporaries from inputs and outputs.
   for (auto& t : temporaries_) {
@@ -496,6 +509,11 @@ void CommandEncoder::end_encoding() {
   next_outputs_.clear();
   concurrent_outputs_.clear();
   all_inputs_.clear();
+
+  if (sid != OS_SIGNPOST_ID_NULL) {
+    os_signpost_interval_end(
+        signpost_log(), sid, "end_encoding");
+  }
 }
 
 bool CommandEncoder::needs_commit() const {
@@ -504,13 +522,39 @@ bool CommandEncoder::needs_commit() const {
 }
 
 void CommandEncoder::commit() {
+  // Each `commit` submits the current MTLCommandBuffer to the queue
+  // and allocates a fresh one. On M-series hardware this is where
+  // Metal does internal command-buffer validation + scheduling —
+  // the cost is small but non-trivial (low tens of µs per call),
+  // and the per-token commit count is `ceil(dispatches / 200)` at
+  // the default `max_ops_per_buffer`, so it adds up on models with
+  // >500 dispatches per step.
+  os_signpost_id_t sid = OS_SIGNPOST_ID_NULL;
+  if (signposts_enabled()) {
+    sid = os_signpost_id_generate(signpost_log());
+    os_signpost_interval_begin(signpost_log(), sid, "commit");
+  }
   buffer_->commit();
   buffer_ = NS::RetainPtr(queue_->commandBufferWithUnretainedReferences());
   buffer_ops_ = 0;
   buffer_sizes_ = 0;
+  if (sid != OS_SIGNPOST_ID_NULL) {
+    os_signpost_interval_end(signpost_log(), sid, "commit");
+  }
 }
 
 void CommandEncoder::synchronize() {
+  // Wraps the CPU side of a full stream sync: end the current
+  // encoder, commit its command buffer, then block on
+  // `waitUntilCompleted`. The bulk of wall-clock time inside this
+  // span is the wait — often 10s of ms per call during decode
+  // loops that sync between steps. Visible under `ai.mlx.metal`
+  // with nested `end_encoding` + `commit` intervals for attribution.
+  os_signpost_id_t sid = OS_SIGNPOST_ID_NULL;
+  if (signposts_enabled()) {
+    sid = os_signpost_id_generate(signpost_log());
+    os_signpost_interval_begin(signpost_log(), sid, "synchronize");
+  }
   auto pool = new_scoped_memory_pool();
   auto cb = NS::RetainPtr(get_command_buffer());
   end_encoding();
@@ -523,6 +567,9 @@ void CommandEncoder::synchronize() {
               "[METAL] Command buffer execution failed: {}.",
               cb->error()->localizedDescription()->utf8String()));
     }
+  }
+  if (sid != OS_SIGNPOST_ID_NULL) {
+    os_signpost_interval_end(signpost_log(), sid, "synchronize");
   }
 }
 
