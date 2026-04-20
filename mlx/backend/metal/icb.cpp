@@ -348,6 +348,19 @@ void IndirectCommandRecorder::finalize() {
     }
   }
 
+  // Build the union of every segment's resource_set so replay can
+  // issue one `useResource` per unique buffer instead of
+  // (segments × resource_set-size) calls. On GPT-OSS 20B with ~650
+  // segments and ~5-15 buffers/segment, this collapses ~6 500
+  // per-replay-step Metal API calls to a few hundred.
+  std::unordered_set<const MTL::Buffer*> union_set;
+  for (const auto& seg : segments_) {
+    for (const auto* buf : seg.resource_set) {
+      union_set.insert(buf);
+    }
+  }
+  all_resources_.assign(union_set.begin(), union_set.end());
+
   finalized_ = true;
 }
 
@@ -362,6 +375,12 @@ void IndirectCommandRecorder::replay(MTL::ComputeCommandEncoder* enc) const {
   }
 
   const auto usage = MTL::ResourceUsageRead | MTL::ResourceUsageWrite;
+  // `useResource` is encoder-scoped, so a single pass over the
+  // pre-computed union of every segment's resources is sufficient —
+  // no need to re-declare per segment.
+  for (const auto* buf : all_resources_) {
+    enc->useResource(buf, usage);
+  }
   bool any_emitted = false;
   for (const auto& seg : segments_) {
     if (seg.commands.empty() || !seg.icb) {
@@ -370,9 +389,6 @@ void IndirectCommandRecorder::replay(MTL::ComputeCommandEncoder* enc) const {
     if (any_emitted) {
       // Barrier between consecutive non-empty ICB segments.
       enc->memoryBarrier(MTL::BarrierScopeBuffers);
-    }
-    for (const auto* buf : seg.resource_set) {
-      enc->useResource(buf, usage);
     }
     enc->executeCommandsInBuffer(seg.icb.get(), NS::Range(0, seg.commands.size()));
     any_emitted = true;
@@ -437,12 +453,6 @@ void IndirectCommandRecorder::replay_with_overrides(
         "[metal::IndirectCommandRecorder] null encoder");
   }
 
-  // Per-segment additional-resource set for useResource. We must cover
-  // every override buffer on the live encoder even if it wasn't part of
-  // the original seg.resource_set.
-  std::vector<std::unordered_set<const MTL::Buffer*>> extra_resources(
-      segments_.size());
-
   // Apply overrides: for each (name, buffer, offset) triple, walk every
   // TagLocation registered under that name and rewrite the ICB's
   // indirect compute command's slot binding. Missing names are skipped
@@ -451,6 +461,11 @@ void IndirectCommandRecorder::replay_with_overrides(
     const char* v = std::getenv("MLX_ICB_OVERRIDE_TRACE");
     return v && v[0] == '1';
   }();
+  // Collect the unique set of override buffers we bind into the ICBs
+  // so we can call `useResource` on them once at replay time (in
+  // addition to the pre-computed `all_resources_` union). Sparse —
+  // typically only a handful of unique buffers per replay step.
+  std::unordered_set<const MTL::Buffer*> override_extra_buffers;
   for (const auto& [name_id, new_buf, new_offset] : overrides) {
     if (!new_buf) {
       throw std::invalid_argument(
@@ -467,6 +482,7 @@ void IndirectCommandRecorder::replay_with_overrides(
     if (it == tags_.end()) {
       continue;
     }
+    bool any_applied = false;
     for (const auto& loc : it->second) {
       auto& seg = segments_[loc.segment_idx];
       if (!seg.icb) {
@@ -478,13 +494,29 @@ void IndirectCommandRecorder::replay_with_overrides(
           new_buf,
           static_cast<NS::UInteger>(new_offset),
           loc.slot);
-      extra_resources[loc.segment_idx].insert(new_buf);
+      any_applied = true;
+    }
+    if (any_applied) {
+      override_extra_buffers.insert(new_buf);
     }
   }
 
-  // Replay — identical structure to replay() but unions in the
-  // per-segment override buffers when calling useResource.
+  // One-shot useResource sweep across the union of record-time
+  // resources and this step's overrides. Metal's useResource is
+  // encoder-scoped, so per-segment redeclaration isn't needed —
+  // this collapses what used to be ~segments × resource-set-size
+  // calls (≈ 6.5k on GPT-OSS 20B) into one pass over a few hundred
+  // unique buffers.
   const auto usage = MTL::ResourceUsageRead | MTL::ResourceUsageWrite;
+  for (const auto* buf : all_resources_) {
+    enc->useResource(buf, usage);
+  }
+  for (const auto* buf : override_extra_buffers) {
+    // all_resources_ already covers record-time bindings; only call
+    // here for buffers the caller introduced via overrides.
+    enc->useResource(buf, usage);
+  }
+
   bool any_emitted = false;
   for (size_t si = 0; si < segments_.size(); ++si) {
     const auto& seg = segments_[si];
@@ -493,12 +525,6 @@ void IndirectCommandRecorder::replay_with_overrides(
     }
     if (any_emitted) {
       enc->memoryBarrier(MTL::BarrierScopeBuffers);
-    }
-    for (const auto* buf : seg.resource_set) {
-      enc->useResource(buf, usage);
-    }
-    for (const auto* buf : extra_resources[si]) {
-      enc->useResource(buf, usage);
     }
     enc->executeCommandsInBuffer(seg.icb.get(), NS::Range(0, seg.commands.size()));
     any_emitted = true;

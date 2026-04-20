@@ -205,6 +205,14 @@ class MLX_API IndirectCommandRecorder {
     std::unordered_set<const MTL::Buffer*> resource_set;
   };
 
+  // Union of every segment's `resource_set`, built at finalize().
+  // Used at replay time to call `useResource` once per unique
+  // buffer on the live encoder (Metal's useResource is encoder-
+  // scoped, not per-dispatch, so per-segment iteration is
+  // redundant and paid many thousand API calls per decode step on
+  // models like GPT-OSS 20B with ~650 segments).
+  std::vector<const MTL::Buffer*> all_resources_;
+
   // Builds the descriptor and allocates the ICB for a segment, given its
   // known command count.
   NS::SharedPtr<MTL::IndirectCommandBuffer> allocate_icb_(size_t max_commands);
