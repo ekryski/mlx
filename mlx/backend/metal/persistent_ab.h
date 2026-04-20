@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include <Metal/Metal.hpp>
+#include <cstdint>
 #include <vector>
 
 #include "mlx/api.h"
@@ -72,8 +74,39 @@ class MLX_API PersistentAb {
   const std::vector<ArgumentBuffer::Slot>& layout() const;
   size_t size_bytes() const;
 
+  // ─────────────────────────────────────────────────────────────────
+  // Side-channel scalar buffer (for per-step values lifted out of AB)
+  // ─────────────────────────────────────────────────────────────────
+  //
+  // Small 4-byte MTLBuffer that a primitive can bind at a direct
+  // kernel slot (e.g. SDPA N). Callers overwrite the contents from
+  // CPU before each dispatch; at ICB replay the orchestrator swaps
+  // the binding to a fresh MLXArray via the tag-override path, so
+  // this buffer's contents only matter during record (and live
+  // non-ICB dispatches). Allocated lazily on first access — handles
+  // that don't need it pay nothing.
+  MTL::Buffer* scalar_buffer(Device& d);
+
+  // Write a uint32 into the scalar side-buffer. Allocates on first
+  // call.
+  void set_scalar_u32(Device& d, uint32_t value);
+
+  // Binding-name tag used with `CommandEncoder::tag_binding` at
+  // record time so the orchestrator can override this scalar
+  // buffer's binding per step via name_id lookup. Zero means "not
+  // registered" (no auto-tagging during record). Set once at
+  // handle construction; read during eval_gpu.
+  uint32_t scalar_binding_name() const {
+    return scalar_binding_name_;
+  }
+  void set_scalar_binding_name(uint32_t name_id) {
+    scalar_binding_name_ = name_id;
+  }
+
  private:
   ArgumentBuffer ab_;
+  NS::SharedPtr<MTL::Buffer> scalar_buffer_;
+  uint32_t scalar_binding_name_ = 0;
 };
 
 } // namespace mlx::core::metal

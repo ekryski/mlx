@@ -179,12 +179,16 @@ void RoPE::eval_gpu(
     auto& in_array = donated ? out : in;
     const auto& persistent_handle = ab_handle();
 
+    // NOTE: as of the persistent-AB refactor 2026-04-20, `offset` is
+    // lifted out of the AB and bound directly at kernel slot 1. The
+    // decode-loop orchestrator tags the offset buffer and overrides
+    // slot 1 per replay step via `replay(overrides:)`, race-free
+    // with in-flight GPU work.
     if (with_freqs) {
       auto& freqs = inputs[2];
       const std::vector<Slot> slot_layout{
           {Slot::Kind::BufferPtrOffset, 0, "in"},
           {Slot::Kind::BufferPtrOffset, 0, "out"},
-          {Slot::Kind::BufferPtrOffset, 0, "offset"},
           {Slot::Kind::Float32, 0, "scale"},
           {Slot::Kind::Scalar64, 0, "stride"},
           {Slot::Kind::BufferPtrOffset, 0, "freqs"},
@@ -200,17 +204,13 @@ void RoPE::eval_gpu(
             1,
             static_cast<const MTL::Buffer*>(out.buffer().ptr()),
             out.offset());
+        target.set_float32(2, scale_);
+        target.set_scalar64(3, static_cast<uint64_t>(out_strides[0]));
         target.set_buffer_ptr(
-            2,
-            static_cast<const MTL::Buffer*>(offset.buffer().ptr()),
-            offset.offset());
-        target.set_float32(3, scale_);
-        target.set_scalar64(4, static_cast<uint64_t>(out_strides[0]));
-        target.set_buffer_ptr(
-            5,
+            4,
             static_cast<const MTL::Buffer*>(freqs.buffer().ptr()),
             freqs.offset());
-        target.set_scalar64(6, static_cast<uint64_t>(freqs.strides()[0]));
+        target.set_scalar64(5, static_cast<uint64_t>(freqs.strides()[0]));
       };
 
       MTL::Buffer* ab_mtl = nullptr;
@@ -220,7 +220,7 @@ void RoPE::eval_gpu(
         if (actual.size() != slot_layout.size()) {
           throw std::runtime_error(
               "[RoPE::eval_gpu] persistent AB handle has wrong slot "
-              "count for freqs path (expected 7, got " +
+              "count for freqs path (expected 6, got " +
               std::to_string(actual.size()) + ")");
         }
         populate(*persistent_handle);
@@ -242,7 +242,19 @@ void RoPE::eval_gpu(
         compute_encoder.tag_ab_binding(ab_mtl);
       }
 
+      // Auto-tag the offset buffer under the handle's registered
+      // binding name so the orchestrator can override slot 1 per
+      // replay step. Only during active ICB recording.
+      if (persistent_handle &&
+          persistent_handle->scalar_binding_name() != 0 &&
+          compute_encoder.is_recording()) {
+        compute_encoder.tag_binding(
+            persistent_handle->scalar_binding_name(),
+            static_cast<const MTL::Buffer*>(offset.buffer().ptr()));
+      }
+
       compute_encoder.set_buffer(ab_mtl, 0);
+      compute_encoder.set_input_array(offset, 1);
 
       uint32_t dim0 = dims_ / 2;
       auto group_dims = get_block_dims(dim0, N, 1);
@@ -256,7 +268,6 @@ void RoPE::eval_gpu(
       const std::vector<Slot> slot_layout{
           {Slot::Kind::BufferPtrOffset, 0, "in"},
           {Slot::Kind::BufferPtrOffset, 0, "out"},
-          {Slot::Kind::BufferPtrOffset, 0, "offset"},
           {Slot::Kind::Float32, 0, "scale"},
           {Slot::Kind::Scalar64, 0, "stride"},
           {Slot::Kind::Float32, 0, "base"},
@@ -271,13 +282,9 @@ void RoPE::eval_gpu(
             1,
             static_cast<const MTL::Buffer*>(out.buffer().ptr()),
             out.offset());
-        target.set_buffer_ptr(
-            2,
-            static_cast<const MTL::Buffer*>(offset.buffer().ptr()),
-            offset.offset());
-        target.set_float32(3, scale_);
-        target.set_scalar64(4, static_cast<uint64_t>(out_strides[0]));
-        target.set_float32(5, base);
+        target.set_float32(2, scale_);
+        target.set_scalar64(3, static_cast<uint64_t>(out_strides[0]));
+        target.set_float32(4, base);
       };
 
       MTL::Buffer* ab_mtl = nullptr;
@@ -287,7 +294,7 @@ void RoPE::eval_gpu(
         if (actual.size() != slot_layout.size()) {
           throw std::runtime_error(
               "[RoPE::eval_gpu] persistent AB handle has wrong slot "
-              "count for base path (expected 6, got " +
+              "count for base path (expected 5, got " +
               std::to_string(actual.size()) + ")");
         }
         populate(*persistent_handle);
@@ -306,7 +313,16 @@ void RoPE::eval_gpu(
         compute_encoder.tag_ab_binding(ab_mtl);
       }
 
+      if (persistent_handle &&
+          persistent_handle->scalar_binding_name() != 0 &&
+          compute_encoder.is_recording()) {
+        compute_encoder.tag_binding(
+            persistent_handle->scalar_binding_name(),
+            static_cast<const MTL::Buffer*>(offset.buffer().ptr()));
+      }
+
       compute_encoder.set_buffer(ab_mtl, 0);
+      compute_encoder.set_input_array(offset, 1);
 
       uint32_t dim0 = dims_ / 2;
       auto group_dims = get_block_dims(dim0, N, 1);

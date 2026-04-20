@@ -685,6 +685,11 @@ void sdpa_vector_unified(
     // its contents in place and bind — no add_temporary_object,
     // since the caller owns the handle lifetime. Otherwise allocate
     // a fresh transient AB (same as pre-Option-A behavior).
+    //
+    // NOTE: as of the persistent-AB refactor 2026-04-20, N (T_k) is
+    // NOT a slot in this AB. It's bound as a direct kernel buffer at
+    // slot 1 so the decode-loop orchestrator can override it
+    // race-free via the tag-binding path. Slots below are rebased.
     using Slot = metal::ArgumentBuffer::Slot;
     const std::vector<Slot> slot_layout{
         {Slot::Kind::BufferPtrOffset, 0, "queries"},
@@ -699,7 +704,6 @@ void sdpa_vector_unified(
         {Slot::Kind::Scalar64, 0, "v_seq_stride"},
         {Slot::Kind::Float32, 0, "scale"},
         {Slot::Kind::Scalar32, 0, "gqa_factor"},
-        {Slot::Kind::Scalar32, 0, "N"},
         {Slot::Kind::Scalar32, 0, "blocks"},
         {Slot::Kind::Scalar32, 0, "mask_kv_seq_stride"},
         {Slot::Kind::Scalar32, 0, "mask_q_seq_stride"},
@@ -727,15 +731,15 @@ void sdpa_vector_unified(
         int32_t q_seq_stride = m.shape(2) > 1 ? m.strides(2) : 0;
         int32_t head_stride =
             m.shape(1) > 1 ? m.strides(1) : (m.shape(0) > 1 ? m.strides(0) : 0);
-        target.set_scalar32(14, static_cast<uint32_t>(kv_seq_stride));
-        target.set_scalar32(15, static_cast<uint32_t>(q_seq_stride));
-        target.set_scalar32(16, static_cast<uint32_t>(head_stride));
+        target.set_scalar32(13, static_cast<uint32_t>(kv_seq_stride));
+        target.set_scalar32(14, static_cast<uint32_t>(q_seq_stride));
+        target.set_scalar32(15, static_cast<uint32_t>(head_stride));
       }
       if (has_sinks) {
         const auto& sn = *sinks;
         target.set_buffer_ptr(
             5, static_cast<const MTL::Buffer*>(sn.buffer().ptr()), sn.offset());
-        target.set_scalar32(17, static_cast<uint32_t>(q.shape(1)));
+        target.set_scalar32(16, static_cast<uint32_t>(q.shape(1)));
       }
       target.set_scalar64(6, static_cast<uint64_t>(k_head_stride));
       target.set_scalar64(7, static_cast<uint64_t>(k_seq_stride));
@@ -743,20 +747,26 @@ void sdpa_vector_unified(
       target.set_scalar64(9, static_cast<uint64_t>(v_seq_stride));
       target.set_float32(10, scale);
       target.set_scalar32(11, static_cast<uint32_t>(gqa_factor));
-      target.set_scalar32(12, static_cast<uint32_t>(N));
-      target.set_scalar32(13, static_cast<uint32_t>(blocks));
+      target.set_scalar32(12, static_cast<uint32_t>(blocks));
     };
 
     MTL::Buffer* ab_mtl = nullptr;
+    MTL::Buffer* n_buf = nullptr;
     if (ab_handle) {
       if (ab_handle->layout().size() != slot_layout.size()) {
         throw std::runtime_error(
             "[sdpa_vector_unified] persistent AB handle has wrong slot "
-            "count (expected 18, got " +
+            "count (expected 17, got " +
             std::to_string(ab_handle->layout().size()) + ")");
       }
       populate(*ab_handle);
       ab_mtl = ab_handle->mtl_buffer();
+      // Per-step N (T_k) via handle-owned 4-byte shared buffer.
+      // Write current N value; the decode-loop orchestrator rebinds
+      // this slot to a fresh MLXArray per replay step via the
+      // tag-binding override mechanism.
+      ab_handle->set_scalar_u32(d, static_cast<uint32_t>(N));
+      n_buf = ab_handle->scalar_buffer(d);
     } else {
       auto ab = std::make_shared<metal::ArgumentBuffer>(d, slot_layout);
       populate(*ab);
@@ -779,7 +789,26 @@ void sdpa_vector_unified(
     if (has_sinks) compute_encoder.register_input_array(*sinks);
     compute_encoder.register_output_array(out);
 
+    // Auto-tag the handle's N-buffer under the registered binding
+    // name so the orchestrator can override slot 1 per step. Only
+    // during active ICB recording — tag_binding throws otherwise.
+    if (ab_handle && ab_handle->scalar_binding_name() != 0 &&
+        compute_encoder.is_recording()) {
+      compute_encoder.tag_binding(
+          ab_handle->scalar_binding_name(), n_buf);
+    }
+
     compute_encoder.set_buffer(ab_mtl, 0);
+    if (ab_handle) {
+      // Persistent path: bind the handle's stable N-buffer at slot 1.
+      compute_encoder.set_buffer(n_buf, 1);
+    } else {
+      // Transient path: inline-spill N into the arena at slot 1.
+      // No tagging needed — transient ABs are rebuilt per step via
+      // build-only sessions, which regenerates N each time.
+      uint32_t N_u32 = static_cast<uint32_t>(N);
+      compute_encoder.set_bytes(N_u32, 1);
+    }
     compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
   } else {
     // Phase 1 non-AB body — preserved as an internal debug escape

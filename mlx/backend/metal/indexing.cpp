@@ -173,9 +173,11 @@ void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
       compute_encoder.set_compute_pipeline_state(kernel);
 
       using Slot = metal::ArgumentBuffer::Slot;
+      // 4-slot layout — indices lifted out of the AB to kernel slot 1
+      // so the decode-loop orchestrator can override it race-free
+      // per step via the tag-binding path.
       const std::vector<Slot> slot_layout{
           {Slot::Kind::BufferPtrOffset, 0, "src"},
-          {Slot::Kind::BufferPtrOffset, 0, "indices"},
           {Slot::Kind::BufferPtrOffset, 0, "out"},
           {Slot::Kind::Scalar64, 0, "stride"},
           {Slot::Kind::Scalar32, 0, "size"},
@@ -183,8 +185,9 @@ void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
 
       // If the decode-loop orchestrator handed us a PersistentAb,
       // populate ITS storage and bind its stable MTLBuffer instead of
-      // allocating a transient. That lets the caller retarget slot 1
-      // (indices buffer ptr) between ICB replays without re-recording.
+      // allocating a transient. The handle's own MTLBuffer is stable
+      // across replays; the per-step indices pointer is overridden
+      // at slot 1 via tag_binding.
       metal::PersistentAb* persistent =
           consume_next_gather_front_persistent_ab();
       auto populate = [&](auto& target) {
@@ -194,14 +197,10 @@ void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
             src.offset());
         target.set_buffer_ptr(
             1,
-            static_cast<const MTL::Buffer*>(indices.buffer().ptr()),
-            indices.offset());
-        target.set_buffer_ptr(
-            2,
             static_cast<const MTL::Buffer*>(out.buffer().ptr()),
             out.offset());
-        target.set_scalar64(3, static_cast<uint64_t>(slice_size));
-        target.set_scalar32(4, static_cast<uint32_t>(src.shape(0)));
+        target.set_scalar64(2, static_cast<uint64_t>(slice_size));
+        target.set_scalar32(3, static_cast<uint32_t>(src.shape(0)));
       };
 
       MTL::Buffer* ab_mtl = nullptr;
@@ -211,7 +210,7 @@ void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
         if (actual.size() != slot_layout.size()) {
           throw std::runtime_error(
               "[Gather::eval_gpu] persistent gather_front AB handle has "
-              "wrong slot count (expected 5, got " +
+              "wrong slot count (expected 4, got " +
               std::to_string(actual.size()) + ")");
         }
         populate(*persistent);
@@ -243,7 +242,18 @@ void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
         compute_encoder.tag_ab_binding(ab_mtl);
       }
 
+      // Auto-tag the indices buffer under the persistent handle's
+      // registered binding name so the orchestrator can override
+      // slot 1 (the per-step input token) per replay step.
+      if (persistent && persistent->scalar_binding_name() != 0 &&
+          compute_encoder.is_recording()) {
+        compute_encoder.tag_binding(
+            persistent->scalar_binding_name(),
+            static_cast<const MTL::Buffer*>(indices.buffer().ptr()));
+      }
+
       compute_encoder.set_buffer(ab_mtl, 0);
+      compute_encoder.set_input_array(indices, 1);
       compute_encoder.dispatch_threads(grid_dims, group_dims);
       if (transient) {
         compute_encoder.add_temporary_object(

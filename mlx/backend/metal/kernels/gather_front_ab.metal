@@ -15,13 +15,18 @@
 #include "mlx/backend/metal/kernels/indexing/indexing.h"
 
 // Byte layout — must match the ArgumentBuffer slot ordering
-// declared in `Gather::eval_gpu`'s AB branch:
+// declared in `Gather::eval_gpu`'s AB branch.
+//
+// NOTE: as of the persistent-AB refactor 2026-04-20, `indices` is
+// NOT a slot in the AB. It's bound as a direct kernel buffer at
+// slot 1 so the decode-loop orchestrator can override it race-free
+// via the tag-binding path.
+//
 //   [ 0..15] src     : BufferPtrOffset  (device T*)
-//   [16..31] indices : BufferPtrOffset  (device IdxT*)
-//   [32..47] out     : BufferPtrOffset  (device T*)
-//   [48..55] stride  : int64
-//   [56..59] size    : int
-//   [60..63] _pad    : uint32  (round to 16-byte multiple)
+//   [16..31] out     : BufferPtrOffset  (device T*)
+//   [32..39] stride  : int64
+//   [40..43] size    : int
+//   [44..47] _pad    : uint32  (round to 16-byte multiple)
 struct BufferPtrOffset {
   uint64_t addr;
   uint64_t offset;
@@ -29,7 +34,6 @@ struct BufferPtrOffset {
 
 struct GatherFrontArgs {
   BufferPtrOffset src;
-  BufferPtrOffset indices;
   BufferPtrOffset out;
   int64_t stride;
   int size;
@@ -39,13 +43,11 @@ struct GatherFrontArgs {
 template <typename T, typename IdxT, typename LocT, int N>
 [[kernel]] void gather_front_ab(
     constant const GatherFrontArgs& args [[buffer(0)]],
+    const device IdxT* indices [[buffer(1)]],
     uint2 index [[thread_position_in_grid]],
     uint2 grid_dim [[threads_per_grid]]) {
   const device T* src =
       reinterpret_cast<const device T*>(args.src.addr + args.src.offset);
-  const device IdxT* indices =
-      reinterpret_cast<const device IdxT*>(
-          args.indices.addr + args.indices.offset);
   device T* out =
       reinterpret_cast<device T*>(args.out.addr + args.out.offset);
 

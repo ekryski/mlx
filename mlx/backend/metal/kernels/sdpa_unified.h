@@ -234,17 +234,21 @@ struct SdpaUnifiedArgs {
   uint64_t v_seq_stride;            // 120
   float scale;                      // 128
   uint gqa_factor;                  // 132
-  uint N;                           // 136
-  uint blocks;                      // 140  reserved; currently always 1
-  uint mask_kv_seq_stride;          // 144  valid when u_has_mask
-  uint mask_q_seq_stride;           // 148
-  uint mask_head_stride;            // 152
-  uint num_q_heads;                 // 156  valid when u_has_sinks
-}; // sizeof == 160
+  // N (T_k) was packed here historically; it now lives in a
+  // separate buffer bound at kernel slot 1 so the decode-loop
+  // orchestrator can rewrite it per step via the tag-binding
+  // override path (race-free across CPU/GPU).
+  uint blocks;                      // 136  reserved; currently always 1
+  uint mask_kv_seq_stride;          // 140  valid when u_has_mask
+  uint mask_q_seq_stride;           // 144
+  uint mask_head_stride;            // 148
+  uint num_q_heads;                 // 152  valid when u_has_sinks
+}; // sizeof == 156
 
 template <typename T, int D, int V = D>
 [[kernel]] void sdpa_unified_vector_ab(
     constant const SdpaUnifiedArgs& args [[buffer(0)]],
+    constant const uint& N_arg [[buffer(1)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -277,7 +281,12 @@ template <typename T, int D, int V = D>
   }
 
   const int gqa_factor = int(args.gqa_factor);
-  const int N = int(args.N);
+  // N (T_k) is sourced from a separate kernel buffer, not from
+  // the AB. The decode-loop orchestrator overrides this buffer
+  // per step while GPU is still reading step N-1's bind — the
+  // completion handler keeps the stale buffer alive. See
+  // `persistent-ab-refactor-2026-04-20.md` for the race analysis.
+  const int N = int(N_arg);
   const size_t k_head_stride = size_t(args.k_head_stride);
   const size_t k_seq_stride = size_t(args.k_seq_stride);
   const size_t v_head_stride = size_t(args.v_head_stride);

@@ -18,25 +18,27 @@ constant bool traditional [[function_constant(2)]];
 // ArgumentBuffer slot ordering declared by RoPE::eval_gpu for the AB
 // single-token branch.
 //
+// NOTE: as of the persistent-AB refactor 2026-04-20, `offset` is
+// NOT a slot in the AB. It's bound as a direct kernel buffer at
+// slot 1 so the decode-loop orchestrator can override it race-free
+// via the tag-binding path.
+//
 // Non-freqs (passes `base` inline):
 //   [ 0..15] in     : BufferPtrOffset
 //   [16..31] out    : BufferPtrOffset
-//   [32..47] offset : BufferPtrOffset  (device int*)
-//   [48..51] scale  : float
-//   [52..55] _pad0  : uint32
-//   [56..63] stride : int64
-//   [64..67] base   : float
-//   [68..79] _pad1  : (round to 16-byte multiple)
+//   [32..35] scale  : float
+//   [36..39] _pad0  : uint32
+//   [40..47] stride : int64
+//   [48..51] base   : float
 //
 // Freqs (device-pointer to freqs table + freq_stride):
 //   [ 0..15] in           : BufferPtrOffset
 //   [16..31] out          : BufferPtrOffset
-//   [32..47] offset       : BufferPtrOffset
-//   [48..51] scale        : float
-//   [52..55] _pad0        : uint32
-//   [56..63] stride       : int64
-//   [64..79] freqs        : BufferPtrOffset
-//   [80..87] freq_stride  : int64
+//   [32..35] scale        : float
+//   [36..39] _pad0        : uint32
+//   [40..47] stride       : int64
+//   [48..63] freqs        : BufferPtrOffset
+//   [64..71] freq_stride  : int64
 struct BufferPtrOffset {
   uint64_t addr;
   uint64_t offset;
@@ -45,20 +47,15 @@ struct BufferPtrOffset {
 struct RopeSingleArgs {
   BufferPtrOffset in;
   BufferPtrOffset out;
-  BufferPtrOffset offset;
   float scale;
   uint _pad0;
   int64_t stride;
   float base;
-  uint _pad1a;
-  uint _pad1b;
-  uint _pad1c;
 };
 
 struct RopeSingleFreqsArgs {
   BufferPtrOffset in;
   BufferPtrOffset out;
-  BufferPtrOffset offset;
   float scale;
   uint _pad0;
   int64_t stride;
@@ -110,14 +107,13 @@ inline void rope_single_body(
 template <typename T>
 [[kernel]] void rope_ab_single(
     constant const RopeSingleArgs& args [[buffer(0)]],
+    const device int* offset_ptr [[buffer(1)]],
     uint2 pos [[thread_position_in_grid]],
     uint2 grid [[threads_per_grid]]) {
   const device T* in =
       reinterpret_cast<const device T*>(args.in.addr + args.in.offset);
   device T* out =
       reinterpret_cast<device T*>(args.out.addr + args.out.offset);
-  const device int* offset_ptr =
-      reinterpret_cast<const device int*>(args.offset.addr + args.offset.offset);
 
   float d = static_cast<float>(pos.x) / static_cast<float>(grid.x);
   float inv_freq = metal::exp2(-d * args.base);
@@ -129,14 +125,13 @@ template <typename T>
 template <typename T>
 [[kernel]] void rope_ab_single_freqs(
     constant const RopeSingleFreqsArgs& args [[buffer(0)]],
+    const device int* offset_ptr [[buffer(1)]],
     uint2 pos [[thread_position_in_grid]],
     uint2 grid [[threads_per_grid]]) {
   const device T* in =
       reinterpret_cast<const device T*>(args.in.addr + args.in.offset);
   device T* out =
       reinterpret_cast<device T*>(args.out.addr + args.out.offset);
-  const device int* offset_ptr =
-      reinterpret_cast<const device int*>(args.offset.addr + args.offset.offset);
   const device float* freqs =
       reinterpret_cast<const device float*>(args.freqs.addr + args.freqs.offset);
 
