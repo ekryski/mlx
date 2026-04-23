@@ -1,6 +1,8 @@
 // Copyright © 2023-2024 Apple Inc.
 
 #include <cstdlib>
+#include <os/log.h>
+#include <os/signpost.h>
 #include <sstream>
 
 #include <fmt/format.h>
@@ -28,6 +30,39 @@ struct hash<NS::SharedPtr<T>> {
 } // namespace std
 
 namespace mlx::core::metal {
+
+// ─────────────────────────────────────────────────────────────────────
+// os_signpost — per-kernel-dispatch tracing (opt-in)
+// ─────────────────────────────────────────────────────────────────────
+//
+// Gated on `MLX_METAL_PROFILE=1`. When unset, `signpost_log()` returns
+// `OS_LOG_DISABLED` — `os_signpost_*` calls against that handle
+// short-circuit on a kernel-level atomic check and never touch the
+// trace buffer. Overhead when off: one branch on `OS_LOG_DISABLED`.
+//
+// Subsystem `ai.mlx.metal`, category `PointsOfInterest`. Each kernel
+// dispatch produces an interval labelled with the compute pipeline's
+// `label()`, which Instruments Metal System Trace cross-references
+// against the GPU-side kernel track so you can read CPU encoding and
+// GPU execution on the same timeline.
+os_log_t signpost_log() {
+  static os_log_t g_log = []() -> os_log_t {
+    const char* v = std::getenv("MLX_METAL_PROFILE");
+    if (v && v[0] == '1') {
+      return os_log_create("ai.mlx.metal", OS_LOG_CATEGORY_POINTS_OF_INTEREST);
+    }
+    return OS_LOG_DISABLED;
+  }();
+  return g_log;
+}
+
+bool signposts_enabled() {
+  static bool g_enabled = []() {
+    const char* v = std::getenv("MLX_METAL_PROFILE");
+    return v && v[0] == '1';
+  }();
+  return g_enabled;
+}
 
 namespace {
 
@@ -349,6 +384,28 @@ void CommandEncoder::maybeInsertBarrier() {
   next_outputs_.clear();
 }
 
+void CommandEncoder::set_compute_pipeline_state(
+    MTL::ComputePipelineState* kernel) {
+  get_command_encoder()->setComputePipelineState(kernel);
+  if (signposts_enabled()) {
+    // Open a `kernel_dispatch` interval for this CPU encoding
+    // window (set_compute_pipeline_state → set_buffer(s) →
+    // dispatch_*). The dispatch_* call closes it. Label comes from
+    // the pipeline state's debug name — set by `get_kernel` when
+    // the PSO was first compiled, so every dispatch is self-
+    // identifying in Instruments.
+    auto log = signpost_log();
+    cur_dispatch_signpost_id_ = os_signpost_id_generate(log);
+    const char* name = device_.pso_name(kernel);
+    os_signpost_interval_begin(
+        log,
+        cur_dispatch_signpost_id_,
+        "kernel_dispatch",
+        "%{public}s",
+        name);
+  }
+}
+
 void CommandEncoder::dispatch_threadgroups(
     MTL::Size grid_dims,
     MTL::Size group_dims) {
@@ -356,6 +413,11 @@ void CommandEncoder::dispatch_threadgroups(
   buffer_ops_++;
   total_dispatches_++;
   get_command_encoder()->dispatchThreadgroups(grid_dims, group_dims);
+  if (cur_dispatch_signpost_id_ != OS_SIGNPOST_ID_NULL) {
+    os_signpost_interval_end(
+        signpost_log(), cur_dispatch_signpost_id_, "kernel_dispatch");
+    cur_dispatch_signpost_id_ = OS_SIGNPOST_ID_NULL;
+  }
 }
 
 void CommandEncoder::dispatch_threads(
@@ -365,6 +427,11 @@ void CommandEncoder::dispatch_threads(
   buffer_ops_++;
   total_dispatches_++;
   get_command_encoder()->dispatchThreads(grid_dims, group_dims);
+  if (cur_dispatch_signpost_id_ != OS_SIGNPOST_ID_NULL) {
+    os_signpost_interval_end(
+        signpost_log(), cur_dispatch_signpost_id_, "kernel_dispatch");
+    cur_dispatch_signpost_id_ = OS_SIGNPOST_ID_NULL;
+  }
 }
 
 void CommandEncoder::reset_dispatch_counter() {
@@ -394,6 +461,19 @@ void CommandEncoder::end_encoding() {
   //   outputs since they don't need synchronization.
   if (!encoder_) {
     return;
+  }
+  // Signpost the full fence/completion-handler lifecycle. Fires on
+  // every compute-encoder boundary — barrier injection, command-
+  // buffer rotation (`needs_commit`), the `synchronize` call after
+  // a decode step, etc. Dispatch count varies by workload; typical
+  // decode pattern commits a new buffer every ~200 ops (M-series
+  // default `max_ops_per_buffer`), so end_encoding is called
+  // several times per token.
+  os_signpost_id_t sid = OS_SIGNPOST_ID_NULL;
+  if (signposts_enabled()) {
+    sid = os_signpost_id_generate(signpost_log());
+    os_signpost_interval_begin(
+        signpost_log(), sid, "end_encoding");
   }
 
   // Remove temporaries from inputs and outputs.
@@ -446,6 +526,11 @@ void CommandEncoder::end_encoding() {
   next_outputs_.clear();
   concurrent_outputs_.clear();
   all_inputs_.clear();
+
+  if (sid != OS_SIGNPOST_ID_NULL) {
+    os_signpost_interval_end(
+        signpost_log(), sid, "end_encoding");
+  }
 }
 
 bool CommandEncoder::needs_commit() const {
@@ -458,14 +543,40 @@ bool CommandEncoder::needs_commit() const {
 }
 
 void CommandEncoder::commit() {
+  // Each `commit` submits the current MTLCommandBuffer to the queue
+  // and allocates a fresh one. On M-series hardware this is where
+  // Metal does internal command-buffer validation + scheduling —
+  // the cost is small but non-trivial (low tens of µs per call),
+  // and the per-token commit count is `ceil(dispatches / 200)` at
+  // the default `max_ops_per_buffer`, so it adds up on models with
+  // >500 dispatches per step.
+  os_signpost_id_t sid = OS_SIGNPOST_ID_NULL;
+  if (signposts_enabled()) {
+    sid = os_signpost_id_generate(signpost_log());
+    os_signpost_interval_begin(signpost_log(), sid, "commit");
+  }
   buffer_->commit();
   buffer_ = NS::RetainPtr(queue_->commandBufferWithUnretainedReferences());
   buffer_ops_ = 0;
   buffer_input_sizes_ = 0;
   buffer_output_sizes_ = 0;
+  if (sid != OS_SIGNPOST_ID_NULL) {
+    os_signpost_interval_end(signpost_log(), sid, "commit");
+  }
 }
 
 void CommandEncoder::synchronize() {
+  // Wraps the CPU side of a full stream sync: end the current
+  // encoder, commit its command buffer, then block on
+  // `waitUntilCompleted`. The bulk of wall-clock time inside this
+  // span is the wait — often 10s of ms per call during decode
+  // loops that sync between steps. Visible under `ai.mlx.metal`
+  // with nested `end_encoding` + `commit` intervals for attribution.
+  os_signpost_id_t sid = OS_SIGNPOST_ID_NULL;
+  if (signposts_enabled()) {
+    sid = os_signpost_id_generate(signpost_log());
+    os_signpost_interval_begin(signpost_log(), sid, "synchronize");
+  }
   auto pool = new_scoped_memory_pool();
   auto cb = NS::RetainPtr(get_command_buffer());
   end_encoding();
@@ -478,6 +589,9 @@ void CommandEncoder::synchronize() {
               "[METAL] Command buffer execution failed: {}.",
               cb->error()->localizedDescription()->utf8String()));
     }
+  }
+  if (sid != OS_SIGNPOST_ID_NULL) {
+    os_signpost_interval_end(signpost_log(), sid, "synchronize");
   }
 }
 
@@ -784,8 +898,26 @@ MTL::ComputePipelineState* Device::get_kernel_(
 
   // Add kernel to cache
   kernel_map_.insert({hash_name, kernel});
+  // Index the raw PSO pointer against its hash name so the
+  // `os_signpost`-based kernel tracer in `CommandEncoder::
+  // set_compute_pipeline_state` can recover a human-readable label
+  // (metal-cpp exposes `label()` but no setter for PSOs, and the
+  // underlying API only accepts labels via the pipeline descriptor
+  // — which the simple `newComputePipelineState(function, ...)`
+  // path used above does not plumb through).
+  pso_names_[kernel.get()] = hash_name;
 
   return kernel.get();
+}
+
+const char* Device::pso_name(const MTL::ComputePipelineState* pso) const {
+  std::shared_lock lock(
+      const_cast<std::shared_mutex&>(kernel_mtx_));
+  auto it = pso_names_.find(pso);
+  if (it == pso_names_.end()) {
+    return "?";
+  }
+  return it->second.c_str();
 }
 
 MTL::ComputePipelineState* Device::get_kernel(
