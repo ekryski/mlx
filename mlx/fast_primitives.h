@@ -227,6 +227,46 @@ class RMSNormResidual : public Custom {
   float eps_;
 };
 
+class GatherRMSNormQuantizedGEMV : public Custom {
+ public:
+  GatherRMSNormQuantizedGEMV(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      float eps,
+      int group_size,
+      int top_k)
+      : Custom(stream, std::move(fallback)),
+        eps_(eps),
+        group_size_(group_size),
+        top_k_(top_k) {}
+
+  static bool use_fallback(Stream stream);
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("NYI");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(GatherRMSNormQuantizedGEMV)
+  bool is_equivalent(const Primitive& other) const override;
+
+  // Output shape: [..., top_k, 1, N] — derived in fast.cpp at call site.
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    throw std::runtime_error("NYI");
+  }
+
+  auto state() const {
+    return std::make_tuple(nullptr, eps_, group_size_, top_k_);
+  }
+
+ private:
+  float eps_;
+  int group_size_;
+  int top_k_;
+};
+
 class FusedGateActivation : public Custom {
  public:
   FusedGateActivation(

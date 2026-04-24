@@ -403,6 +403,74 @@ bool RMSNormResidual::is_equivalent(const Primitive& other) const {
   return eps_ == r.eps_;
 }
 
+bool GatherRMSNormQuantizedGEMV::use_fallback(Stream s) {
+  // The Metal kernel is new and not yet verified; keep the fallback
+  // (rms_norm + gather_qmm) as the default until a correctness check
+  // passes.
+  const char* forceGPU = std::getenv("MLX_GATHER_RMS_NORM_QGEMV");
+  if (forceGPU && forceGPU[0] == '1') return false;
+  return true;
+}
+
+void GatherRMSNormQuantizedGEMV::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  auto& out = outputs[0];
+
+  const array& x = inputs[0];
+  const array& norm_weight = inputs[1];
+  const array& w = inputs[2];
+  const array& scales = inputs[3];
+  const array& biases = inputs[4];
+  const array& indices = inputs[5];
+
+  out.set_data(allocator::malloc(out.nbytes()));
+
+  int K = x.shape().back();  // in_vec_size
+  int N = w.shape(-2);       // out_vec_size
+  int B = x.ndim() >= 4 ? x.shape(0) : 1;
+  int total_slots = B * top_k_;
+
+  // Dispatch layout: grid (1, out_row_groups, total_slots), threadgroup
+  // (2 simds × 32 lanes, 1, 1). Each group handles 8 output rows.
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  const int outputs_per_group = num_simdgroups * results_per_simdgroup;  // 8
+  int n_row_groups = (N + outputs_per_group - 1) / outputs_per_group;
+
+  std::string kname = "gather_rms_norm_qgemv_" + type_to_name(out) + "_gs" +
+      std::to_string(group_size_);
+  auto kernel = d.get_kernel(kname);
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.set_compute_pipeline_state(kernel);
+  compute_encoder.set_input_array(x, 0);
+  compute_encoder.set_input_array(norm_weight, 1);
+  compute_encoder.set_input_array(w, 2);
+  compute_encoder.set_input_array(scales, 3);
+  compute_encoder.set_input_array(biases, 4);
+  compute_encoder.set_input_array(indices, 5);
+  compute_encoder.set_output_array(out, 6);
+  compute_encoder.set_bytes(eps_, 7);
+  compute_encoder.set_bytes(K, 8);
+  compute_encoder.set_bytes(N, 9);
+  compute_encoder.set_bytes(top_k_, 10);
+
+  // One threadgroup per (out_row_group, slot); 2 simds × 32 lanes each.
+  compute_encoder.dispatch_threads(
+      MTL::Size(num_simdgroups * 32, n_row_groups, total_slots),
+      MTL::Size(num_simdgroups * 32, 1, 1));
+}
+
+bool GatherRMSNormQuantizedGEMV::is_equivalent(const Primitive& other) const {
+  const GatherRMSNormQuantizedGEMV& r =
+      static_cast<const GatherRMSNormQuantizedGEMV&>(other);
+  return eps_ == r.eps_ && group_size_ == r.group_size_ &&
+         top_k_ == r.top_k_;
+}
+
 bool FusedGateActivation::use_fallback(Stream s) {
   return s.device == Device::cpu;
 }

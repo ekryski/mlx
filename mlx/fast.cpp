@@ -160,6 +160,97 @@ array rms_norm_residual(
        astype(weight, out_type, s)})[0];
 }
 
+// ============================================================================
+// Gather RMSNorm + Quantized GEMV for MoE
+// ============================================================================
+array gather_rms_norm_qgemv(
+    const array& x,
+    const array& norm_weight,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    const array& indices,
+    float eps,
+    int group_size,
+    StreamOrDevice s_) {
+  if (x.ndim() < 1) {
+    throw std::invalid_argument(
+        "[gather_rms_norm_qgemv] Input must have at least 1 dimension");
+  }
+  if (w.ndim() != 3) {
+    throw std::invalid_argument(
+        "[gather_rms_norm_qgemv] Weight must be 3D [E, N, K/pack]");
+  }
+  if (indices.ndim() < 1) {
+    throw std::invalid_argument(
+        "[gather_rms_norm_qgemv] Indices must have at least 1 dimension");
+  }
+
+  int K = x.shape().back();
+  int N = w.shape(-2);
+  int top_k = indices.shape(-1);
+  auto out_type = x.dtype();
+  if (!issubdtype(out_type, floating)) {
+    throw std::invalid_argument(
+        "[gather_rms_norm_qgemv] Input must be floating point");
+  }
+
+  auto s = to_stream(s_);
+
+  // Output shape: replace trailing K with [top_k, 1, N].
+  // Input x shape: [B, 1, 1, K] — we broadcast over top_k.
+  auto out_shape = x.shape();
+  out_shape.pop_back();  // drop K
+  // x already has trailing [..., 1, 1] so we end at [..., 1].
+  // Expected output: [B, top_k, 1, N]. Rebuild explicitly.
+  Shape new_shape;
+  if (x.ndim() >= 3) {
+    // Drop the last 3 dims ([1, 1, K]) and append [top_k, 1, N].
+    for (int i = 0; i + 3 < x.ndim(); ++i) new_shape.push_back(x.shape(i));
+  } else {
+    new_shape.push_back(1);  // B=1 implicit
+  }
+  new_shape.push_back(top_k);
+  new_shape.push_back(1);
+  new_shape.push_back(N);
+
+  // Fallback: rms_norm then gather_qmm.
+  auto fallback = [eps, group_size, s](const std::vector<array>& inputs) {
+    auto normed = rms_norm(inputs[0], inputs[1], eps, s);
+    auto out = gather_qmm(
+        normed, inputs[2], inputs[3], inputs[4],
+        /*lhs_indices=*/std::nullopt,
+        /*rhs_indices=*/std::optional<array>(inputs[5]),
+        /*transpose=*/true,
+        std::optional<int>(group_size),
+        std::optional<int>(4),
+        /*mode=*/"affine",
+        /*sorted_indices=*/false, s);
+    return std::vector<array>{out};
+  };
+
+  if (!GatherRMSNormQuantizedGEMV::use_fallback(s)) {
+    return array(
+        std::move(new_shape),
+        out_type,
+        std::make_shared<GatherRMSNormQuantizedGEMV>(
+            s, fallback, eps, group_size, top_k),
+        {astype(x, out_type, s),
+         astype(norm_weight, out_type, s),
+         w,
+         astype(scales, out_type, s),
+         astype(biases, out_type, s),
+         astype(indices, int32, s)});
+  }
+  return fallback(
+      {astype(x, out_type, s),
+       astype(norm_weight, out_type, s),
+       w,
+       astype(scales, out_type, s),
+       astype(biases, out_type, s),
+       astype(indices, int32, s)})[0];
+}
+
 array fused_gate_activation(
     const array& gate_up,
     int hidden_dims,

@@ -23,6 +23,29 @@ MLX_API array rms_norm_residual(
     float eps,
     StreamOrDevice s = {});
 
+/// Fused RMSNorm + gatherQuantizedMM for MoE decode.
+///
+/// Input shapes:
+/// - `x`: `[B, 1, 1, K]`
+/// - `norm_weight`: `[K]`
+/// - `w`: `[E, N, K / pack_factor]` (4-bit packed)
+/// - `scales`, `biases`: `[E, N, K / group_size]`
+/// - `indices`: `[B, top_k]`
+/// Output: `[B, top_k, 1, N]`.
+///
+/// Replaces the `rms_norm` + `gather_quantized_mm` pair used inside the
+/// MoE switch MLP's first projection at decode. 4-bit only.
+MLX_API array gather_rms_norm_qgemv(
+    const array& x,
+    const array& norm_weight,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    const array& indices,
+    float eps,
+    int group_size,
+    StreamOrDevice s = {});
+
 /// Fused dense gate+activation kernel.
 ///
 /// Input `gate_up` has shape `[..., 2 * hidden_dims]` (concat of gate and up).
