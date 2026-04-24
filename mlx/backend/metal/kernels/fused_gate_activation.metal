@@ -37,12 +37,24 @@ inline float gelu_approx_act(float x) {
   return 0.5f * x * (1.0f + metal::precise::tanh(inner));
 }
 
+// Clipped swiglu (GPT-OSS). Both halves are clipped to [-7, 7] first; the
+// gate side uses sigmoid(1.702·g); the up side has a +1 bias before the
+// multiply. Matches the `swiglu_gate` helper in warp_moe_gate_up.metal.
+inline float clipped_swiglu(float g, float u) {
+  g = metal::clamp(g, -7.0f, 7.0f);
+  u = metal::clamp(u, -7.0f, 7.0f);
+  float sig = 1.0f / (1.0f + metal::precise::exp(-1.702f * g));
+  return g * sig * (u + 1.0f);
+}
+
 template <int activation_type>
 inline float apply_gate(float g, float u) {
   if (activation_type == 0) {
     return silu_act(g) * u;
-  } else {
+  } else if (activation_type == 1) {
     return gelu_approx_act(g) * u;
+  } else {
+    return clipped_swiglu(g, u);
   }
 }
 
@@ -141,8 +153,10 @@ template <typename T, int activation_type, int N_READS = FUSED_GATE_N_READS>
 #define instantiate_fga(name, type)       \
   instantiate_fga_single(name, type, 0)   \
   instantiate_fga_single(name, type, 1)   \
+  instantiate_fga_single(name, type, 2)   \
   instantiate_fga_looped(name, type, 0)   \
-  instantiate_fga_looped(name, type, 1)
+  instantiate_fga_looped(name, type, 1)   \
+  instantiate_fga_looped(name, type, 2)
 
 instantiate_fga(float32, float)
 instantiate_fga(float16, half)

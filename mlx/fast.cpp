@@ -173,9 +173,9 @@ array fused_gate_activation(
     throw std::invalid_argument(
         "[fused_gate_activation] Last axis must equal 2 * hidden_dims");
   }
-  if (activation_type < 0 || activation_type > 1) {
+  if (activation_type < 0 || activation_type > 2) {
     throw std::invalid_argument(
-        "[fused_gate_activation] activation_type must be 0 (silu) or 1 (gelu_approx)");
+        "[fused_gate_activation] activation_type must be 0 (silu), 1 (gelu_approx), or 2 (clipped swiglu)");
   }
 
   auto out_type = gate_up.dtype();
@@ -196,7 +196,8 @@ array fused_gate_activation(
     if (activation_type == 0) {
       // silu(gate) = gate * sigmoid(gate)
       activated = multiply(gate, sigmoid(gate, s), s);
-    } else {
+      return std::vector<array>{multiply(activated, up, s)};
+    } else if (activation_type == 1) {
       // gelu_approx(gate) = 0.5 * gate * (1 + tanh(sqrt(2/pi) * (gate + 0.044715 * gate^3)))
       auto gate3 = multiply(multiply(gate, gate, s), gate, s);
       auto inner = multiply(
@@ -210,8 +211,19 @@ array fused_gate_activation(
               add(array(1.0f, gate.dtype()), tanh(inner, s), s),
               s),
           s);
+      return std::vector<array>{multiply(activated, up, s)};
+    } else {
+      // clipped swiglu (GPT-OSS): out = g·sigmoid(1.702·g)·(u + 1) with g, u clamped to [-7, 7]
+      auto seven = array(7.0f, gate.dtype());
+      auto neg_seven = array(-7.0f, gate.dtype());
+      auto g = minimum(maximum(gate, neg_seven, s), seven, s);
+      auto u = minimum(maximum(up, neg_seven, s), seven, s);
+      auto scaled = multiply(array(1.702f, gate.dtype()), g, s);
+      auto sig = sigmoid(scaled, s);
+      auto one = array(1.0f, gate.dtype());
+      return std::vector<array>{
+          multiply(multiply(g, sig, s), add(u, one, s), s)};
     }
-    return std::vector<array>{multiply(activated, up, s)};
   };
 
   auto out_shape = gate_up.shape();
