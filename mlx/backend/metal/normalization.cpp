@@ -424,24 +424,53 @@ void FusedGateActivation::eval_gpu(
   }
   array gate_up = no_copy ? gu_in : contiguous_copy_gpu(gu_in, s);
 
-  // Allocate output with its own buffer — kernel reads gate_up and writes out.
+  // Output buffer — distinct from input (output has half the size in the
+  // last axis). Donation is not possible because the allocation sizes
+  // differ.
   out.set_data(allocator::malloc(out.nbytes()));
 
   uint32_t hidden = static_cast<uint32_t>(hidden_dims_);
-  // Number of rows — total elements / (2 * hidden_dims) for gate_up.
   int n_rows = gate_up.data_size() / (2 * hidden);
 
-  std::string kname = "fused_gate_activation_" + type_to_name(out) + "_act" +
-      std::to_string(activation_type_);
-  auto kernel = d.get_kernel(kname);
+  constexpr int simd_size = 32;
+  constexpr int n_reads = 4;
 
-  // Threadgroup size — prefer up to hidden_dims, capped at kernel max.
-  size_t max_tg = kernel->maxTotalThreadsPerThreadgroup();
-  size_t threadgroup_size = std::min<size_t>(hidden, max_tg);
-  // Round to multiple of 32 for simdgroup alignment.
-  if (threadgroup_size > 32) {
-    threadgroup_size = (threadgroup_size / 32) * 32;
+  // Pick single-row vs looped based on whether one threadgroup's worth of
+  // threads (each handling n_reads elements) can cover hidden_dims.
+  std::string variant;
+  size_t threadgroup_size;
+  bool use_looped = false;
+
+  // Single-row requires ceil(hidden / n_reads) threads, rounded up to a
+  // multiple of simd_size, and must fit in maxTotalThreadsPerThreadgroup.
+  size_t threads_needed = (hidden + n_reads - 1) / n_reads;
+  size_t simds_needed = (threads_needed + simd_size - 1) / simd_size;
+  size_t single_row_tg = simd_size * simds_needed;
+
+  std::string kname_base =
+      "fused_gate_activation_" + std::string("") + type_to_name(out) + "_act" +
+      std::to_string(activation_type_);
+
+  // Probe a single-row kernel first; fall back to looped if TG exceeds max.
+  std::string single_row_name = "fused_gate_activation_single_row_" +
+      type_to_name(out) + "_act" + std::to_string(activation_type_);
+  auto single_row_kernel = d.get_kernel(single_row_name);
+  if (single_row_tg <= single_row_kernel->maxTotalThreadsPerThreadgroup()) {
+    threadgroup_size = single_row_tg;
+  } else {
+    use_looped = true;
   }
+
+  auto kernel = use_looped
+      ? d.get_kernel(
+            "fused_gate_activation_looped_" + type_to_name(out) + "_act" +
+            std::to_string(activation_type_))
+      : single_row_kernel;
+
+  if (use_looped) {
+    threadgroup_size = kernel->maxTotalThreadsPerThreadgroup();
+  }
+
   size_t n_threads = static_cast<size_t>(n_rows) * threadgroup_size;
 
   auto& compute_encoder = metal::get_command_encoder(s);
