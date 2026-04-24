@@ -23,6 +23,20 @@ MLX_API array rms_norm_residual(
     float eps,
     StreamOrDevice s = {});
 
+/// Fused dense gate+activation kernel.
+///
+/// Input `gate_up` has shape `[..., 2 * hidden_dims]` (concat of gate and up).
+/// Output has shape `[..., hidden_dims]` and equals `activation(gate) * up`.
+/// `activation_type`: 0 = silu, 1 = gelu_approx.
+///
+/// Collapses split + activation + multiply (4 Metal dispatches) into a
+/// single dispatch. Metal-only fast path.
+MLX_API array fused_gate_activation(
+    const array& gate_up,
+    int hidden_dims,
+    int activation_type,
+    StreamOrDevice s = {});
+
 MLX_API array rms_norm_rope(
     const array& x,
     const array& weight,
