@@ -160,6 +160,86 @@ array rms_norm_residual(
        astype(weight, out_type, s)})[0];
 }
 
+array fused_gate_activation(
+    const array& gate_up,
+    int hidden_dims,
+    int activation_type,
+    StreamOrDevice s_ /* = {} */) {
+  if (gate_up.ndim() < 1) {
+    throw std::invalid_argument(
+        "[fused_gate_activation] Input must have at least 1 dimension");
+  }
+  if (gate_up.shape().back() != 2 * hidden_dims) {
+    throw std::invalid_argument(
+        "[fused_gate_activation] Last axis must equal 2 * hidden_dims");
+  }
+  if (activation_type < 0 || activation_type > 2) {
+    throw std::invalid_argument(
+        "[fused_gate_activation] activation_type must be 0 (silu), 1 (gelu_approx), or 2 (clipped swiglu)");
+  }
+
+  auto out_type = gate_up.dtype();
+  if (!issubdtype(out_type, floating)) {
+    throw std::invalid_argument(
+        "[fused_gate_activation] Input must be floating point");
+  }
+
+  auto s = to_stream(s_);
+
+  // Fallback: split, apply activation on gate, multiply by up.
+  auto fallback = [hidden_dims, activation_type, s](
+                      const std::vector<array>& inputs) {
+    auto parts = split(inputs[0], 2, -1, s);
+    const auto& gate = parts[0];
+    const auto& up = parts[1];
+    array activated = gate;
+    if (activation_type == 0) {
+      // silu(gate) = gate * sigmoid(gate)
+      activated = multiply(gate, sigmoid(gate, s), s);
+      return std::vector<array>{multiply(activated, up, s)};
+    } else if (activation_type == 1) {
+      // gelu_approx(gate) = 0.5 * gate * (1 + tanh(sqrt(2/pi) * (gate + 0.044715 * gate^3)))
+      auto gate3 = multiply(multiply(gate, gate, s), gate, s);
+      auto inner = multiply(
+          array(0.7978845608f, gate.dtype()),
+          add(gate, multiply(array(0.044715f, gate.dtype()), gate3, s), s),
+          s);
+      activated = multiply(
+          array(0.5f, gate.dtype()),
+          multiply(
+              gate,
+              add(array(1.0f, gate.dtype()), tanh(inner, s), s),
+              s),
+          s);
+      return std::vector<array>{multiply(activated, up, s)};
+    } else {
+      // clipped swiglu (GPT-OSS): out = g·sigmoid(1.702·g)·(u + 1) with g, u clamped to [-7, 7]
+      auto seven = array(7.0f, gate.dtype());
+      auto neg_seven = array(-7.0f, gate.dtype());
+      auto g = minimum(maximum(gate, neg_seven, s), seven, s);
+      auto u = minimum(maximum(up, neg_seven, s), seven, s);
+      auto scaled = multiply(array(1.702f, gate.dtype()), g, s);
+      auto sig = sigmoid(scaled, s);
+      auto one = array(1.0f, gate.dtype());
+      return std::vector<array>{
+          multiply(multiply(g, sig, s), add(u, one, s), s)};
+    }
+  };
+
+  auto out_shape = gate_up.shape();
+  out_shape.back() = hidden_dims;
+
+  if (!FusedGateActivation::use_fallback(s)) {
+    return array(
+        std::move(out_shape),
+        out_type,
+        std::make_shared<FusedGateActivation>(
+            s, fallback, hidden_dims, activation_type),
+        {gate_up});
+  }
+  return fallback({gate_up})[0];
+}
+
 array rms_norm_rope(
     const array& x,
     const array& weight,

@@ -48,6 +48,7 @@ endfunction(build_kernel)
 
 build_kernel(arg_reduce)
 build_kernel(conv steel/conv/params.h)
+build_kernel(fused_gate_activation)
 build_kernel(gemv steel/utils.h)
 build_kernel(layer_norm)
 build_kernel(random)

@@ -403,6 +403,92 @@ bool RMSNormResidual::is_equivalent(const Primitive& other) const {
   return eps_ == r.eps_;
 }
 
+bool FusedGateActivation::use_fallback(Stream s) {
+  return s.device == Device::cpu;
+}
+
+void FusedGateActivation::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  auto& out = outputs[0];
+
+  // Ensure gate_up is contiguous in last dim.
+  const array& gu_in = inputs[0];
+  bool no_copy =
+      gu_in.flags().contiguous && gu_in.strides()[gu_in.ndim() - 1] == 1;
+  if (no_copy && gu_in.ndim() > 1) {
+    auto st = gu_in.strides()[gu_in.ndim() - 2];
+    no_copy &= (st == 0 || st == gu_in.shape().back() || gu_in.shape(-2) == 1);
+  }
+  array gate_up = no_copy ? gu_in : contiguous_copy_gpu(gu_in, s);
+
+  // Output buffer — distinct from input (output has half the size in the
+  // last axis). Donation is not possible because the allocation sizes
+  // differ.
+  out.set_data(allocator::malloc(out.nbytes()));
+
+  uint32_t hidden = static_cast<uint32_t>(hidden_dims_);
+  int n_rows = gate_up.data_size() / (2 * hidden);
+
+  constexpr int simd_size = 32;
+  constexpr int n_reads = 4;
+
+  // Pick single-row vs looped based on whether one threadgroup's worth of
+  // threads (each handling n_reads elements) can cover hidden_dims.
+  std::string variant;
+  size_t threadgroup_size;
+  bool use_looped = false;
+
+  // Single-row requires ceil(hidden / n_reads) threads, rounded up to a
+  // multiple of simd_size, and must fit in maxTotalThreadsPerThreadgroup.
+  size_t threads_needed = (hidden + n_reads - 1) / n_reads;
+  size_t simds_needed = (threads_needed + simd_size - 1) / simd_size;
+  size_t single_row_tg = simd_size * simds_needed;
+
+  std::string kname_base =
+      "fused_gate_activation_" + std::string("") + type_to_name(out) + "_act" +
+      std::to_string(activation_type_);
+
+  // Probe a single-row kernel first; fall back to looped if TG exceeds max.
+  std::string single_row_name = "fused_gate_activation_single_row_" +
+      type_to_name(out) + "_act" + std::to_string(activation_type_);
+  auto single_row_kernel = d.get_kernel(single_row_name);
+  if (single_row_tg <= single_row_kernel->maxTotalThreadsPerThreadgroup()) {
+    threadgroup_size = single_row_tg;
+  } else {
+    use_looped = true;
+  }
+
+  auto kernel = use_looped
+      ? d.get_kernel(
+            "fused_gate_activation_looped_" + type_to_name(out) + "_act" +
+            std::to_string(activation_type_))
+      : single_row_kernel;
+
+  if (use_looped) {
+    threadgroup_size = kernel->maxTotalThreadsPerThreadgroup();
+  }
+
+  size_t n_threads = static_cast<size_t>(n_rows) * threadgroup_size;
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.set_compute_pipeline_state(kernel);
+  compute_encoder.set_input_array(gate_up, 0);
+  compute_encoder.set_output_array(out, 1);
+  compute_encoder.set_bytes(hidden, 2);
+  compute_encoder.dispatch_threads(
+      MTL::Size(n_threads, 1, 1), MTL::Size(threadgroup_size, 1, 1));
+}
+
+bool FusedGateActivation::is_equivalent(const Primitive& other) const {
+  const FusedGateActivation& r =
+      static_cast<const FusedGateActivation&>(other);
+  return hidden_dims_ == r.hidden_dims_ &&
+         activation_type_ == r.activation_type_;
+}
+
 bool RMSNormRoPE::use_fallback(Stream s) {
   return s.device == Device::cpu;
 }

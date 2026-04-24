@@ -227,6 +227,44 @@ class RMSNormResidual : public Custom {
   float eps_;
 };
 
+class FusedGateActivation : public Custom {
+ public:
+  FusedGateActivation(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int hidden_dims,
+      int activation_type)
+      : Custom(stream, std::move(fallback)),
+        hidden_dims_(hidden_dims),
+        activation_type_(activation_type) {}
+
+  static bool use_fallback(Stream stream);
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("NYI");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(FusedGateActivation)
+  bool is_equivalent(const Primitive& other) const override;
+
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    auto shape = inputs[0].shape();
+    shape.back() = hidden_dims_;
+    return {shape};
+  }
+
+  auto state() const {
+    return std::make_tuple(nullptr, hidden_dims_, activation_type_);
+  }
+
+ private:
+  int hidden_dims_;
+  int activation_type_;
+};
+
 class RMSNormRoPE : public Custom {
  public:
   RMSNormRoPE(
