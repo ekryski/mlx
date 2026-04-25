@@ -451,28 +451,33 @@ template <int Bits, int Dim, int PackedWidth>
     constant float&, uint3);
 
 // Bits × Dim combinations for real models
+// dim=512 covers Gemma 4's global-attention head_dim (sliding layers use 256).
 #define instantiate_all_for_bits(bits) \
   instantiate_turbo_score(bits, 64) \
   instantiate_turbo_score(bits, 80) \
   instantiate_turbo_score(bits, 96) \
   instantiate_turbo_score(bits, 128) \
   instantiate_turbo_score(bits, 256) \
+  instantiate_turbo_score(bits, 512) \
   instantiate_turbo_encode(bits, 64) \
   instantiate_turbo_encode(bits, 80) \
   instantiate_turbo_encode(bits, 96) \
   instantiate_turbo_encode(bits, 128) \
   instantiate_turbo_encode(bits, 256) \
+  instantiate_turbo_encode(bits, 512) \
   instantiate_turbo_value(bits, 64) \
   instantiate_turbo_value(bits, 80) \
   instantiate_turbo_value(bits, 96) \
   instantiate_turbo_value(bits, 128) \
-  instantiate_turbo_value(bits, 256)
+  instantiate_turbo_value(bits, 256) \
+  instantiate_turbo_value(bits, 512)
 
 // WHT encode only for power-of-2 dims
 #define instantiate_wht_for_bits(bits) \
   instantiate_turbo_encode_wht(bits, 64, 6) \
   instantiate_turbo_encode_wht(bits, 128, 7) \
-  instantiate_turbo_encode_wht(bits, 256, 8)
+  instantiate_turbo_encode_wht(bits, 256, 8) \
+  instantiate_turbo_encode_wht(bits, 512, 9)
 
 instantiate_all_for_bits(2)
 instantiate_all_for_bits(3)
@@ -489,3 +494,4 @@ instantiate_turbo_pass2(80)
 instantiate_turbo_pass2(96)
 instantiate_turbo_pass2(128)
 instantiate_turbo_pass2(256)
+instantiate_turbo_pass2(512)
