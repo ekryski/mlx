@@ -299,15 +299,25 @@ MLX_API std::vector<array> turbo_flash_pass1_nr0_causal(
     StreamOrDevice s = {});
 
 /// TurboFlash attention pass 2: cross-block online softmax reduction.
+///
+/// `sinks` is an optional per-head logit array of shape [nq_heads]. When
+/// `nullopt`, the kernel skips the sink branch and the output is the standard
+/// SDPA aggregation. When provided, an extra entry with logit `sinks[h]` and
+/// implicit V=0 is folded into the global softmax — same semantics as
+/// `MLXFast.scaledDotProductAttention(... sinks:)`.
 MLX_API array turbo_flash_pass2(
     const array& o_partials,
     const array& m_partials,
     const array& l_partials,
     int num_blocks,
     int dim,
+    int nq_heads,
+    int L,
+    std::optional<array> sinks,
     StreamOrDevice s = {});
 
-/// TurboFlash attention pass 2 with fused output rotation.
+/// TurboFlash attention pass 2 with fused output rotation. Sinks behave the
+/// same as in `turbo_flash_pass2`, applied before the inverse rotation.
 MLX_API array turbo_flash_pass2_fused(
     const array& o_partials,
     const array& m_partials,
@@ -315,6 +325,9 @@ MLX_API array turbo_flash_pass2_fused(
     const array& val_rotation,
     int num_blocks,
     int dim,
+    int nq_heads,
+    int L,
+    std::optional<array> sinks,
     StreamOrDevice s = {});
 
 /// Weighted sum of codebook-quantized values (V aggregation).

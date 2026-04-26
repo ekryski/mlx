@@ -1,5 +1,6 @@
 // Copyright © 2023-2024 Apple Inc.
 #include <cassert>
+#include <limits>
 #include <numeric>
 
 #include "mlx/fast.h"
@@ -1643,23 +1644,34 @@ array turbo_flash_pass2(
     const array& l_partials,
     int num_blocks,
     int dim,
+    int nq_heads,
+    int L,
+    std::optional<array> sinks,
     StreamOrDevice s_) {
   auto s = to_stream(s_);
 
   int total_q = m_partials.shape(0);
+  bool has_sinks = sinks.has_value();
 
   auto fallback = [](const std::vector<array>&) -> std::vector<array> {
     throw std::runtime_error("[turbo_flash_pass2] Only runs on GPU");
   };
 
+  // Sinks: when caller supplies none, bind a 1-element placeholder so the
+  // kernel buffer is always valid; the kernel skips reading it via has_sinks=0.
+  array sinks_input = has_sinks
+      ? astype(*sinks, float32, s)
+      : array({-std::numeric_limits<float>::infinity()}, {1}, float32);
+
   return array(
       {total_q, dim},
       float32,
       std::make_shared<TurboFlashPass2>(
-          s, fallback, dim, /*fused_rotation=*/false),
+          s, fallback, dim, /*fused_rotation=*/false, nq_heads, L, has_sinks),
       {astype(o_partials, float32, s),
        astype(m_partials, float32, s),
-       astype(l_partials, float32, s)});
+       astype(l_partials, float32, s),
+       sinks_input});
 }
 
 array turbo_flash_pass2_fused(
@@ -1669,24 +1681,33 @@ array turbo_flash_pass2_fused(
     const array& val_rotation,
     int num_blocks,
     int dim,
+    int nq_heads,
+    int L,
+    std::optional<array> sinks,
     StreamOrDevice s_) {
   auto s = to_stream(s_);
 
   int total_q = m_partials.shape(0);
+  bool has_sinks = sinks.has_value();
 
   auto fallback = [](const std::vector<array>&) -> std::vector<array> {
     throw std::runtime_error("[turbo_flash_pass2_fused] Only runs on GPU");
   };
 
+  array sinks_input = has_sinks
+      ? astype(*sinks, float32, s)
+      : array({-std::numeric_limits<float>::infinity()}, {1}, float32);
+
   return array(
       {total_q, dim},
       float32,
       std::make_shared<TurboFlashPass2>(
-          s, fallback, dim, /*fused_rotation=*/true),
+          s, fallback, dim, /*fused_rotation=*/true, nq_heads, L, has_sinks),
       {astype(o_partials, float32, s),
        astype(m_partials, float32, s),
        astype(l_partials, float32, s),
-       astype(val_rotation, float32, s)});
+       astype(val_rotation, float32, s),
+       sinks_input});
 }
 
 array turbo_value(

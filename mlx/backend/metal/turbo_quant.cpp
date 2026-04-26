@@ -353,12 +353,14 @@ void TurboFlashPass2::eval_gpu(
 
   int total_q = m_partials.shape(0);
   int num_blocks = m_partials.shape(1);
+  int has_sinks_int = has_sinks_ ? 1 : 0;
 
   out.set_data(allocator::malloc(out.nbytes()));
 
   std::string kname;
   if (fused_rotation_) {
     auto val_rotation = ensure_contiguous(inputs[3], s);
+    auto sinks = ensure_contiguous(inputs[4], s);
 
     kname = "turbo_flash_p2_fused_" + std::to_string(dim_);
     auto kernel = d.get_kernel(kname);
@@ -371,11 +373,17 @@ void TurboFlashPass2::eval_gpu(
     compute_encoder.set_input_array(val_rotation, 3);
     compute_encoder.set_output_array(out, 4);
     compute_encoder.set_bytes(num_blocks, 5);
+    compute_encoder.set_input_array(sinks, 6);
+    compute_encoder.set_bytes(nq_heads_, 7);
+    compute_encoder.set_bytes(L_, 8);
+    compute_encoder.set_bytes(has_sinks_int, 9);
 
     auto grid = MTL::Size(32, total_q, 1);
     auto group = MTL::Size(32, 1, 1);
     compute_encoder.dispatch_threads(grid, group);
   } else {
+    auto sinks = ensure_contiguous(inputs[3], s);
+
     kname = "turbo_flash_p2_" + std::to_string(dim_);
     auto kernel = d.get_kernel(kname);
 
@@ -386,6 +394,10 @@ void TurboFlashPass2::eval_gpu(
     compute_encoder.set_input_array(l_partials, 2);
     compute_encoder.set_output_array(out, 3);
     compute_encoder.set_bytes(num_blocks, 4);
+    compute_encoder.set_input_array(sinks, 5);
+    compute_encoder.set_bytes(nq_heads_, 6);
+    compute_encoder.set_bytes(L_, 7);
+    compute_encoder.set_bytes(has_sinks_int, 8);
 
     auto grid = MTL::Size(32, total_q, 1);
     auto group = MTL::Size(32, 1, 1);
@@ -395,7 +407,8 @@ void TurboFlashPass2::eval_gpu(
 
 bool TurboFlashPass2::is_equivalent(const Primitive& other) const {
   const TurboFlashPass2& o = static_cast<const TurboFlashPass2&>(other);
-  return dim_ == o.dim_ && fused_rotation_ == o.fused_rotation_;
+  return dim_ == o.dim_ && fused_rotation_ == o.fused_rotation_ &&
+      nq_heads_ == o.nq_heads_ && L_ == o.L_ && has_sinks_ == o.has_sinks_;
 }
 
 // ============================================================================
