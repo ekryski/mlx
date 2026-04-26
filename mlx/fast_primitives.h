@@ -813,10 +813,16 @@ class TurboFlashPass2 : public Custom {
       Stream stream,
       std::function<std::vector<array>(std::vector<array>)> fallback,
       int dim,
-      bool fused_rotation)
+      bool fused_rotation,
+      int nq_heads = 1,
+      int L = 1,
+      bool has_sinks = false)
       : Custom(stream, std::move(fallback)),
         dim_(dim),
-        fused_rotation_(fused_rotation) {}
+        fused_rotation_(fused_rotation),
+        nq_heads_(nq_heads),
+        L_(L),
+        has_sinks_(has_sinks) {}
 
   void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
       override {
@@ -829,12 +835,16 @@ class TurboFlashPass2 : public Custom {
   bool is_equivalent(const Primitive& other) const override;
   DEFINE_INPUT_OUTPUT_SHAPE()
   auto state() const {
-    return std::make_tuple(nullptr, dim_, fused_rotation_);
+    return std::make_tuple(
+        nullptr, dim_, fused_rotation_, nq_heads_, L_, has_sinks_);
   }
 
  private:
   int dim_;
   bool fused_rotation_;
+  int nq_heads_;
+  int L_;
+  bool has_sinks_;
 };
 
 class TurboValue : public Custom {

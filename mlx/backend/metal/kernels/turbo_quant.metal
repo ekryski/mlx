@@ -240,6 +240,15 @@ template <int Bits, int Dim, int PackedWidth, int LogDim>
 
 // ============================================================================
 // TurboFlash Pass 2: Cross-block online softmax reduction
+//
+// Sinks: when `has_sinks != 0`, an extra per-head logit `sinks[head_idx]` is
+// folded into the global softmax denominator before normalization. The sink
+// contributes nothing to the output accumulator (V is implicit zero), only
+// to the running max `m` and denominator `l`. Layout assumption: queries are
+// flattened from [B, nQHeads, L, Dim] so q_idx = b*nQHeads*L + h*L + l_pos
+// and head_idx = (q_idx / L) % nQHeads. The `sinks` buffer is unused when
+// `has_sinks == 0` and may point anywhere safely bindable (e.g. a reused
+// `l_partials` buffer).
 // ============================================================================
 template <int Dim>
 [[kernel]] void turbo_flash_pass2(
@@ -248,6 +257,10 @@ template <int Dim>
     const device float* l_partials [[buffer(2)]],
     device float* output [[buffer(3)]],
     constant int& num_blocks [[buffer(4)]],
+    const device float* sinks [[buffer(5)]],
+    constant int& nq_heads [[buffer(6)]],
+    constant int& L [[buffer(7)]],
+    constant int& has_sinks [[buffer(8)]],
     uint3 pos [[thread_position_in_grid]]) {
 
   constexpr uint DIMS_PER_LANE = (Dim + 31) / 32;
@@ -280,6 +293,19 @@ template <int Dim>
     m = new_m;
   }
 
+  if (has_sinks != 0) {
+    uint head_idx = (q_idx / uint(L)) % uint(nq_heads);
+    float sink_score = sinks[head_idx];
+    float new_m = max(m, sink_score);
+    float exp_old = exp(m - new_m);
+    float exp_sink = exp(sink_score - new_m);
+    for (uint i = 0; i < DIMS_PER_LANE; i++) {
+      o[i] = o[i] * exp_old;
+    }
+    l = l * exp_old + exp_sink;
+    m = new_m;
+  }
+
   float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
   for (uint i = 0; i < DIMS_PER_LANE; i++) {
     uint d = lane + i * 32;
@@ -291,6 +317,9 @@ template <int Dim>
 
 // ============================================================================
 // TurboFlash Pass 2 with fused output rotation
+//
+// Same sinks semantics as `turbo_flash_pass2` — folded into the global softmax
+// before the inverse-rotation matmul.
 // ============================================================================
 template <int Dim>
 [[kernel]] void turbo_flash_pass2_fused_rot(
@@ -300,6 +329,10 @@ template <int Dim>
     const device float* val_rotation [[buffer(3)]],
     device float* output [[buffer(4)]],
     constant int& num_blocks [[buffer(5)]],
+    const device float* sinks [[buffer(6)]],
+    constant int& nq_heads [[buffer(7)]],
+    constant int& L [[buffer(8)]],
+    constant int& has_sinks [[buffer(9)]],
     uint3 pos [[thread_position_in_grid]]) {
 
   constexpr uint DIMS_PER_LANE = (Dim + 31) / 32;
@@ -329,6 +362,19 @@ template <int Dim>
       }
     }
     l = l * exp_old + block_l * exp_block;
+    m = new_m;
+  }
+
+  if (has_sinks != 0) {
+    uint head_idx = (q_idx / uint(L)) % uint(nq_heads);
+    float sink_score = sinks[head_idx];
+    float new_m = max(m, sink_score);
+    float exp_old = exp(m - new_m);
+    float exp_sink = exp(sink_score - new_m);
+    for (uint i = 0; i < DIMS_PER_LANE; i++) {
+      o[i] = o[i] * exp_old;
+    }
+    l = l * exp_old + exp_sink;
     m = new_m;
   }
 
@@ -437,11 +483,15 @@ template <int Bits, int Dim, int PackedWidth>
   template [[host_name("turbo_flash_p2_" #dim)]] \
   [[kernel]] void turbo_flash_pass2<dim>( \
     const device float*, const device float*, const device float*, \
-    device float*, constant int&, uint3); \
+    device float*, constant int&, \
+    const device float*, constant int&, constant int&, constant int&, \
+    uint3); \
   template [[host_name("turbo_flash_p2_fused_" #dim)]] \
   [[kernel]] void turbo_flash_pass2_fused_rot<dim>( \
     const device float*, const device float*, const device float*, \
-    const device float*, device float*, constant int&, uint3);
+    const device float*, device float*, constant int&, \
+    const device float*, constant int&, constant int&, constant int&, \
+    uint3);
 
 #define instantiate_turbo_value(bits, dim) \
   template [[host_name("turbo_value_" #bits "_" #dim)]] \
