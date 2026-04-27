@@ -1725,6 +1725,46 @@ array turbo_value(
        array(sparse_threshold, float32)});
 }
 
+array turbo_bulk_dequant_rotated(
+    const array& packed,
+    const array& norms,
+    const array& codebook,
+    int bits,
+    int dim,
+    Dtype output_dtype,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+
+  if (s.device == Device::cpu) {
+    throw std::runtime_error("[turbo_bulk_dequant_rotated] Only runs on GPU");
+  }
+  if (output_dtype != bfloat16 && output_dtype != float16) {
+    throw std::invalid_argument(
+        "[turbo_bulk_dequant_rotated] output dtype must be bfloat16 or float16");
+  }
+  if (packed.ndim() != 4) {
+    throw std::invalid_argument(
+        "[turbo_bulk_dequant_rotated] packed must be [B, H, T, PackedWidth]");
+  }
+
+  int B = static_cast<int>(packed.shape(0));
+  int H = static_cast<int>(packed.shape(1));
+  int T = static_cast<int>(packed.shape(2));
+
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[turbo_bulk_dequant_rotated] Only runs on GPU");
+  };
+
+  return array(
+      {B, H, T, dim},
+      output_dtype,
+      std::make_shared<TurboBulkDequantRotated>(
+          s, fallback, bits, dim, output_dtype),
+      {packed,
+       astype(norms, float32, s),
+       astype(codebook, float32, s)});
+}
+
 // ============================================================================
 // GatedDeltaNet / SSM recurrence primitives
 // ============================================================================

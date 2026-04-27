@@ -427,6 +427,82 @@ template <int Bits, int Dim, int PackedWidth>
 }
 
 // ============================================================================
+// Bulk dequant in rotated codec space
+// ============================================================================
+// Decompresses [B, H, T, PackedWidth] uint32 + norms[B, H, T] + codebook[2^Bits]
+// into [B, H, T, Dim] FP16/BF16, in rotated Π space (caller applies the
+// inverse rotation downstream — typically by passing the output to
+// MLXFast.scaledDotProductAttention with the matching rotated query, then
+// matmul-by-V_rotation on the SDPA output).
+//
+// One thread per packed `uint32` word, emitting `dims_per_word = 32 / Bits`
+// dim outputs each. For Bits ∈ {2, 4, 8}, dims_per_word ∈ {16, 8, 4}, all
+// clean (no cross-word spill). For Bits=3, words straddle dims and the
+// per-thread loop checks `spill > 0` like the score/value kernels do.
+//
+// Grid:  (PackedWidth, T, B*H)  — one thread per (packed-word, token, head)
+// Group: (PackedWidth, 1, 1)    — clamped to ≤32 in the host dispatcher
+template <int Bits, int Dim, int PackedWidth, typename T>
+[[kernel]] void turbo_dequant_rotated(
+    const device uint32_t* packed [[buffer(0)]],
+    const device float* norms [[buffer(1)]],
+    const device float* codebook [[buffer(2)]],
+    device T* out [[buffer(3)]],
+    constant int& tokens [[buffer(4)]],
+    uint3 pos [[thread_position_in_grid]]) {
+
+  uint w = pos.x;
+  uint t = pos.y;
+  uint bh = pos.z;
+  if (w >= uint(PackedWidth) || t >= uint(tokens)) return;
+
+  constexpr uint MASK = (1u << Bits) - 1u;
+
+  uint base = bh * uint(tokens) * PackedWidth + t * PackedWidth;
+  uint word = packed[base + w];
+  float norm_val = norms[bh * uint(tokens) + t];
+
+  // Bits ∈ {2, 4, 8}: clean nibble/byte packing — fast inner loop.
+  // Bits == 3: per-dim spill check matches turbo_score / turbo_value.
+  if (Bits == 2 || Bits == 4 || Bits == 8) {
+    constexpr uint DIMS_PER_WORD = 32u / Bits;
+    uint d_base = w * DIMS_PER_WORD;
+    uint out_base = bh * uint(tokens) * Dim + t * Dim + d_base;
+    for (uint k = 0; k < DIMS_PER_WORD; k++) {
+      uint d = d_base + k;
+      if (d >= uint(Dim)) break;
+      uint val = (word >> (k * Bits)) & MASK;
+      float result = codebook[val] * norm_val;
+      out[out_base + k] = static_cast<T>(result);
+    }
+  } else {
+    // 3-bit (or any other non-divisor): per-dim with spill handling.
+    // Each thread emits ceil(32 / Bits) dims worth of output, but the
+    // bit-extract is keyed on absolute dim index `d` so cross-word spills
+    // pull from word+1 correctly.
+    constexpr uint DIMS_PER_WORD = (32u + Bits - 1u) / Bits;
+    uint d_base = w * DIMS_PER_WORD;
+    for (uint k = 0; k < DIMS_PER_WORD; k++) {
+      uint d = d_base + k;
+      if (d >= uint(Dim)) break;
+      uint bit_offset = d * Bits;
+      uint word_idx = bit_offset / 32;
+      uint shift = bit_offset % 32;
+      // Re-fetch in case d straddles into the next word for this thread.
+      uint local_word = packed[base + word_idx];
+      uint val = (local_word >> shift);
+      int spill = (int)shift + (int)Bits - 32;
+      if (spill > 0) {
+        val |= (packed[base + word_idx + 1] << ((uint)Bits - (uint)spill));
+      }
+      val &= MASK;
+      float result = codebook[val] * norm_val;
+      out[bh * uint(tokens) * Dim + t * Dim + d] = static_cast<T>(result);
+    }
+  }
+}
+
+// ============================================================================
 // Instantiation macros
 // ============================================================================
 
@@ -469,6 +545,14 @@ template <int Bits, int Dim, int PackedWidth>
     const device float*, device float*, constant int&, constant int&, \
     constant float&, uint3);
 
+// Bulk dequant kernel — one host_name per (bits, dim, output dtype) tuple.
+// Output dtype suffix matches MLX's standard conventions: `bf16` and `f16`.
+#define instantiate_turbo_dequant_rotated(bits, dim, dtype, dtype_suffix) \
+  template [[host_name("turbo_dequant_rotated_" #bits "_" #dim "_" #dtype_suffix)]] \
+  [[kernel]] void turbo_dequant_rotated<bits, dim, TQ_PW(dim, bits), dtype>( \
+    const device uint32_t*, const device float*, const device float*, \
+    device dtype*, constant int&, uint3);
+
 // Bits × Dim combinations for real models. Dim=512 added for Gemma 4
 // family (E2B, 26B-A4B, 31B), which uses headDim=512.
 #define instantiate_all_for_bits(bits) \
@@ -489,7 +573,19 @@ template <int Bits, int Dim, int PackedWidth>
   instantiate_turbo_value(bits, 96) \
   instantiate_turbo_value(bits, 128) \
   instantiate_turbo_value(bits, 256) \
-  instantiate_turbo_value(bits, 512)
+  instantiate_turbo_value(bits, 512) \
+  instantiate_turbo_dequant_rotated(bits, 64,  bfloat, bf16) \
+  instantiate_turbo_dequant_rotated(bits, 80,  bfloat, bf16) \
+  instantiate_turbo_dequant_rotated(bits, 96,  bfloat, bf16) \
+  instantiate_turbo_dequant_rotated(bits, 128, bfloat, bf16) \
+  instantiate_turbo_dequant_rotated(bits, 256, bfloat, bf16) \
+  instantiate_turbo_dequant_rotated(bits, 512, bfloat, bf16) \
+  instantiate_turbo_dequant_rotated(bits, 64,  half,   f16)  \
+  instantiate_turbo_dequant_rotated(bits, 80,  half,   f16)  \
+  instantiate_turbo_dequant_rotated(bits, 96,  half,   f16)  \
+  instantiate_turbo_dequant_rotated(bits, 128, half,   f16)  \
+  instantiate_turbo_dequant_rotated(bits, 256, half,   f16)  \
+  instantiate_turbo_dequant_rotated(bits, 512, half,   f16)
 
 // WHT encode only for power-of-2 dims
 #define instantiate_wht_for_bits(bits) \

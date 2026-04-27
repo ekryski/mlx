@@ -865,6 +865,44 @@ class TurboValue : public Custom {
   int dim_;
 };
 
+// Bulk-dequant of a packed [B, H, T, PackedWidth] codec buffer back to
+// FP16/BF16 [B, H, T, dim] in rotated codec space. One Metal dispatch
+// (vs the per-token bit-unpack inside TurboFlash). Output dtype is
+// templated through the host-name suffix so callers can target their
+// model dtype directly without an extra cast.
+class TurboBulkDequantRotated : public Custom {
+ public:
+  TurboBulkDequantRotated(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int bits,
+      int dim,
+      Dtype output_dtype)
+      : Custom(stream, std::move(fallback)),
+        bits_(bits),
+        dim_(dim),
+        output_dtype_(output_dtype) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("TurboBulkDequantRotated only runs on GPU");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(TurboBulkDequantRotated)
+  bool is_equivalent(const Primitive& other) const override;
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  auto state() const {
+    return std::make_tuple(nullptr, bits_, dim_, output_dtype_);
+  }
+
+ private:
+  int bits_;
+  int dim_;
+  Dtype output_dtype_;
+};
+
 // ============================================================================
 // GatedDeltaNet / SSM recurrence primitives
 // ============================================================================

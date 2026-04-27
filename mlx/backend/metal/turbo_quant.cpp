@@ -449,4 +449,69 @@ bool TurboValue::is_equivalent(const Primitive& other) const {
   return bits_ == o.bits_ && dim_ == o.dim_;
 }
 
+// ============================================================================
+// TurboBulkDequantRotated
+// ============================================================================
+
+void TurboBulkDequantRotated::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  auto& out = outputs[0];
+
+  auto packed = ensure_contiguous(inputs[0], s);
+  auto norms = ensure_contiguous(inputs[1], s);
+  auto codebook = ensure_contiguous(inputs[2], s);
+
+  // Layout: packed [B, H, T, PackedWidth] uint32.
+  int B = static_cast<int>(packed.shape(0));
+  int H = static_cast<int>(packed.shape(1));
+  int T = static_cast<int>(packed.shape(2));
+  int packed_width = static_cast<int>(packed.shape(3));
+
+  out.set_data(allocator::malloc(out.nbytes()));
+
+  // host_name suffix is dtype-keyed; bf16 and f16 are the supported targets.
+  std::string dtype_suffix;
+  switch (output_dtype_) {
+    case bfloat16:
+      dtype_suffix = "bf16";
+      break;
+    case float16:
+      dtype_suffix = "f16";
+      break;
+    default:
+      throw std::runtime_error(
+          "TurboBulkDequantRotated: output dtype must be bfloat16 or float16");
+  }
+
+  std::string kname = "turbo_dequant_rotated_" +
+      std::to_string(bits_) + "_" + std::to_string(dim_) + "_" + dtype_suffix;
+  auto kernel = d.get_kernel(kname);
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.set_compute_pipeline_state(kernel);
+  compute_encoder.set_input_array(packed, 0);
+  compute_encoder.set_input_array(norms, 1);
+  compute_encoder.set_input_array(codebook, 2);
+  compute_encoder.set_output_array(out, 3);
+  compute_encoder.set_bytes(T, 4);
+
+  // Grid: (PackedWidth, T, B*H). Threadgroup x clamped to 32 for SIMD-aligned
+  // launches; pad grid x up to a multiple of group x.
+  int group_x = std::min(packed_width, 32);
+  if (group_x < 1) group_x = 1;
+  int grid_x = ((packed_width + group_x - 1) / group_x) * group_x;
+  auto grid = MTL::Size(grid_x, T, B * H);
+  auto group = MTL::Size(group_x, 1, 1);
+  compute_encoder.dispatch_threads(grid, group);
+}
+
+bool TurboBulkDequantRotated::is_equivalent(const Primitive& other) const {
+  const TurboBulkDequantRotated& o =
+      static_cast<const TurboBulkDequantRotated&>(other);
+  return bits_ == o.bits_ && dim_ == o.dim_ && output_dtype_ == o.output_dtype_;
+}
+
 } // namespace mlx::core::fast
