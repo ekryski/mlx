@@ -1637,6 +1637,12 @@ std::vector<array> turbo_flash_pass1_nr0_causal(
        array(q_offset, int32)});
 }
 
+// Output is bfloat16 — matches model dtype for all current MLX LMs and avoids
+// an fp32→bf16 conversion in the consumer's graph. Kernel accumulators stay
+// fp32; only the final write narrows. This dtype change is also what fixes
+// upstream MLX graph-compile fusion bug (#87/#92) that produced `!!!!!`
+// decoding on certain shapes — see kernel comment in
+// backend/metal/kernels/turbo_quant.metal.
 array turbo_flash_pass2(
     const array& o_partials,
     const array& m_partials,
@@ -1654,7 +1660,7 @@ array turbo_flash_pass2(
 
   return array(
       {total_q, dim},
-      float32,
+      bfloat16,
       std::make_shared<TurboFlashPass2>(
           s, fallback, dim, /*fused_rotation=*/false),
       {astype(o_partials, float32, s),
@@ -1680,7 +1686,7 @@ array turbo_flash_pass2_fused(
 
   return array(
       {total_q, dim},
-      float32,
+      bfloat16,
       std::make_shared<TurboFlashPass2>(
           s, fallback, dim, /*fused_rotation=*/true),
       {astype(o_partials, float32, s),

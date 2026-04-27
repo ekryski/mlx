@@ -168,6 +168,13 @@ class MLX_API CommandEncoder {
   std::unordered_map<const void*, NS::SharedPtr<MTL::Fence>> prev_ce_outputs_;
   std::mutex outputs_mtx_;
 
+  // Name of the most recently bound compute pipeline. Captured in
+  // `set_compute_pipeline_state` and used by `set_input_array` /
+  // `register_output_array` for `MLX_HAZARD_TRACE=1` logs (so each input
+  // / output line carries the kernel that's about to consume / produce
+  // it). Always reflects the kernel of the in-flight encoding window.
+  const char* current_kernel_name_{""};
+
   // Signpost state for MLX_METAL_PROFILE=1 per-kernel tracing. The
   // ID is generated in `set_compute_pipeline_state` and consumed by
   // the next `dispatch_*` call on this encoder. `OS_SIGNPOST_ID_NULL`
