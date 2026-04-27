@@ -330,6 +330,20 @@ MLX_API array turbo_value(
     int dim,
     StreamOrDevice s = {});
 
+/// Bulk-dequantize a packed [B, H, T, PackedWidth] codec buffer back to
+/// FP16/BF16 [B, H, T, dim] in rotated codec space. One Metal dispatch.
+///
+/// `packed` must be uint32; `norms` and `codebook` must be float32.
+/// `output_dtype` selects between bfloat16 and float16 outputs.
+MLX_API array turbo_bulk_dequant_rotated(
+    const array& packed,
+    const array& norms,
+    const array& codebook,
+    int bits,
+    int dim,
+    Dtype output_dtype,
+    StreamOrDevice s = {});
+
 // ============================================================================
 // GatedDeltaNet / SSM recurrence primitives
 // ============================================================================
