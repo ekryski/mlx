@@ -73,6 +73,15 @@ TEST_CASE("test access stream in other thread") {
     return;
   }
 
+  // Fork-specific semantics (see commit 8d03d9a8 "CommandEncoder
+  // lazy init"): cross-thread access to a stream lazily initializes
+  // the thread's CommandEncoder for that stream instead of throwing.
+  // The change is required for Swift structured concurrency where
+  // Tasks migrate between threads. Upstream mlx behavior (commit
+  // 5e2c4425) was to throw runtime_error — this test was originally
+  // written against that contract. The inverted assertion below is
+  // the fork's correctness contract: the cross-thread eval must
+  // succeed without error.
   auto main_thread_stream = new_stream(Device::gpu);
   eval(arange(10, main_thread_stream));
 
@@ -87,7 +96,7 @@ TEST_CASE("test access stream in other thread") {
   });
   t.join();
 
-  CHECK(error_caught);
+  CHECK_FALSE(error_caught);
 }
 
 TEST_CASE("test new stream in threads") {

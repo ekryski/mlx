@@ -1,15 +1,14 @@
 name: alpha CI
 
-# Builds the Metal backend on the ekryski fork's `alpha` branch and any PR
-# targeting it. CMake build only — the `tests` target currently has
-# pre-existing linker errors for the new `SSMStep` and `TurboBulkDequantRotated`
-# primitives (vtables not linked into the test binary). Building libmlx.a is
-# the load-bearing signal for "did Tom's / Eric's metal kernel changes
-# preserve compilability?" Tests TODO once the test target is fixed.
+# Builds and tests the Metal backend on the ekryski fork's `alpha` branch
+# and any PR targeting it. The Metal kernels are compiled by `mlx-metallib`
+# as part of the main target, so a green build here exercises the full
+# kernel pipeline.
 #
-# CPU build only — Metal kernels are compiled by `mlx-metallib` as part of
-# the main target, so a green run here exercises the full kernel pipeline
-# even though there is no GPU on the runner.
+# Note: doctest cases that gate on `gpu::is_available()` are no-ops on
+# GitHub-hosted macOS runners (no Apple GPU exposed to CI VMs). They still
+# compile, link, and resolve all symbols — the build is the load-bearing
+# signal for kernel-level changes. GPU runtime tests run locally.
 
 on:
   push:
@@ -48,14 +47,17 @@ jobs:
             cmake-${{ runner.os }}-
 
       - name: Configure
-        run: cmake -S . -B build -DMLX_BUILD_TESTS=OFF -DMLX_BUILD_PYTHON_BINDINGS=OFF
+        run: cmake -S . -B build -DMLX_BUILD_TESTS=ON -DMLX_BUILD_PYTHON_BINDINGS=OFF
 
-      - name: Build libmlx + metallib
-        run: cmake --build build --target mlx -j
+      - name: Build (libmlx + metallib + tests)
+        run: cmake --build build -j
 
       - name: Verify build artifacts
         run: |
           test -f build/libmlx.a
           test -f build/mlx.metallib || test -f build/mlx/backend/metal/kernels/mlx.metallib
-          echo "libmlx.a:        $(stat -f '%z' build/libmlx.a) bytes"
+          echo "libmlx.a: $(stat -f '%z' build/libmlx.a) bytes"
           ls -la build/*.metallib build/mlx/backend/metal/kernels/*.metallib 2>/dev/null | head
+
+      - name: Run unit tests
+        run: ./build/tests/tests
