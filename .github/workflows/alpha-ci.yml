@@ -1,0 +1,61 @@
+name: alpha CI
+
+# Builds the Metal backend on the ekryski fork's `alpha` branch and any PR
+# targeting it. CMake build only — the `tests` target currently has
+# pre-existing linker errors for the new `SSMStep` and `TurboBulkDequantRotated`
+# primitives (vtables not linked into the test binary). Building libmlx.a is
+# the load-bearing signal for "did Tom's / Eric's metal kernel changes
+# preserve compilability?" Tests TODO once the test target is fixed.
+#
+# CPU build only — Metal kernels are compiled by `mlx-metallib` as part of
+# the main target, so a green run here exercises the full kernel pipeline
+# even though there is no GPU on the runner.
+
+on:
+  push:
+    branches: [alpha]
+  pull_request:
+    branches: [alpha]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: alpha-ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/alpha' }}
+
+jobs:
+  build:
+    if: github.repository_owner == 'ekryski'
+    name: Build (M1 macOS)
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          cmake --version
+          uname -a
+
+      - name: Cache CMake build directory
+        uses: actions/cache@v4
+        with:
+          path: build
+          key: cmake-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'mlx/backend/metal/CMakeLists.txt', 'mlx/backend/metal/kernels/**/*.metal', 'mlx/backend/metal/kernels/**/*.h') }}
+          restore-keys: |
+            cmake-${{ runner.os }}-
+
+      - name: Configure
+        run: cmake -S . -B build -DMLX_BUILD_TESTS=OFF -DMLX_BUILD_PYTHON_BINDINGS=OFF
+
+      - name: Build libmlx + metallib
+        run: cmake --build build --target mlx -j
+
+      - name: Verify build artifacts
+        run: |
+          test -f build/libmlx.a
+          test -f build/mlx.metallib || test -f build/mlx/backend/metal/kernels/mlx.metallib
+          echo "libmlx.a:        $(stat -f '%z' build/libmlx.a) bytes"
+          ls -la build/*.metallib build/mlx/backend/metal/kernels/*.metallib 2>/dev/null | head
