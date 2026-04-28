@@ -1,8 +1,8 @@
 // Copyright © 2023-2024 Apple Inc.
 
-#include <cstdlib>
 #include <os/log.h>
 #include <os/signpost.h>
+#include <cstdlib>
 #include <sstream>
 
 #include <fmt/format.h>
@@ -315,9 +315,17 @@ void CommandEncoder::set_buffer(
     int idx,
     int64_t offset /* = 0 */) {
   // Record as both input and output to ensure synchronization between command
-  // buffers
-  all_inputs_.insert((void*)buf);
+  // buffers. First sighting in this CB triggers an explicit retain; the
+  // all_inputs_ set already dedupes so we won't double-retain. Required by
+  // Apple's MTLResourceHazardTrackingModeUntracked +
+  // commandBufferWithUnretainedReferences contract.
+  bool first = all_inputs_.insert((void*)buf).second;
   all_outputs_.insert((void*)buf);
+  if (first && env::metal_retain_bound_buffers() && buf) {
+    auto* mut_buf = const_cast<MTL::Buffer*>(buf);
+    mut_buf->retain();
+    retained_buffers_.push_back(mut_buf);
+  }
   get_command_encoder()->setBuffer(buf, offset, idx);
 }
 
@@ -325,14 +333,29 @@ void CommandEncoder::set_input_array(
     const array& a,
     int idx,
     int64_t offset /* = 0 */) {
-  if (all_inputs_.insert(a.buffer().ptr()).second) {
+  bool first = all_inputs_.insert(a.buffer().ptr()).second;
+  if (first) {
     buffer_input_sizes_ += a.data_size();
+    // See note in set_buffer above re: untracked-hazard / unretained-CB
+    // contract. Retain on first sighting only.
+    if (env::metal_retain_bound_buffers() && a.buffer().ptr()) {
+      auto* mut_buf =
+          static_cast<MTL::Buffer*>(const_cast<void*>(a.buffer().ptr()));
+      mut_buf->retain();
+      retained_buffers_.push_back(mut_buf);
+    }
   }
   auto r_buf = static_cast<MTL::Resource*>(const_cast<void*>(a.buffer().ptr()));
   needs_barrier_ =
       needs_barrier_ | (prev_outputs_.find(r_buf) != prev_outputs_.end());
   auto a_buf = static_cast<const MTL::Buffer*>(a.buffer().ptr());
   get_command_encoder()->setBuffer(a_buf, a.offset() + offset, idx);
+}
+
+std::vector<MTL::Buffer*> CommandEncoder::take_retained_buffers() {
+  std::vector<MTL::Buffer*> out;
+  out.swap(retained_buffers_);
+  return out;
 }
 
 void CommandEncoder::set_output_array(
@@ -398,11 +421,7 @@ void CommandEncoder::set_compute_pipeline_state(
     cur_dispatch_signpost_id_ = os_signpost_id_generate(log);
     const char* name = device_.pso_name(kernel);
     os_signpost_interval_begin(
-        log,
-        cur_dispatch_signpost_id_,
-        "kernel_dispatch",
-        "%{public}s",
-        name);
+        log, cur_dispatch_signpost_id_, "kernel_dispatch", "%{public}s", name);
   }
 }
 
@@ -472,8 +491,7 @@ void CommandEncoder::end_encoding() {
   os_signpost_id_t sid = OS_SIGNPOST_ID_NULL;
   if (signposts_enabled()) {
     sid = os_signpost_id_generate(signpost_log());
-    os_signpost_interval_begin(
-        signpost_log(), sid, "end_encoding");
+    os_signpost_interval_begin(signpost_log(), sid, "end_encoding");
   }
 
   // Remove temporaries from inputs and outputs.
@@ -528,8 +546,7 @@ void CommandEncoder::end_encoding() {
   all_inputs_.clear();
 
   if (sid != OS_SIGNPOST_ID_NULL) {
-    os_signpost_interval_end(
-        signpost_log(), sid, "end_encoding");
+    os_signpost_interval_end(signpost_log(), sid, "end_encoding");
   }
 }
 
@@ -911,8 +928,7 @@ MTL::ComputePipelineState* Device::get_kernel_(
 }
 
 const char* Device::pso_name(const MTL::ComputePipelineState* pso) const {
-  std::shared_lock lock(
-      const_cast<std::shared_mutex&>(kernel_mtx_));
+  std::shared_lock lock(const_cast<std::shared_mutex&>(kernel_mtx_));
   auto it = pso_names_.find(pso);
   if (it == pso_names_.end()) {
     return "?";
@@ -965,9 +981,10 @@ CommandEncoder& get_command_encoder(Stream s) {
   auto& encoders = get_command_encoders();
   auto it = encoders.find(s.index);
   if (it == encoders.end()) {
-    // Lazily initialize the command encoder for this stream on the current thread.
-    // This handles Swift structured concurrency where Tasks can migrate between
-    // threads, and the thread-local encoder map may not have the stream registered.
+    // Lazily initialize the command encoder for this stream on the current
+    // thread. This handles Swift structured concurrency where Tasks can migrate
+    // between threads, and the thread-local encoder map may not have the stream
+    // registered.
     auto& d = device(s.device);
     it = encoders.try_emplace(s.index, d, s.index, d.residency_set()).first;
   }
