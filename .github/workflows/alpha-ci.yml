@@ -30,7 +30,7 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Show toolchain
         run: |
@@ -39,7 +39,7 @@ jobs:
           uname -a
 
       - name: Cache CMake build directory
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: build
           key: cmake-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'mlx/backend/metal/CMakeLists.txt', 'mlx/backend/metal/kernels/**/*.metal', 'mlx/backend/metal/kernels/**/*.h') }}
