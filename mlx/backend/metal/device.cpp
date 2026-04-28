@@ -17,20 +17,6 @@
 #include "mlx/backend/metal/utils.h"
 #include "mlx/utils.h"
 
-namespace {
-// One-shot read of MLX_HAZARD_TRACE for env-gated diagnostic logging in
-// the command encoder. Set to non-empty/non-"0" to enable. See
-// benchmarks/notes/2026-04-26-turbo-perf-handoff.md (H12 investigation)
-// for what the output is used for.
-inline bool hazard_trace_enabled() {
-  static const bool v = []() {
-    const char* s = std::getenv("MLX_HAZARD_TRACE");
-    return s != nullptr && s[0] != '\0' && std::string(s) != "0";
-  }();
-  return v;
-}
-} // namespace
-
 namespace std {
 
 // Required for putting the pointer in unordered_set.
@@ -343,20 +329,8 @@ void CommandEncoder::set_input_array(
     buffer_input_sizes_ += a.data_size();
   }
   auto r_buf = static_cast<MTL::Resource*>(const_cast<void*>(a.buffer().ptr()));
-  bool prev_hit = (prev_outputs_.find(r_buf) != prev_outputs_.end());
-  needs_barrier_ = needs_barrier_ | prev_hit;
-  if (hazard_trace_enabled()) {
-    fprintf(
-        stderr,
-        "[HAZARD] disp=%llu kernel=%-40s INPUT  buf=%p idx=%d sz=%zu offset=%lld prev_hit=%d\n",
-        (unsigned long long)total_dispatches_,
-        current_kernel_name_,
-        a.buffer().ptr(),
-        idx,
-        a.data_size(),
-        (long long)(a.offset() + offset),
-        prev_hit ? 1 : 0);
-  }
+  needs_barrier_ =
+      needs_barrier_ | (prev_outputs_.find(r_buf) != prev_outputs_.end());
   auto a_buf = static_cast<const MTL::Buffer*>(a.buffer().ptr());
   get_command_encoder()->setBuffer(a_buf, a.offset() + offset, idx);
 }
@@ -376,23 +350,11 @@ void CommandEncoder::register_output_array(const array& a) {
   // input-side dedup hides that re-use. Counting every output materialization
   // gives the commit heuristic a truer picture of in-flight memory pressure
   // than the input-only counter alone.
-  bool first_seen = all_outputs_.insert(a.buffer().ptr()).second;
-  if (first_seen) {
+  if (all_outputs_.insert(a.buffer().ptr()).second) {
     buffer_output_sizes_ += a.data_size();
   }
 
   auto buf = static_cast<MTL::Resource*>(const_cast<void*>(a.buffer().ptr()));
-  if (hazard_trace_enabled()) {
-    fprintf(
-        stderr,
-        "[HAZARD] disp=%llu kernel=%-40s OUTPUT buf=%p sz=%zu first_seen=%d concurrent=%d\n",
-        (unsigned long long)total_dispatches_,
-        current_kernel_name_,
-        a.buffer().ptr(),
-        a.data_size(),
-        first_seen ? 1 : 0,
-        concurrent_ ? 1 : 0);
-  }
   if (concurrent_) {
     concurrent_outputs_.insert(buf);
   } else {
@@ -413,13 +375,6 @@ void CommandEncoder::add_temporaries(std::vector<array> arrays) {
 
 void CommandEncoder::maybeInsertBarrier() {
   if (needs_barrier_) {
-    if (hazard_trace_enabled()) {
-      fprintf(
-          stderr,
-          "[HAZARD] disp=%llu BARRIER inserted (prev->%zu live outputs)\n",
-          (unsigned long long)total_dispatches_,
-          next_outputs_.size());
-    }
     get_command_encoder()->memoryBarrier(MTL::BarrierScopeBuffers);
     needs_barrier_ = false;
     prev_outputs_ = std::move(next_outputs_);
@@ -432,14 +387,6 @@ void CommandEncoder::maybeInsertBarrier() {
 void CommandEncoder::set_compute_pipeline_state(
     MTL::ComputePipelineState* kernel) {
   get_command_encoder()->setComputePipelineState(kernel);
-  current_kernel_name_ = device_.pso_name(kernel);
-  if (hazard_trace_enabled()) {
-    fprintf(
-        stderr,
-        "[HAZARD] ===== bind kernel=%s (next disp=%llu) =====\n",
-        current_kernel_name_,
-        (unsigned long long)total_dispatches_);
-  }
   if (signposts_enabled()) {
     // Open a `kernel_dispatch` interval for this CPU encoding
     // window (set_compute_pipeline_state → set_buffer(s) →
@@ -571,16 +518,6 @@ void CommandEncoder::end_encoding() {
     }
   });
 
-  if (hazard_trace_enabled()) {
-    fprintf(
-        stderr,
-        "[HAZARD] disp=%llu END_ENCODING (cleared prev=%zu next=%zu all_in=%zu all_out=%zu)\n",
-        (unsigned long long)total_dispatches_,
-        prev_outputs_.size(),
-        next_outputs_.size(),
-        all_inputs_.size(),
-        all_outputs_.size());
-  }
   encoder_->endEncoding();
   encoder_.reset();
   needs_barrier_ = false;
