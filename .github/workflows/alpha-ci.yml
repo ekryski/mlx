@@ -28,7 +28,7 @@ jobs:
     if: github.repository_owner == 'ekryski'
     name: Build (M1 macOS)
     runs-on: macos-26
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -47,10 +47,21 @@ jobs:
             cmake-${{ runner.os }}-
 
       - name: Configure
-        run: cmake -S . -B build -DMLX_BUILD_TESTS=ON -DMLX_BUILD_PYTHON_BINDINGS=OFF
+        # Examples (linear_regression, logistic_regression, tutorial, ...) each
+        # link the full libmlx and add 5-10 min of build time without
+        # contributing CI signal. Disable.
+        run: |
+          cmake -S . -B build \
+            -DMLX_BUILD_TESTS=ON \
+            -DMLX_BUILD_EXAMPLES=OFF \
+            -DMLX_BUILD_PYTHON_BINDINGS=OFF
 
       - name: Build (libmlx + metallib + tests)
-        run: cmake --build build -j
+        # Cap parallelism at 2 on the 3-vCPU / 7 GB macos-26 runner. C++ template
+        # instantiation in the steel/attn kernels peaks at >2 GB per job — three
+        # concurrent compilers blow past 7 GB and trigger swap, which is *much*
+        # slower than a 2-job run. -j 2 finishes faster end-to-end.
+        run: cmake --build build -j 2
 
       - name: Verify build artifacts
         run: |
