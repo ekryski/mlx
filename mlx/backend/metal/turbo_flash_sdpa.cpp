@@ -2,11 +2,35 @@
 // phase 1.1 follow-up.
 
 #include "mlx/backend/common/compiled.h"
+#include "mlx/backend/metal/copy.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx/fast_primitives.h"
 
 namespace mlx::core::fast {
+
+namespace {
+
+// Force contiguous row-major layout for kernel inputs. Mirrors the pattern in
+// `turbo_quant.cpp`: callers slice from larger pre-allocated buffers
+// (`keyPackedMSE![..., ..<tokenCount, ...]`), and the resulting strided view
+// has the underlying buffer's stride along the token axis (`allocSteps`, not
+// `tokenCount`). The kernel's pointer arithmetic
+// (`k_packed + kv_idx * tokenCount * KEY_PACKED_WIDTH`) assumes a contiguous
+// `[num_kv_heads, tokenCount, KEY_PACKED_WIDTH]` layout, so we materialise a
+// contiguous copy when needed. The slice cost is far smaller than the kernel
+// itself and avoids the silent kv-head-1+ output zeroing that bit
+// GPT-OSS-20B turbo4v2 decode pre-fix.
+inline const array&
+ensure_contiguous(const array& x, const Stream& s, std::vector<array>& copies) {
+  if (x.flags().row_contiguous) {
+    return x;
+  }
+  copies.push_back(contiguous_copy_gpu(x, s));
+  return copies.back();
+}
+
+} // namespace
 
 void TurboFlashSDPA::eval_gpu(
     const std::vector<array>& inputs,
@@ -17,14 +41,18 @@ void TurboFlashSDPA::eval_gpu(
   auto& out = outputs[0];
   out.set_data(allocator::malloc(out.nbytes()));
 
-  const array& q = inputs[0];
-  const array& k_packed = inputs[1];
-  const array& k_norms = inputs[2];
-  const array& k_codebook = inputs[3];
-  const array& v_packed = inputs[4];
-  const array& v_norms = inputs[5];
-  const array& v_codebook = inputs[6];
-  const array* sinks_arr = has_sinks_ ? &inputs[7] : nullptr;
+  std::vector<array> copies;
+  copies.reserve(inputs.size());
+
+  const array& q = ensure_contiguous(inputs[0], s, copies);
+  const array& k_packed = ensure_contiguous(inputs[1], s, copies);
+  const array& k_norms = ensure_contiguous(inputs[2], s, copies);
+  const array& k_codebook = ensure_contiguous(inputs[3], s, copies);
+  const array& v_packed = ensure_contiguous(inputs[4], s, copies);
+  const array& v_norms = ensure_contiguous(inputs[5], s, copies);
+  const array& v_codebook = ensure_contiguous(inputs[6], s, copies);
+  const array* sinks_arr =
+      has_sinks_ ? &ensure_contiguous(inputs[7], s, copies) : nullptr;
 
   int total_q = q.shape(0);
   // token_count = N — number of K positions stored. Layout
@@ -72,6 +100,11 @@ void TurboFlashSDPA::eval_gpu(
   MTL::Size group_dims(1024, 1, 1);
   MTL::Size grid_dims(total_q, 1, 1);
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+
+  // Hand the strided→contiguous temporaries off to the encoder so MLX keeps
+  // their reference counts alive until the GPU work finishes. Mirrors the
+  // `TurboScore` / `TurboValue` pattern in `turbo_quant.cpp`.
+  compute_encoder.add_temporaries(std::move(copies));
 }
 
 bool TurboFlashSDPA::is_equivalent(const Primitive& other) const {
