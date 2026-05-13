@@ -51,12 +51,15 @@ template <int KeyBits, int ValueBits, int Dim>
   constexpr int qk_per_thread = (Dim + BD - 1) / BD;
   constexpr uint KEY_MASK = (1u << KeyBits) - 1u;
   constexpr uint VAL_MASK = (1u << ValueBits) - 1u;
-  constexpr int KEY_PACK_FACTOR = 32 / KeyBits;
-  constexpr int VAL_PACK_FACTOR = 32 / ValueBits;
-  constexpr int KEY_PACKED_WIDTH =
-      (Dim + KEY_PACK_FACTOR - 1) / KEY_PACK_FACTOR;
-  constexpr int VAL_PACKED_WIDTH =
-      (Dim + VAL_PACK_FACTOR - 1) / VAL_PACK_FACTOR;
+  // PackedWidth uses *bit-contiguous* packing (`(Dim * bits + 31) / 32`) to
+  // match the Swift encoder (`TurboQuantPacking.packedWidth`). The earlier
+  // `(Dim + PACK_FACTOR - 1) / PACK_FACTOR` form silently dropped the
+  // boundary-spanning values for bits ∉ {2, 4, 8, 16} — values where a 32-bit
+  // word doesn't hold an integer number of indices (3, 5, 6, 7). For those
+  // widths the encoder packs across word boundaries, and the unpack below
+  // (mirroring `turbo_flash.metal`) handles the spill.
+  constexpr int KEY_PACKED_WIDTH = (Dim * KeyBits + 31) / 32;
+  constexpr int VAL_PACKED_WIDTH = (Dim * ValueBits + 31) / 32;
   constexpr uint KEY_LEVELS = 1u << KeyBits;
   constexpr uint VAL_LEVELS = 1u << ValueBits;
 
@@ -148,9 +151,20 @@ template <int KeyBits, int ValueBits, int Dim>
           k[j] = 0;
           continue;
         }
-        int word_idx = d / KEY_PACK_FACTOR;
-        int shift = (d % KEY_PACK_FACTOR) * KeyBits;
-        uint val_idx = (k_packed_t[word_idx] >> shift) & KEY_MASK;
+        // Bit-contiguous unpacking — matches the encoder
+        // (`TurboQuantPacking.packLowBit`) and `turbo_flash.metal`. For
+        // bits ∈ {3, 5, 6, 7} values span word boundaries; the spill
+        // branch stitches the low bits in.
+        uint bit_offset = (uint)(d * KeyBits);
+        uint word_idx = bit_offset / 32u;
+        uint shift = bit_offset % 32u;
+        uint val_idx = (k_packed_t[word_idx] >> shift);
+        int spill = (int)shift + (int)KeyBits - 32;
+        if (spill > 0) {
+          val_idx |=
+              (k_packed_t[word_idx + 1] << ((uint)KeyBits - (uint)spill));
+        }
+        val_idx &= KEY_MASK;
         k[j] = tg_key_codebook[val_idx] * k_norm;
       }
 
@@ -182,9 +196,17 @@ template <int KeyBits, int ValueBits, int Dim>
             v[j] = 0;
             continue;
           }
-          int word_idx = d / VAL_PACK_FACTOR;
-          int shift = (d % VAL_PACK_FACTOR) * ValueBits;
-          uint val_idx = (v_packed_t[word_idx] >> shift) & VAL_MASK;
+          // Same bit-contiguous unpacking as K above.
+          uint bit_offset = (uint)(d * ValueBits);
+          uint word_idx = bit_offset / 32u;
+          uint shift = bit_offset % 32u;
+          uint val_idx = (v_packed_t[word_idx] >> shift);
+          int spill = (int)shift + (int)ValueBits - 32;
+          if (spill > 0) {
+            val_idx |=
+                (v_packed_t[word_idx + 1] << ((uint)ValueBits - (uint)spill));
+          }
+          val_idx &= VAL_MASK;
           v[j] = tg_val_codebook[val_idx] * v_norm;
         }
 
