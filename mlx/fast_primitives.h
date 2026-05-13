@@ -1131,7 +1131,8 @@ class FlashQuantizedSDPA : public Custom {
       int bits,
       int group_size,
       int n_q_heads,
-      int n_kv_heads)
+      int n_kv_heads,
+      int window_size = -1)
       : Custom(stream, std::move(fallback)),
         scale_(scale),
         do_causal_(do_causal),
@@ -1139,7 +1140,8 @@ class FlashQuantizedSDPA : public Custom {
         bits_(bits),
         group_size_(group_size),
         n_q_heads_(n_q_heads),
-        n_kv_heads_(n_kv_heads) {}
+        n_kv_heads_(n_kv_heads),
+        window_size_(window_size) {}
 
   void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
       override {
@@ -1160,7 +1162,8 @@ class FlashQuantizedSDPA : public Custom {
         bits_,
         group_size_,
         n_q_heads_,
-        n_kv_heads_);
+        n_kv_heads_,
+        window_size_);
   }
 
  private:
@@ -1171,6 +1174,7 @@ class FlashQuantizedSDPA : public Custom {
   int group_size_;
   int n_q_heads_;
   int n_kv_heads_;
+  int window_size_;
 };
 
 // Spec 040: Mamba / Mamba 2 selective-SSM step + delta-log capture for

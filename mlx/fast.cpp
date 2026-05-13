@@ -2107,6 +2107,7 @@ array flash_quantized_sdpa(
     const std::string& mask_mode /* = "" */,
     std::optional<array> mask_arr /* = {} */,
     const std::optional<array>& sinks /* = {} */,
+    int window_size /* = -1 */,
     StreamOrDevice s_ /* = {} */) {
   auto s = to_stream(s_);
 
@@ -2119,6 +2120,10 @@ array flash_quantized_sdpa(
   if (!mask_mode.empty() && mask_mode != "causal" && mask_mode != "array") {
     throw std::invalid_argument(
         "[flash_quantized_sdpa] mask_mode must be 'causal', 'array', or ''");
+  }
+  if (window_size > 0 && !do_causal) {
+    throw std::invalid_argument(
+        "[flash_quantized_sdpa] window_size > 0 requires mask_mode='causal'");
   }
 
   int B = queries.shape(0);
@@ -2166,7 +2171,8 @@ array flash_quantized_sdpa(
           bits,
           group_size,
           n_q_heads,
-          n_kv_heads),
+          n_kv_heads,
+          window_size),
       std::move(inputs));
 }
 

@@ -464,6 +464,7 @@ MLX_API array flash_quantized_sdpa(
     const std::string& mask_mode = "",
     std::optional<array> mask_arr = {},
     const std::optional<array>& sinks = {},
+    int window_size = -1,
     StreamOrDevice s = {});
 
 /// Mamba state-replay primitive — sequential SSM step with per-step delta-log
