@@ -1177,6 +1177,75 @@ class FlashQuantizedSDPA : public Custom {
   int window_size_;
 };
 
+// TurboQuant fused single-pass SDPA with sinks — spec 041 phase 1.1 follow-up
+// for sinks-using models (GPT-OSS family). Single-kernel online-softmax SDPA
+// over MSE-codec compressed K and V (`turbo_encode_wht` layout). Output is in
+// rotated V space; caller applies the inverse rotation afterward.
+//
+// Inputs:
+//   queries:    [B*nQ, D] float (caller pre-rotates + pre-scales)
+//   k_packed:   [B*nKV, N, KeyPackedWidth] uint32
+//   k_norms:    [B*nKV, N] float
+//   k_codebook: [2^KeyBits] float
+//   v_packed:   [B*nKV, N, ValuePackedWidth] uint32
+//   v_norms:    [B*nKV, N] float
+//   v_codebook: [2^ValueBits] float
+//   sinks?:     [nQ] T per-head sink logits
+//
+// Output: [B*nQ, D] bfloat (rotated-V space; caller applies inverse rotation)
+class TurboFlashSDPA : public Custom {
+ public:
+  TurboFlashSDPA(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int key_bits,
+      int value_bits,
+      int dim,
+      int repeat_count,
+      bool has_sinks,
+      bool do_causal,
+      int window_size)
+      : Custom(stream, std::move(fallback)),
+        key_bits_(key_bits),
+        value_bits_(value_bits),
+        dim_(dim),
+        repeat_count_(repeat_count),
+        has_sinks_(has_sinks),
+        do_causal_(do_causal),
+        window_size_(window_size) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("TurboFlashSDPA only runs on GPU");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(TurboFlashSDPA)
+  bool is_equivalent(const Primitive& other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
+  auto state() const {
+    return std::make_tuple(
+        nullptr,
+        key_bits_,
+        value_bits_,
+        dim_,
+        repeat_count_,
+        has_sinks_,
+        do_causal_,
+        window_size_);
+  }
+
+ private:
+  int key_bits_;
+  int value_bits_;
+  int dim_;
+  int repeat_count_;
+  bool has_sinks_;
+  bool do_causal_;
+  int window_size_;
+};
+
 // Spec 040: Mamba / Mamba 2 selective-SSM step + delta-log capture for
 // state-replay rollback. Sequential per-step recurrence — written this way
 // (instead of leveraging ssmAttn's parallel scan) so we can materialise the
