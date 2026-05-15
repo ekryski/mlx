@@ -61,13 +61,21 @@ template <
   // same packed K/V word from device memory (8× redundant for 4-bit).
   // Now: one cooperative load of codebook + one cooperative load of
   // each packed word per K/V iteration.
-  threadgroup float tg_key_cb[KEY_LEVELS];
-  threadgroup float tg_val_cb[VAL_LEVELS];
+  //
+  // Spec 042 §7b — codebook + V accumulator move to fp16. Codebooks
+  // are small (≤ 256 entries) and the values fit comfortably in fp16
+  // range; storing as half halves TG-memory bank traffic on M1.
+  // V accumulator `o[]` matches the spec 043 Phase 2 swap that lives
+  // in turbo_flash_sdpa.h. Softmax `m`, `l` stay fp32. Score path
+  // (`q · tg_key_cb`) Metal-promotes half * float → float so the dot
+  // product still accumulates in fp32 before the simd_sum reduction.
+  threadgroup half tg_key_cb[KEY_LEVELS];
+  threadgroup half tg_val_cb[VAL_LEVELS];
   threadgroup uint32_t tg_packed[MAX_PW];
   for (uint i = lane; i < KEY_LEVELS; i += 32)
-    tg_key_cb[i] = key_codebook[i];
+    tg_key_cb[i] = static_cast<half>(key_codebook[i]);
   for (uint i = lane; i < VAL_LEVELS; i += 32)
-    tg_val_cb[i] = val_codebook[i];
+    tg_val_cb[i] = static_cast<half>(val_codebook[i]);
 
   float q_vals[DIMS_PER_LANE];
   for (uint i = 0; i < DIMS_PER_LANE; i++) {
@@ -77,9 +85,9 @@ template <
 
   float m = -INFINITY;
   float l = 0.0f;
-  float o[DIMS_PER_LANE];
+  half o[DIMS_PER_LANE];
   for (uint i = 0; i < DIMS_PER_LANE; i++)
-    o[i] = 0.0f;
+    o[i] = half(0);
 
   // Barrier covers codebook write-then-read AND TG-cache-init →
   // first-iteration write — keeps a single sync at kernel head.
@@ -226,14 +234,14 @@ template <
   if (t_end > q_abs + 1)
     t_end = q_abs + 1;
 
-  // Spec 042 §2 + spec 043 Phase 1 — see turbo_flash_p1 comment.
-  threadgroup float tg_key_cb[KEY_LEVELS];
-  threadgroup float tg_val_cb[VAL_LEVELS];
+  // Spec 042 §2 + spec 043 Phase 1 + §7b — see turbo_flash_p1 comment.
+  threadgroup half tg_key_cb[KEY_LEVELS];
+  threadgroup half tg_val_cb[VAL_LEVELS];
   threadgroup uint32_t tg_packed[MAX_PW];
   for (uint i = lane; i < KEY_LEVELS; i += 32)
-    tg_key_cb[i] = key_codebook[i];
+    tg_key_cb[i] = static_cast<half>(key_codebook[i]);
   for (uint i = lane; i < VAL_LEVELS; i += 32)
-    tg_val_cb[i] = val_codebook[i];
+    tg_val_cb[i] = static_cast<half>(val_codebook[i]);
 
   float q_vals[DIMS_PER_LANE];
   for (uint i = 0; i < DIMS_PER_LANE; i++) {
@@ -243,9 +251,9 @@ template <
 
   float m = -INFINITY;
   float l = 0.0f;
-  float o[DIMS_PER_LANE];
+  half o[DIMS_PER_LANE];
   for (uint i = 0; i < DIMS_PER_LANE; i++)
-    o[i] = 0.0f;
+    o[i] = half(0);
 
   simdgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -364,17 +372,17 @@ template <
   if (t_end > uint(token_count))
     t_end = uint(token_count);
 
-  // Spec 042 §2 + spec 043 Phase 1 — see turbo_flash_p1 comment. NR0 path
-  // additionally amortises K/V dequant across NR0 queries; the
+  // Spec 042 §2 + spec 043 Phase 1 + §7b — see turbo_flash_p1 comment.
+  // NR0 path additionally amortises K/V dequant across NR0 queries; the
   // cooperative load happens BEFORE that per-token dequant (same K/V is
   // reused by all NR0 score computations).
-  threadgroup float tg_key_cb[KEY_LEVELS];
-  threadgroup float tg_val_cb[VAL_LEVELS];
+  threadgroup half tg_key_cb[KEY_LEVELS];
+  threadgroup half tg_val_cb[VAL_LEVELS];
   threadgroup uint32_t tg_packed[MAX_PW];
   for (uint i = lane; i < KEY_LEVELS; i += 32)
-    tg_key_cb[i] = key_codebook[i];
+    tg_key_cb[i] = static_cast<half>(key_codebook[i]);
   for (uint i = lane; i < VAL_LEVELS; i += 32)
-    tg_val_cb[i] = val_codebook[i];
+    tg_val_cb[i] = static_cast<half>(val_codebook[i]);
 
   // Load query values for ALL NR0 rows — each row's dims interleaved in
   // registers
@@ -394,15 +402,16 @@ template <
     kv_indices[r] = (query_group * NR0 + r) / uint(repeat_count);
   }
 
-  // Online softmax state — NR0 independent streams, all in registers
+  // Online softmax state — NR0 independent streams. Softmax m/l stay
+  // fp32 for dynamic-range stability; V accumulator drops to fp16.
   float m_state[NR0];
   float l_state[NR0];
-  float o_state[NR0 * DIMS_PER_LANE];
+  half o_state[NR0 * DIMS_PER_LANE];
   for (uint r = 0; r < NR0; r++) {
     m_state[r] = -INFINITY;
     l_state[r] = 0.0f;
     for (uint i = 0; i < DIMS_PER_LANE; i++) {
-      o_state[r * DIMS_PER_LANE + i] = 0.0f;
+      o_state[r * DIMS_PER_LANE + i] = half(0);
     }
   }
 
@@ -591,16 +600,16 @@ template <
   if (t_end > max_q_abs + 1)
     t_end = max_q_abs + 1;
 
-  // Spec 042 §2 + spec 043 Phase 1 — see turbo_flash_p1_nr0 comment.
+  // Spec 042 §2 + spec 043 Phase 1 + §7b — see turbo_flash_p1_nr0 comment.
   constexpr uint MAX_PW =
       KeyPackedWidth > ValuePackedWidth ? KeyPackedWidth : ValuePackedWidth;
-  threadgroup float tg_key_cb[KEY_LEVELS];
-  threadgroup float tg_val_cb[VAL_LEVELS];
+  threadgroup half tg_key_cb[KEY_LEVELS];
+  threadgroup half tg_val_cb[VAL_LEVELS];
   threadgroup uint32_t tg_packed[MAX_PW];
   for (uint i = lane; i < KEY_LEVELS; i += 32)
-    tg_key_cb[i] = key_codebook[i];
+    tg_key_cb[i] = static_cast<half>(key_codebook[i]);
   for (uint i = lane; i < VAL_LEVELS; i += 32)
-    tg_val_cb[i] = val_codebook[i];
+    tg_val_cb[i] = static_cast<half>(val_codebook[i]);
 
   // Load query values for all NR0 rows
   float q_vals[NR0 * DIMS_PER_LANE];
@@ -617,15 +626,16 @@ template <
   uint q_head_idx_0 = (query_group * NR0) / uint(L);
   uint kv_idx = q_head_idx_0 / uint(repeat_count);
 
-  // Online softmax state — NR0 independent streams
+  // Online softmax state — NR0 independent streams. Softmax m/l stay
+  // fp32; V accumulator drops to fp16.
   float m_state[NR0];
   float l_state[NR0];
-  float o_state[NR0 * DIMS_PER_LANE];
+  half o_state[NR0 * DIMS_PER_LANE];
   for (uint r = 0; r < NR0; r++) {
     m_state[r] = -INFINITY;
     l_state[r] = 0.0f;
     for (uint i = 0; i < DIMS_PER_LANE; i++)
-      o_state[r * DIMS_PER_LANE + i] = 0.0f;
+      o_state[r * DIMS_PER_LANE + i] = half(0);
   }
 
   simdgroup_barrier(mem_flags::mem_threadgroup);

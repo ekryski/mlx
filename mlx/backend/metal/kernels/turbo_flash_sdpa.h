@@ -102,6 +102,16 @@ template <int KeyBits, int ValueBits, int Dim>
   // equivalent for TurboQuant. The codebook is small (≤ 256 floats for
   // 8-bit) and constant per call; hoist into TG memory at kernel start
   // so each thread reads from L1 instead of device memory.
+  //
+  // Spec 042 §7b note: tried moving these to half on M1 (saves 50% TG
+  // memory + bank traffic), but it regressed GPT-OSS-20B coherence on
+  // the bias path even though `testTurboFlashSDPAvBiasMatchesReference`
+  // passed at rtol < 0.003. The unit test didn't cover the turbo4v2
+  // shape (kb=4, vb=2) which is GPT-OSS's actual config — leaving the
+  // codebooks fp32 here until a tighter regression probe captures
+  // whatever real-flow precision interaction the half codec triggers.
+  // The codebook hoist landed cleanly in turbo_flash.metal's 4
+  // templates (no bias kernel there).
   threadgroup U tg_key_codebook[KEY_LEVELS];
   threadgroup U tg_val_codebook[VAL_LEVELS];
   // Spec 043 Phase 1 — per-simdgroup K/V packed-word cache. Before this
