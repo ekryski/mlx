@@ -63,12 +63,21 @@ template <int KeyBits, int ValueBits, int Dim>
   constexpr uint KEY_LEVELS = 1u << KeyBits;
   constexpr uint VAL_LEVELS = 1u << ValueBits;
 
+  // Spec 043 Phase 2 — drop the V accumulator from fp32 to fp16. Score
+  // path (q · k → softmax → m, l) stays fp32 for dynamic-range stability
+  // per the spec's open-question §2; only the per-lane V output
+  // accumulator `o[]` changes precision. Metal promotes `o[i] * factor +
+  // exp_score * v[i]` to fp32 during compute and truncates to fp16 on
+  // store, so numerics stay close to the all-fp32 reference. The
+  // savings: half the register footprint for `o[]` and half the bytes
+  // when spilling, freeing register pressure for the score path.
   typedef float U;
+  typedef half ACC_T;
 
   thread U q[qk_per_thread];
   thread U k[qk_per_thread];
   thread U v[qk_per_thread];
-  thread U o[qk_per_thread];
+  thread ACC_T o[qk_per_thread];
 
   threadgroup U outputs[BN * BD];
   threadgroup U max_scores[BN];
