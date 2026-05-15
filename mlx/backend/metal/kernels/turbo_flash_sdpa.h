@@ -80,6 +80,16 @@ template <int KeyBits, int ValueBits, int Dim>
   // so each thread reads from L1 instead of device memory.
   threadgroup U tg_key_codebook[KEY_LEVELS];
   threadgroup U tg_val_codebook[VAL_LEVELS];
+  // Spec 043 Phase 1 — per-simdgroup K/V packed-word cache. Before this
+  // change, every lane that touched dim `d` loaded the packed word
+  // containing `d` from device memory; for 4-bit Dim=128 that's 8 lanes
+  // redundantly loading each of 16 words per K position. Now one lane
+  // loads the word into TG memory and all 32 lanes read the cache.
+  // Reused for K then V within the same iteration (V's reload happens
+  // after the K-score loop, so the buffer is free to overwrite).
+  constexpr int MAX_PW =
+      KEY_PACKED_WIDTH > VAL_PACKED_WIDTH ? KEY_PACKED_WIDTH : VAL_PACKED_WIDTH;
+  threadgroup uint32_t tg_packed[BN][MAX_PW];
   uint linear_tid = simd_gid * BD + simd_lid;
   for (uint i = linear_tid; i < KEY_LEVELS; i += BN * BD) {
     tg_key_codebook[i] = static_cast<U>(k_codebook[i]);
@@ -140,8 +150,16 @@ template <int KeyBits, int ValueBits, int Dim>
     }
 
     if (use_key) {
-      // Inline dequant K[i] for this thread's qk_per_thread dim slice.
+      // Spec 043 Phase 1 — cooperative K packed-word load into this
+      // simdgroup's TG slot, then every lane reads the packed bytes
+      // from cache. Eliminates the per-lane redundant device load (8x
+      // for 4-bit, 4x for 8-bit, 16x for 2-bit).
       const device uint32_t* k_packed_t = k_packed_head + i * KEY_PACKED_WIDTH;
+      for (int w = simd_lid; w < KEY_PACKED_WIDTH; w += BD) {
+        tg_packed[simd_gid][w] = k_packed_t[w];
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+
       U k_norm = static_cast<U>(k_norms_head[i]);
 
 #pragma clang loop unroll(full)
@@ -151,18 +169,18 @@ template <int KeyBits, int ValueBits, int Dim>
           k[j] = 0;
           continue;
         }
-        // Bit-contiguous unpacking — matches the encoder
-        // (`TurboQuantPacking.packLowBit`) and `turbo_flash.metal`. For
-        // bits ∈ {3, 5, 6, 7} values span word boundaries; the spill
-        // branch stitches the low bits in.
+        // Bit-contiguous unpacking from the TG cache — matches the
+        // encoder (`TurboQuantPacking.packLowBit`). For bits ∈
+        // {3, 5, 6, 7} values span word boundaries; the spill branch
+        // stitches the low bits in.
         uint bit_offset = (uint)(d * KeyBits);
         uint word_idx = bit_offset / 32u;
         uint shift = bit_offset % 32u;
-        uint val_idx = (k_packed_t[word_idx] >> shift);
+        uint val_idx = (tg_packed[simd_gid][word_idx] >> shift);
         int spill = (int)shift + (int)KeyBits - 32;
         if (spill > 0) {
-          val_idx |=
-              (k_packed_t[word_idx + 1] << ((uint)KeyBits - (uint)spill));
+          val_idx |= (tg_packed[simd_gid][word_idx + 1]
+                      << ((uint)KeyBits - (uint)spill));
         }
         val_idx &= KEY_MASK;
         k[j] = tg_key_codebook[val_idx] * k_norm;
@@ -185,8 +203,16 @@ template <int KeyBits, int ValueBits, int Dim>
 
       // Inline dequant V[i] for this thread's dim slice.
       if (exp_score > 1e-20) {
+        // Spec 043 Phase 1 — cooperative V packed-word load. Reuses
+        // tg_packed[simd_gid][..] (K's load already finished its
+        // simd_sum + softmax, so the buffer is free to overwrite).
         const device uint32_t* v_packed_t =
             v_packed_head + i * VAL_PACKED_WIDTH;
+        for (int w = simd_lid; w < VAL_PACKED_WIDTH; w += BD) {
+          tg_packed[simd_gid][w] = v_packed_t[w];
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
         U v_norm = static_cast<U>(v_norms_head[i]);
 
 #pragma clang loop unroll(full)
@@ -196,15 +222,16 @@ template <int KeyBits, int ValueBits, int Dim>
             v[j] = 0;
             continue;
           }
-          // Same bit-contiguous unpacking as K above.
+          // Same bit-contiguous unpacking as K above, against the
+          // shared TG cache.
           uint bit_offset = (uint)(d * ValueBits);
           uint word_idx = bit_offset / 32u;
           uint shift = bit_offset % 32u;
-          uint val_idx = (v_packed_t[word_idx] >> shift);
+          uint val_idx = (tg_packed[simd_gid][word_idx] >> shift);
           int spill = (int)shift + (int)ValueBits - 32;
           if (spill > 0) {
-            val_idx |=
-                (v_packed_t[word_idx + 1] << ((uint)ValueBits - (uint)spill));
+            val_idx |= (tg_packed[simd_gid][word_idx + 1]
+                        << ((uint)ValueBits - (uint)spill));
           }
           val_idx &= VAL_MASK;
           v[j] = tg_val_codebook[val_idx] * v_norm;

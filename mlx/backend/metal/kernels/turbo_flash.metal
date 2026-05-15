@@ -42,6 +42,8 @@ template <
   constexpr uint VAL_MASK = (1u << ValueBits) - 1u;
   constexpr uint VAL_LEVELS = 1u << ValueBits;
   constexpr uint DIMS_PER_LANE = (Dim + 31) / 32;
+  constexpr uint MAX_PW =
+      KeyPackedWidth > ValuePackedWidth ? KeyPackedWidth : ValuePackedWidth;
 
   uint lane = pos.x;
   uint q_idx = pos.y;
@@ -53,12 +55,19 @@ template <
   if (t_end > uint(token_count))
     t_end = uint(token_count);
 
-  float key_cb[KEY_LEVELS];
-  for (uint i = 0; i < KEY_LEVELS; i++)
-    key_cb[i] = key_codebook[i];
-  float val_cb[VAL_LEVELS];
-  for (uint i = 0; i < VAL_LEVELS; i++)
-    val_cb[i] = val_codebook[i];
+  // Spec 042 §2 + spec 043 Phase 1 — threadgroup-shared codebooks +
+  // per-token packed-word cache. Was: each of 32 lanes copied the full
+  // codebook into thread registers (32× redundant) and re-loaded the
+  // same packed K/V word from device memory (8× redundant for 4-bit).
+  // Now: one cooperative load of codebook + one cooperative load of
+  // each packed word per K/V iteration.
+  threadgroup float tg_key_cb[KEY_LEVELS];
+  threadgroup float tg_val_cb[VAL_LEVELS];
+  threadgroup uint32_t tg_packed[MAX_PW];
+  for (uint i = lane; i < KEY_LEVELS; i += 32)
+    tg_key_cb[i] = key_codebook[i];
+  for (uint i = lane; i < VAL_LEVELS; i += 32)
+    tg_val_cb[i] = val_codebook[i];
 
   float q_vals[DIMS_PER_LANE];
   for (uint i = 0; i < DIMS_PER_LANE; i++) {
@@ -72,9 +81,18 @@ template <
   for (uint i = 0; i < DIMS_PER_LANE; i++)
     o[i] = 0.0f;
 
+  // Barrier covers codebook write-then-read AND TG-cache-init →
+  // first-iteration write — keeps a single sync at kernel head.
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+
   for (uint t = t_start; t < t_end; t++) {
+    // Cooperative K packed-word load into TG cache (spec 043 Phase 1).
     const device uint32_t* k_packed_ptr = key_packed +
         kv_idx * uint(token_count) * KeyPackedWidth + t * KeyPackedWidth;
+    for (uint w = lane; w < KeyPackedWidth; w += 32)
+      tg_packed[w] = k_packed_ptr[w];
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
     float k_norm = key_norms[kv_idx * uint(token_count) + t];
 
     float dot_partial = 0.0f;
@@ -85,13 +103,13 @@ template <
       uint k_bit_offset = d * KeyBits;
       uint k_word_idx = k_bit_offset / 32;
       uint k_shift = k_bit_offset % 32;
-      uint k_value = (k_packed_ptr[k_word_idx] >> k_shift);
+      uint k_value = (tg_packed[k_word_idx] >> k_shift);
       int k_spill = (int)k_shift + (int)KeyBits - 32;
       if (k_spill > 0)
         k_value |=
-            (k_packed_ptr[k_word_idx + 1] << ((uint)KeyBits - (uint)k_spill));
+            (tg_packed[k_word_idx + 1] << ((uint)KeyBits - (uint)k_spill));
       k_value &= KEY_MASK;
-      dot_partial += q_vals[i] * key_cb[k_value];
+      dot_partial += q_vals[i] * tg_key_cb[k_value];
     }
     float score = simd_sum(dot_partial) * k_norm;
 
@@ -99,8 +117,14 @@ template <
     float exp_diff = exp(m - new_m);
     float exp_score = exp(score - new_m);
 
+    // Cooperative V packed-word load into TG cache (reuses tg_packed —
+    // K's read above finished into thread registers before this point).
     const device uint32_t* v_packed_ptr = val_packed +
         kv_idx * uint(token_count) * ValuePackedWidth + t * ValuePackedWidth;
+    for (uint w = lane; w < ValuePackedWidth; w += 32)
+      tg_packed[w] = v_packed_ptr[w];
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
     float v_norm = val_norms[kv_idx * uint(token_count) + t];
 
     for (uint i = 0; i < DIMS_PER_LANE; i++) {
@@ -110,13 +134,13 @@ template <
       uint v_bit_offset = d * ValueBits;
       uint v_word_idx = v_bit_offset / 32;
       uint v_shift = v_bit_offset % 32;
-      uint v_value = (v_packed_ptr[v_word_idx] >> v_shift);
+      uint v_value = (tg_packed[v_word_idx] >> v_shift);
       int v_spill = (int)v_shift + (int)ValueBits - 32;
       if (v_spill > 0)
         v_value |=
-            (v_packed_ptr[v_word_idx + 1] << ((uint)ValueBits - (uint)v_spill));
+            (tg_packed[v_word_idx + 1] << ((uint)ValueBits - (uint)v_spill));
       v_value &= VAL_MASK;
-      o[i] = o[i] * exp_diff + exp_score * (val_cb[v_value] * v_norm);
+      o[i] = o[i] * exp_diff + exp_score * (tg_val_cb[v_value] * v_norm);
     }
     l = l * exp_diff + exp_score;
     m = new_m;
@@ -167,6 +191,8 @@ template <
   constexpr uint VAL_MASK = (1u << ValueBits) - 1u;
   constexpr uint VAL_LEVELS = 1u << ValueBits;
   constexpr uint DIMS_PER_LANE = (Dim + 31) / 32;
+  constexpr uint MAX_PW =
+      KeyPackedWidth > ValuePackedWidth ? KeyPackedWidth : ValuePackedWidth;
 
   uint lane = pos.x;
   uint q_idx = pos.y;
@@ -200,12 +226,14 @@ template <
   if (t_end > q_abs + 1)
     t_end = q_abs + 1;
 
-  float key_cb[KEY_LEVELS];
-  for (uint i = 0; i < KEY_LEVELS; i++)
-    key_cb[i] = key_codebook[i];
-  float val_cb[VAL_LEVELS];
-  for (uint i = 0; i < VAL_LEVELS; i++)
-    val_cb[i] = val_codebook[i];
+  // Spec 042 §2 + spec 043 Phase 1 — see turbo_flash_p1 comment.
+  threadgroup float tg_key_cb[KEY_LEVELS];
+  threadgroup float tg_val_cb[VAL_LEVELS];
+  threadgroup uint32_t tg_packed[MAX_PW];
+  for (uint i = lane; i < KEY_LEVELS; i += 32)
+    tg_key_cb[i] = key_codebook[i];
+  for (uint i = lane; i < VAL_LEVELS; i += 32)
+    tg_val_cb[i] = val_codebook[i];
 
   float q_vals[DIMS_PER_LANE];
   for (uint i = 0; i < DIMS_PER_LANE; i++) {
@@ -219,9 +247,15 @@ template <
   for (uint i = 0; i < DIMS_PER_LANE; i++)
     o[i] = 0.0f;
 
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+
   for (uint t = t_start; t < t_end; t++) {
     const device uint32_t* k_packed_ptr = key_packed +
         kv_idx * uint(token_count) * KeyPackedWidth + t * KeyPackedWidth;
+    for (uint w = lane; w < KeyPackedWidth; w += 32)
+      tg_packed[w] = k_packed_ptr[w];
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
     float k_norm = key_norms[kv_idx * uint(token_count) + t];
 
     float dot_partial = 0.0f;
@@ -232,13 +266,13 @@ template <
       uint k_bit_offset = d * KeyBits;
       uint k_word_idx = k_bit_offset / 32;
       uint k_shift = k_bit_offset % 32;
-      uint k_value = (k_packed_ptr[k_word_idx] >> k_shift);
+      uint k_value = (tg_packed[k_word_idx] >> k_shift);
       int k_spill = (int)k_shift + (int)KeyBits - 32;
       if (k_spill > 0)
         k_value |=
-            (k_packed_ptr[k_word_idx + 1] << ((uint)KeyBits - (uint)k_spill));
+            (tg_packed[k_word_idx + 1] << ((uint)KeyBits - (uint)k_spill));
       k_value &= KEY_MASK;
-      dot_partial += q_vals[i] * key_cb[k_value];
+      dot_partial += q_vals[i] * tg_key_cb[k_value];
     }
     float score = simd_sum(dot_partial) * k_norm;
 
@@ -248,6 +282,10 @@ template <
 
     const device uint32_t* v_packed_ptr = val_packed +
         kv_idx * uint(token_count) * ValuePackedWidth + t * ValuePackedWidth;
+    for (uint w = lane; w < ValuePackedWidth; w += 32)
+      tg_packed[w] = v_packed_ptr[w];
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
     float v_norm = val_norms[kv_idx * uint(token_count) + t];
 
     for (uint i = 0; i < DIMS_PER_LANE; i++) {
@@ -257,13 +295,13 @@ template <
       uint v_bit_offset = d * ValueBits;
       uint v_word_idx = v_bit_offset / 32;
       uint v_shift = v_bit_offset % 32;
-      uint v_value = (v_packed_ptr[v_word_idx] >> v_shift);
+      uint v_value = (tg_packed[v_word_idx] >> v_shift);
       int v_spill = (int)v_shift + (int)ValueBits - 32;
       if (v_spill > 0)
         v_value |=
-            (v_packed_ptr[v_word_idx + 1] << ((uint)ValueBits - (uint)v_spill));
+            (tg_packed[v_word_idx + 1] << ((uint)ValueBits - (uint)v_spill));
       v_value &= VAL_MASK;
-      o[i] = o[i] * exp_diff + exp_score * (val_cb[v_value] * v_norm);
+      o[i] = o[i] * exp_diff + exp_score * (tg_val_cb[v_value] * v_norm);
     }
     l = l * exp_diff + exp_score;
     m = new_m;
@@ -313,6 +351,8 @@ template <
   constexpr uint VAL_MASK = (1u << ValueBits) - 1u;
   constexpr uint VAL_LEVELS = 1u << ValueBits;
   constexpr uint DIMS_PER_LANE = (Dim + 31) / 32;
+  constexpr uint MAX_PW =
+      KeyPackedWidth > ValuePackedWidth ? KeyPackedWidth : ValuePackedWidth;
 
   uint lane = pos.x; // SIMD lane (0-31)
   uint query_group = pos.y; // which group of NR0 queries
@@ -324,17 +364,17 @@ template <
   if (t_end > uint(token_count))
     t_end = uint(token_count);
 
-  // Load key codebook into registers (shared across all NR0 queries)
-  float key_cb[KEY_LEVELS];
-  for (uint i = 0; i < KEY_LEVELS; i++) {
-    key_cb[i] = key_codebook[i];
-  }
-
-  // Load value codebook into registers (shared across all NR0 queries)
-  float val_cb[VAL_LEVELS];
-  for (uint i = 0; i < VAL_LEVELS; i++) {
-    val_cb[i] = val_codebook[i];
-  }
+  // Spec 042 §2 + spec 043 Phase 1 — see turbo_flash_p1 comment. NR0 path
+  // additionally amortises K/V dequant across NR0 queries; the
+  // cooperative load happens BEFORE that per-token dequant (same K/V is
+  // reused by all NR0 score computations).
+  threadgroup float tg_key_cb[KEY_LEVELS];
+  threadgroup float tg_val_cb[VAL_LEVELS];
+  threadgroup uint32_t tg_packed[MAX_PW];
+  for (uint i = lane; i < KEY_LEVELS; i += 32)
+    tg_key_cb[i] = key_codebook[i];
+  for (uint i = lane; i < VAL_LEVELS; i += 32)
+    tg_val_cb[i] = val_codebook[i];
 
   // Load query values for ALL NR0 rows — each row's dims interleaved in
   // registers
@@ -366,10 +406,19 @@ template <
     }
   }
 
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+
   // Process tokens in this block — KV dequant done ONCE, reused across NR0
   // queries
   for (uint t = t_start; t < t_end; t++) {
-    // --- Dequant K for this token ONCE (amortized across NR0 queries) ---
+    // --- Cooperative K packed-word load + dequant ONCE ---
+    const device uint32_t* k_packed_ptr = key_packed +
+        kv_indices[0] * uint(token_count) * KeyPackedWidth +
+        t * KeyPackedWidth;
+    for (uint w = lane; w < KeyPackedWidth; w += 32)
+      tg_packed[w] = k_packed_ptr[w];
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
     float k_decoded[DIMS_PER_LANE];
     for (uint i = 0; i < DIMS_PER_LANE; i++) {
       uint d = lane + i * 32;
@@ -382,27 +431,27 @@ template <
       uint k_word_idx = k_bit_offset / 32;
       uint k_shift = k_bit_offset % 32;
 
-      const device uint32_t* k_packed_ptr = key_packed +
-          kv_indices[0] * uint(token_count) * KeyPackedWidth +
-          t * KeyPackedWidth;
-
-      uint k_value = (k_packed_ptr[k_word_idx] >> k_shift);
+      uint k_value = (tg_packed[k_word_idx] >> k_shift);
       int k_spill = (int)k_shift + (int)KeyBits - 32;
       if (k_spill > 0) {
         k_value |=
-            (k_packed_ptr[k_word_idx + 1] << ((uint)KeyBits - (uint)k_spill));
+            (tg_packed[k_word_idx + 1] << ((uint)KeyBits - (uint)k_spill));
       }
       k_value &= KEY_MASK;
-      k_decoded[i] = key_cb[k_value];
+      k_decoded[i] = tg_key_cb[k_value];
     }
     float k_norm = key_norms[kv_indices[0] * uint(token_count) + t];
 
-    // --- Dequant V for this token ONCE ---
-    float v_decoded[DIMS_PER_LANE];
+    // --- Cooperative V packed-word load + dequant ONCE ---
     const device uint32_t* v_packed_ptr = val_packed +
         kv_indices[0] * uint(token_count) * ValuePackedWidth +
         t * ValuePackedWidth;
+    for (uint w = lane; w < ValuePackedWidth; w += 32)
+      tg_packed[w] = v_packed_ptr[w];
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
     float v_norm = val_norms[kv_indices[0] * uint(token_count) + t];
+    float v_decoded[DIMS_PER_LANE];
     for (uint i = 0; i < DIMS_PER_LANE; i++) {
       uint d = lane + i * 32;
       if (d >= Dim) {
@@ -413,14 +462,14 @@ template <
       uint v_bit_offset = d * ValueBits;
       uint v_word_idx = v_bit_offset / 32;
       uint v_shift = v_bit_offset % 32;
-      uint v_value = (v_packed_ptr[v_word_idx] >> v_shift);
+      uint v_value = (tg_packed[v_word_idx] >> v_shift);
       int v_spill = (int)v_shift + (int)ValueBits - 32;
       if (v_spill > 0) {
         v_value |=
-            (v_packed_ptr[v_word_idx + 1] << ((uint)ValueBits - (uint)v_spill));
+            (tg_packed[v_word_idx + 1] << ((uint)ValueBits - (uint)v_spill));
       }
       v_value &= VAL_MASK;
-      v_decoded[i] = val_cb[v_value] * v_norm;
+      v_decoded[i] = tg_val_cb[v_value] * v_norm;
     }
 
     // --- Score + softmax + V accumulate for each of NR0 queries ---
@@ -542,13 +591,16 @@ template <
   if (t_end > max_q_abs + 1)
     t_end = max_q_abs + 1;
 
-  // Load codebooks (shared across all NR0 queries)
-  float key_cb[KEY_LEVELS];
-  for (uint i = 0; i < KEY_LEVELS; i++)
-    key_cb[i] = key_codebook[i];
-  float val_cb[VAL_LEVELS];
-  for (uint i = 0; i < VAL_LEVELS; i++)
-    val_cb[i] = val_codebook[i];
+  // Spec 042 §2 + spec 043 Phase 1 — see turbo_flash_p1_nr0 comment.
+  constexpr uint MAX_PW =
+      KeyPackedWidth > ValuePackedWidth ? KeyPackedWidth : ValuePackedWidth;
+  threadgroup float tg_key_cb[KEY_LEVELS];
+  threadgroup float tg_val_cb[VAL_LEVELS];
+  threadgroup uint32_t tg_packed[MAX_PW];
+  for (uint i = lane; i < KEY_LEVELS; i += 32)
+    tg_key_cb[i] = key_codebook[i];
+  for (uint i = lane; i < VAL_LEVELS; i += 32)
+    tg_val_cb[i] = val_codebook[i];
 
   // Load query values for all NR0 rows
   float q_vals[NR0 * DIMS_PER_LANE];
@@ -576,12 +628,18 @@ template <
       o_state[r * DIMS_PER_LANE + i] = 0.0f;
   }
 
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+
   // Process tokens — KV dequant once, score per-row with causal mask
   for (uint t = t_start; t < t_end; t++) {
-    // Dequant K once
-    float k_decoded[DIMS_PER_LANE];
+    // Cooperative K packed-word load + dequant ONCE
     const device uint32_t* k_packed_ptr = key_packed +
         kv_idx * uint(token_count) * KeyPackedWidth + t * KeyPackedWidth;
+    for (uint w = lane; w < KeyPackedWidth; w += 32)
+      tg_packed[w] = k_packed_ptr[w];
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    float k_decoded[DIMS_PER_LANE];
     for (uint i = 0; i < DIMS_PER_LANE; i++) {
       uint d = lane + i * 32;
       if (d >= Dim) {
@@ -591,22 +649,26 @@ template <
       uint k_bit_offset = d * KeyBits;
       uint k_word_idx = k_bit_offset / 32;
       uint k_shift = k_bit_offset % 32;
-      uint k_value = (k_packed_ptr[k_word_idx] >> k_shift);
+      uint k_value = (tg_packed[k_word_idx] >> k_shift);
       int k_spill = (int)k_shift + (int)KeyBits - 32;
       if (k_spill > 0) {
         k_value |=
-            (k_packed_ptr[k_word_idx + 1] << ((uint)KeyBits - (uint)k_spill));
+            (tg_packed[k_word_idx + 1] << ((uint)KeyBits - (uint)k_spill));
       }
       k_value &= KEY_MASK;
-      k_decoded[i] = key_cb[k_value];
+      k_decoded[i] = tg_key_cb[k_value];
     }
     float k_norm = key_norms[kv_idx * uint(token_count) + t];
 
-    // Dequant V once
-    float v_decoded[DIMS_PER_LANE];
+    // Cooperative V packed-word load + dequant ONCE
     const device uint32_t* v_packed_ptr = val_packed +
         kv_idx * uint(token_count) * ValuePackedWidth + t * ValuePackedWidth;
+    for (uint w = lane; w < ValuePackedWidth; w += 32)
+      tg_packed[w] = v_packed_ptr[w];
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
     float v_norm = val_norms[kv_idx * uint(token_count) + t];
+    float v_decoded[DIMS_PER_LANE];
     for (uint i = 0; i < DIMS_PER_LANE; i++) {
       uint d = lane + i * 32;
       if (d >= Dim) {
@@ -616,14 +678,14 @@ template <
       uint v_bit_offset = d * ValueBits;
       uint v_word_idx = v_bit_offset / 32;
       uint v_shift = v_bit_offset % 32;
-      uint v_value = (v_packed_ptr[v_word_idx] >> v_shift);
+      uint v_value = (tg_packed[v_word_idx] >> v_shift);
       int v_spill = (int)v_shift + (int)ValueBits - 32;
       if (v_spill > 0) {
         v_value |=
-            (v_packed_ptr[v_word_idx + 1] << ((uint)ValueBits - (uint)v_spill));
+            (tg_packed[v_word_idx + 1] << ((uint)ValueBits - (uint)v_spill));
       }
       v_value &= VAL_MASK;
-      v_decoded[i] = val_cb[v_value] * v_norm;
+      v_decoded[i] = tg_val_cb[v_value] * v_norm;
     }
 
     // Score + softmax + V for each query row (with per-row causal mask)
