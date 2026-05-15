@@ -24,6 +24,13 @@ using namespace metal;
 
 constant bool tf_has_sinks [[function_constant(60)]];
 constant bool tf_do_causal [[function_constant(61)]];
+// Spec 043 Phase 4 — DC-bias correction inside the A-path kernel.
+// When `tf_has_bias` is true the kernel reads per-vector bias `b[t]`
+// and `rotated_ones[d]` (precomputed `1 @ rotation^T` per codec) for
+// both K and V, adding `b[t] * rotated_ones[d]` to the rotated
+// reconstruction. Unlocks GPT-OSS-20B on the A path; on the B path
+// this same fix-up is applied Swift-side post-bulk-dequant.
+constant bool tf_has_bias [[function_constant(62)]];
 
 template <int KeyBits, int ValueBits, int Dim>
 [[kernel]] void turbo_flash_sdpa_v(
@@ -42,6 +49,14 @@ template <int KeyBits, int ValueBits, int Dim>
     [[buffer(11), function_constant(tf_has_sinks)]],
     const constant int& window_size
     [[buffer(12), function_constant(tf_do_causal)]],
+    // Phase 4 bias inputs. Layout matches K/V norms: per-vector fp32,
+    // shape [B * nKV, T]. rotated_ones is per-codec constant fp32 [Dim].
+    const device float* k_bias [[buffer(13), function_constant(tf_has_bias)]],
+    const device float* v_bias [[buffer(14), function_constant(tf_has_bias)]],
+    const device float* k_rotated_ones
+    [[buffer(15), function_constant(tf_has_bias)]],
+    const device float* v_rotated_ones
+    [[buffer(16), function_constant(tf_has_bias)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -170,6 +185,12 @@ template <int KeyBits, int ValueBits, int Dim>
       simdgroup_barrier(mem_flags::mem_threadgroup);
 
       U k_norm = static_cast<U>(k_norms_head[i]);
+      // Phase 4 — DC-bias term for K at this token position. fp32 to
+      // match the rotated-ones precision and keep the score's fp32
+      // accumulator unaffected by half/float promotion.
+      U k_bias_t = tf_has_bias
+          ? static_cast<U>(k_bias[kv_head_idx * uint(token_count) + i])
+          : U(0);
 
 #pragma clang loop unroll(full)
       for (int j = 0; j < qk_per_thread; j++) {
@@ -193,6 +214,9 @@ template <int KeyBits, int ValueBits, int Dim>
         }
         val_idx &= KEY_MASK;
         k[j] = tg_key_codebook[val_idx] * k_norm;
+        if (tf_has_bias) {
+          k[j] += k_bias_t * static_cast<U>(k_rotated_ones[d]);
+        }
       }
 
       // Score = q · k (Q already pre-scaled and pre-rotated).
@@ -223,6 +247,9 @@ template <int KeyBits, int ValueBits, int Dim>
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
         U v_norm = static_cast<U>(v_norms_head[i]);
+        U v_bias_t = tf_has_bias
+            ? static_cast<U>(v_bias[kv_head_idx * uint(token_count) + i])
+            : U(0);
 
 #pragma clang loop unroll(full)
         for (int j = 0; j < qk_per_thread; j++) {
@@ -244,6 +271,9 @@ template <int KeyBits, int ValueBits, int Dim>
           }
           val_idx &= VAL_MASK;
           v[j] = tg_val_codebook[val_idx] * v_norm;
+          if (tf_has_bias) {
+            v[j] += v_bias_t * static_cast<U>(v_rotated_ones[d]);
+          }
         }
 
 #pragma clang loop unroll(full)

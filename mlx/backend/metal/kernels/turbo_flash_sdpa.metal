@@ -26,6 +26,10 @@ using namespace metal;
       const device bfloat*,                                                \
       const constant int&,                                                 \
       const constant int&,                                                 \
+      const device float*,                                                 \
+      const device float*,                                                 \
+      const device float*,                                                 \
+      const device float*,                                                 \
       uint3, uint3, uint, uint);
 
 // Cover the common GPT-OSS / Qwen / Gemma 4 head dims × the four bench

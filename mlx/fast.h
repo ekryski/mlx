@@ -486,6 +486,13 @@ MLX_API array turbo_flash_sdpa_v(
     const std::optional<array>& sinks = {},
     bool do_causal = false,
     int window_size = -1,
+    // Spec 043 Phase 4 — optional DC-bias correction inputs. When all
+    // four are provided, the kernel applies `b[t] * rotated_ones[d]` to
+    // the rotated K/V reconstruction (unlocks GPT-OSS-20B on A path).
+    const std::optional<array>& k_bias = {},
+    const std::optional<array>& v_bias = {},
+    const std::optional<array>& k_rotated_ones = {},
+    const std::optional<array>& v_rotated_ones = {},
     StreamOrDevice s = {});
 
 /// Mamba state-replay primitive — sequential SSM step with per-step delta-log
