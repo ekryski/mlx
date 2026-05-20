@@ -1022,7 +1022,8 @@ bool is_nax_available() {
     const char* env = std::getenv("MLX_METAL_NO_NAX");
     return env != nullptr && env[0] == '1' && env[1] == '\0';
   }();
-  if (_runtime_disable_nax) return false;
+  if (_runtime_disable_nax)
+    return false;
   auto _check_nax = []() {
     bool can_use_nax = false;
     if (__builtin_available(
