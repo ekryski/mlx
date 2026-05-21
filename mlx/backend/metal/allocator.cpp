@@ -117,6 +117,18 @@ Buffer MetalAllocator::malloc(size_t size) {
   // Try the cache
   std::unique_lock lk(mutex_);
   MTL::Buffer* buf = buffer_cache_.reuse_from_cache(size);
+  // Zero recycled buffers before returning them to the caller. Stale
+  // contents from prior allocations can produce cross-run non-determinism
+  // at long-context decode when downstream kernels read regions they did
+  // not explicitly initialize.
+  //
+  // Bound the memset to the requested size — the pool may return an
+  // oversized buffer (up to 2x), and zeroing the full capacity is a
+  // measurable cost on large prefill paths. Any kernel that reads beyond
+  // its declared output size is a separate bug.
+  if (buf) {
+    memset(buf->contents(), 0, size);
+  }
   if (!buf) {
     size_t mem_required = get_active_memory() + get_cache_memory() + size;
 
