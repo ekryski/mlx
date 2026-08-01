@@ -2194,11 +2194,19 @@ array turbo_flash_sdpa_v(
     const std::optional<array>& sinks /* = {} */,
     bool do_causal /* = false */,
     int window_size /* = -1 */,
+    const std::optional<array>& k_bias /* = {} */,
+    const std::optional<array>& v_bias /* = {} */,
+    const std::optional<array>& k_rotated_ones /* = {} */,
+    const std::optional<array>& v_rotated_ones /* = {} */,
     StreamOrDevice s_ /* = {} */) {
   auto s = to_stream(s_);
 
   int total_q = queries.shape(0);
   bool has_sinks = sinks.has_value();
+  // Phase 4: bias requires all four arrays. Either all are provided
+  // or none are (no partial bias support).
+  bool has_bias = k_bias.has_value() && v_bias.has_value() &&
+      k_rotated_ones.has_value() && v_rotated_ones.has_value();
 
   auto fallback = [](const std::vector<array>&) -> std::vector<array> {
     throw std::runtime_error("[turbo_flash_sdpa_v] Only runs on GPU");
@@ -2215,6 +2223,12 @@ array turbo_flash_sdpa_v(
   if (has_sinks) {
     inputs.push_back(astype(*sinks, bfloat16, s));
   }
+  if (has_bias) {
+    inputs.push_back(astype(*k_bias, float32, s));
+    inputs.push_back(astype(*v_bias, float32, s));
+    inputs.push_back(astype(*k_rotated_ones, float32, s));
+    inputs.push_back(astype(*v_rotated_ones, float32, s));
+  }
 
   return array(
       {total_q, dim},
@@ -2228,7 +2242,8 @@ array turbo_flash_sdpa_v(
           repeat_count,
           has_sinks,
           do_causal,
-          window_size),
+          window_size,
+          has_bias),
       std::move(inputs));
 }
 

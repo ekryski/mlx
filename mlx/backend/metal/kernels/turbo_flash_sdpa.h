@@ -24,6 +24,13 @@ using namespace metal;
 
 constant bool tf_has_sinks [[function_constant(60)]];
 constant bool tf_do_causal [[function_constant(61)]];
+// Spec 043 Phase 4 — DC-bias correction inside the A-path kernel.
+// When `tf_has_bias` is true the kernel reads per-vector bias `b[t]`
+// and `rotated_ones[d]` (precomputed `1 @ rotation^T` per codec) for
+// both K and V, adding `b[t] * rotated_ones[d]` to the rotated
+// reconstruction. Unlocks GPT-OSS-20B on the A path; on the B path
+// this same fix-up is applied Swift-side post-bulk-dequant.
+constant bool tf_has_bias [[function_constant(62)]];
 
 template <int KeyBits, int ValueBits, int Dim>
 [[kernel]] void turbo_flash_sdpa_v(
@@ -42,6 +49,14 @@ template <int KeyBits, int ValueBits, int Dim>
     [[buffer(11), function_constant(tf_has_sinks)]],
     const constant int& window_size
     [[buffer(12), function_constant(tf_do_causal)]],
+    // Phase 4 bias inputs. Layout matches K/V norms: per-vector fp32,
+    // shape [B * nKV, T]. rotated_ones is per-codec constant fp32 [Dim].
+    const device float* k_bias [[buffer(13), function_constant(tf_has_bias)]],
+    const device float* v_bias [[buffer(14), function_constant(tf_has_bias)]],
+    const device float* k_rotated_ones
+    [[buffer(15), function_constant(tf_has_bias)]],
+    const device float* v_rotated_ones
+    [[buffer(16), function_constant(tf_has_bias)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -63,12 +78,21 @@ template <int KeyBits, int ValueBits, int Dim>
   constexpr uint KEY_LEVELS = 1u << KeyBits;
   constexpr uint VAL_LEVELS = 1u << ValueBits;
 
+  // Spec 043 Phase 2 — drop the V accumulator from fp32 to fp16. Score
+  // path (q · k → softmax → m, l) stays fp32 for dynamic-range stability
+  // per the spec's open-question §2; only the per-lane V output
+  // accumulator `o[]` changes precision. Metal promotes `o[i] * factor +
+  // exp_score * v[i]` to fp32 during compute and truncates to fp16 on
+  // store, so numerics stay close to the all-fp32 reference. The
+  // savings: half the register footprint for `o[]` and half the bytes
+  // when spilling, freeing register pressure for the score path.
   typedef float U;
+  typedef half ACC_T;
 
   thread U q[qk_per_thread];
   thread U k[qk_per_thread];
   thread U v[qk_per_thread];
-  thread U o[qk_per_thread];
+  thread ACC_T o[qk_per_thread];
 
   threadgroup U outputs[BN * BD];
   threadgroup U max_scores[BN];
@@ -78,8 +102,28 @@ template <int KeyBits, int ValueBits, int Dim>
   // equivalent for TurboQuant. The codebook is small (≤ 256 floats for
   // 8-bit) and constant per call; hoist into TG memory at kernel start
   // so each thread reads from L1 instead of device memory.
+  //
+  // Spec 042 §7b note: tried moving these to half on M1 (saves 50% TG
+  // memory + bank traffic), but it regressed GPT-OSS-20B coherence on
+  // the bias path even though `testTurboFlashSDPAvBiasMatchesReference`
+  // passed at rtol < 0.003. The unit test didn't cover the turbo4v2
+  // shape (kb=4, vb=2) which is GPT-OSS's actual config — leaving the
+  // codebooks fp32 here until a tighter regression probe captures
+  // whatever real-flow precision interaction the half codec triggers.
+  // The codebook hoist landed cleanly in turbo_flash.metal's 4
+  // templates (no bias kernel there).
   threadgroup U tg_key_codebook[KEY_LEVELS];
   threadgroup U tg_val_codebook[VAL_LEVELS];
+  // Spec 043 Phase 1 — per-simdgroup K/V packed-word cache. Before this
+  // change, every lane that touched dim `d` loaded the packed word
+  // containing `d` from device memory; for 4-bit Dim=128 that's 8 lanes
+  // redundantly loading each of 16 words per K position. Now one lane
+  // loads the word into TG memory and all 32 lanes read the cache.
+  // Reused for K then V within the same iteration (V's reload happens
+  // after the K-score loop, so the buffer is free to overwrite).
+  constexpr int MAX_PW =
+      KEY_PACKED_WIDTH > VAL_PACKED_WIDTH ? KEY_PACKED_WIDTH : VAL_PACKED_WIDTH;
+  threadgroup uint32_t tg_packed[BN][MAX_PW];
   uint linear_tid = simd_gid * BD + simd_lid;
   for (uint i = linear_tid; i < KEY_LEVELS; i += BN * BD) {
     tg_key_codebook[i] = static_cast<U>(k_codebook[i]);
@@ -140,9 +184,23 @@ template <int KeyBits, int ValueBits, int Dim>
     }
 
     if (use_key) {
-      // Inline dequant K[i] for this thread's qk_per_thread dim slice.
+      // Spec 043 Phase 1 — cooperative K packed-word load into this
+      // simdgroup's TG slot, then every lane reads the packed bytes
+      // from cache. Eliminates the per-lane redundant device load (8x
+      // for 4-bit, 4x for 8-bit, 16x for 2-bit).
       const device uint32_t* k_packed_t = k_packed_head + i * KEY_PACKED_WIDTH;
+      for (int w = simd_lid; w < KEY_PACKED_WIDTH; w += BD) {
+        tg_packed[simd_gid][w] = k_packed_t[w];
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+
       U k_norm = static_cast<U>(k_norms_head[i]);
+      // Phase 4 — DC-bias term for K at this token position. fp32 to
+      // match the rotated-ones precision and keep the score's fp32
+      // accumulator unaffected by half/float promotion.
+      U k_bias_t = tf_has_bias
+          ? static_cast<U>(k_bias[kv_head_idx * uint(token_count) + i])
+          : U(0);
 
 #pragma clang loop unroll(full)
       for (int j = 0; j < qk_per_thread; j++) {
@@ -151,21 +209,24 @@ template <int KeyBits, int ValueBits, int Dim>
           k[j] = 0;
           continue;
         }
-        // Bit-contiguous unpacking — matches the encoder
-        // (`TurboQuantPacking.packLowBit`) and `turbo_flash.metal`. For
-        // bits ∈ {3, 5, 6, 7} values span word boundaries; the spill
-        // branch stitches the low bits in.
+        // Bit-contiguous unpacking from the TG cache — matches the
+        // encoder (`TurboQuantPacking.packLowBit`). For bits ∈
+        // {3, 5, 6, 7} values span word boundaries; the spill branch
+        // stitches the low bits in.
         uint bit_offset = (uint)(d * KeyBits);
         uint word_idx = bit_offset / 32u;
         uint shift = bit_offset % 32u;
-        uint val_idx = (k_packed_t[word_idx] >> shift);
+        uint val_idx = (tg_packed[simd_gid][word_idx] >> shift);
         int spill = (int)shift + (int)KeyBits - 32;
         if (spill > 0) {
-          val_idx |=
-              (k_packed_t[word_idx + 1] << ((uint)KeyBits - (uint)spill));
+          val_idx |= (tg_packed[simd_gid][word_idx + 1]
+                      << ((uint)KeyBits - (uint)spill));
         }
         val_idx &= KEY_MASK;
         k[j] = tg_key_codebook[val_idx] * k_norm;
+        if (tf_has_bias) {
+          k[j] += k_bias_t * static_cast<U>(k_rotated_ones[d]);
+        }
       }
 
       // Score = q · k (Q already pre-scaled and pre-rotated).
@@ -185,9 +246,20 @@ template <int KeyBits, int ValueBits, int Dim>
 
       // Inline dequant V[i] for this thread's dim slice.
       if (exp_score > 1e-20) {
+        // Spec 043 Phase 1 — cooperative V packed-word load. Reuses
+        // tg_packed[simd_gid][..] (K's load already finished its
+        // simd_sum + softmax, so the buffer is free to overwrite).
         const device uint32_t* v_packed_t =
             v_packed_head + i * VAL_PACKED_WIDTH;
+        for (int w = simd_lid; w < VAL_PACKED_WIDTH; w += BD) {
+          tg_packed[simd_gid][w] = v_packed_t[w];
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
         U v_norm = static_cast<U>(v_norms_head[i]);
+        U v_bias_t = tf_has_bias
+            ? static_cast<U>(v_bias[kv_head_idx * uint(token_count) + i])
+            : U(0);
 
 #pragma clang loop unroll(full)
         for (int j = 0; j < qk_per_thread; j++) {
@@ -196,18 +268,22 @@ template <int KeyBits, int ValueBits, int Dim>
             v[j] = 0;
             continue;
           }
-          // Same bit-contiguous unpacking as K above.
+          // Same bit-contiguous unpacking as K above, against the
+          // shared TG cache.
           uint bit_offset = (uint)(d * ValueBits);
           uint word_idx = bit_offset / 32u;
           uint shift = bit_offset % 32u;
-          uint val_idx = (v_packed_t[word_idx] >> shift);
+          uint val_idx = (tg_packed[simd_gid][word_idx] >> shift);
           int spill = (int)shift + (int)ValueBits - 32;
           if (spill > 0) {
-            val_idx |=
-                (v_packed_t[word_idx + 1] << ((uint)ValueBits - (uint)spill));
+            val_idx |= (tg_packed[simd_gid][word_idx + 1]
+                        << ((uint)ValueBits - (uint)spill));
           }
           val_idx &= VAL_MASK;
           v[j] = tg_val_codebook[val_idx] * v_norm;
+          if (tf_has_bias) {
+            v[j] += v_bias_t * static_cast<U>(v_rotated_ones[d]);
+          }
         }
 
 #pragma clang loop unroll(full)

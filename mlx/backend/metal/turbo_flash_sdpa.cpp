@@ -51,25 +51,42 @@ void TurboFlashSDPA::eval_gpu(
   const array& v_packed = ensure_contiguous(inputs[4], s, copies);
   const array& v_norms = ensure_contiguous(inputs[5], s, copies);
   const array& v_codebook = ensure_contiguous(inputs[6], s, copies);
-  const array* sinks_arr =
-      has_sinks_ ? &ensure_contiguous(inputs[7], s, copies) : nullptr;
+  // Sinks and bias slots are conditional and follow the base 7 inputs.
+  // Order matches the entry point in fast.cpp: sinks first (if any),
+  // then the 4-tuple (k_bias, v_bias, k_rotated_ones, v_rotated_ones).
+  int next_input = 7;
+  const array* sinks_arr = nullptr;
+  if (has_sinks_) {
+    sinks_arr = &ensure_contiguous(inputs[next_input++], s, copies);
+  }
+  const array* k_bias_arr = nullptr;
+  const array* v_bias_arr = nullptr;
+  const array* k_rot_ones_arr = nullptr;
+  const array* v_rot_ones_arr = nullptr;
+  if (has_bias_) {
+    k_bias_arr = &ensure_contiguous(inputs[next_input++], s, copies);
+    v_bias_arr = &ensure_contiguous(inputs[next_input++], s, copies);
+    k_rot_ones_arr = &ensure_contiguous(inputs[next_input++], s, copies);
+    v_rot_ones_arr = &ensure_contiguous(inputs[next_input++], s, copies);
+  }
 
   int total_q = q.shape(0);
   // token_count = N — number of K positions stored. Layout
   // `[B*nKV, N, packed]` so dim(1) is N.
   int N = k_packed.shape(1);
 
-  // Function constants — match kernel-side IDs (60, 61).
+  // Function constants — match kernel-side IDs (60, 61, 62).
   metal::MTLFCList func_consts = {
       {&has_sinks_, MTL::DataType::DataTypeBool, 60},
       {&do_causal_, MTL::DataType::DataTypeBool, 61},
+      {&has_bias_, MTL::DataType::DataTypeBool, 62},
   };
 
   // Kernel name: turbo_flash_sdpa_v_{kb}_{vb}_{dim}
   std::string kname = "turbo_flash_sdpa_v_" + std::to_string(key_bits_) + "_" +
       std::to_string(value_bits_) + "_" + std::to_string(dim_);
   std::string hash_name = kname + (has_sinks_ ? "_sinks" : "_nosinks") +
-      (do_causal_ ? "_c" : "_nc");
+      (do_causal_ ? "_c" : "_nc") + (has_bias_ ? "_b" : "_nb");
 
   auto& compute_encoder = metal::get_command_encoder(s);
   auto kernel = d.get_kernel(kname, hash_name, func_consts);
@@ -95,6 +112,12 @@ void TurboFlashSDPA::eval_gpu(
   if (do_causal_) {
     compute_encoder.set_bytes(window_size_, 12);
   }
+  if (has_bias_) {
+    compute_encoder.set_input_array(*k_bias_arr, 13);
+    compute_encoder.set_input_array(*v_bias_arr, 14);
+    compute_encoder.set_input_array(*k_rot_ones_arr, 15);
+    compute_encoder.set_input_array(*v_rot_ones_arr, 16);
+  }
 
   // Grid: (total_q, 1, 1). Threadgroup: (1024, 1, 1) = 32 simdgroups.
   MTL::Size group_dims(1024, 1, 1);
@@ -112,7 +135,7 @@ bool TurboFlashSDPA::is_equivalent(const Primitive& other) const {
   return key_bits_ == o.key_bits_ && value_bits_ == o.value_bits_ &&
       dim_ == o.dim_ && repeat_count_ == o.repeat_count_ &&
       has_sinks_ == o.has_sinks_ && do_causal_ == o.do_causal_ &&
-      window_size_ == o.window_size_;
+      window_size_ == o.window_size_ && has_bias_ == o.has_bias_;
 }
 
 std::vector<Shape> TurboFlashSDPA::output_shapes(

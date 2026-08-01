@@ -41,9 +41,17 @@ template <int Bits, int Dim, int PackedWidth>
       packed + kv_idx * uint(token_count) * PackedWidth + k_idx * PackedWidth;
   float norm_val = norms[kv_idx * uint(token_count) + k_idx];
 
-  float cb[LEVELS];
-  for (uint i = 0; i < LEVELS; i++)
-    cb[i] = codebook[i];
+  // Spec 042 §2 + §7b — cooperative TG codebook hoist as half.
+  // Was: each of 32 lanes copied the full codebook into per-thread
+  // registers (LEVELS × 32 device loads per simdgroup), then read it
+  // from registers in the per-dim loop. Now: 16 lanes cooperatively
+  // load (16 device loads) into half TG memory, then every lane reads
+  // from cache. Score path stays fp32 — `q_ptr[d] * tg_cb[value]` is
+  // float * half → float by Metal promotion.
+  threadgroup half tg_cb[LEVELS];
+  for (uint i = lane; i < LEVELS; i += 32)
+    tg_cb[i] = static_cast<half>(codebook[i]);
+  simdgroup_barrier(mem_flags::mem_threadgroup);
 
   float acc = 0.0f;
   for (uint d = lane; d < uint(Dim); d += 32) {
@@ -56,7 +64,7 @@ template <int Bits, int Dim, int PackedWidth>
       value |= (packed_ptr[word_idx + 1] << ((uint)Bits - (uint)spill));
     }
     value &= MASK;
-    acc += q_ptr[d] * cb[value];
+    acc += q_ptr[d] * tg_cb[value];
   }
 
   acc = simd_sum(acc);
@@ -295,11 +303,16 @@ template <int Dim>
   uint lane = pos.x;
   uint q_idx = pos.y;
 
+  // Spec 042 §7b — softmax `m`/`l` stay fp32 for dynamic-range
+  // stability; V accumulator `o[]` drops to fp16 (Phase 2 pattern).
+  // Compute `o[i] * exp_old + o_partials[d] * exp_block` is float
+  // (Metal promotes half × float → float); only the storage truncates
+  // to half before the final bf16 cast.
   float m = -INFINITY;
   float l = 0.0f;
-  float o[DIMS_PER_LANE];
+  half o[DIMS_PER_LANE];
   for (uint i = 0; i < DIMS_PER_LANE; i++)
-    o[i] = 0.0f;
+    o[i] = half(0);
 
   for (uint b = 0; b < uint(num_blocks); b++) {
     uint ml_idx = q_idx * uint(num_blocks) + b;
@@ -316,7 +329,9 @@ template <int Dim>
     for (uint i = 0; i < DIMS_PER_LANE; i++) {
       uint d = lane + i * 32;
       if (d < uint(Dim)) {
-        o[i] = o[i] * exp_old + o_partials[partial_base + d] * exp_block;
+        o[i] = static_cast<half>(
+            static_cast<float>(o[i]) * exp_old +
+            o_partials[partial_base + d] * exp_block);
       }
     }
     l = l * exp_old + block_l * exp_block;
@@ -327,7 +342,7 @@ template <int Dim>
   for (uint i = 0; i < DIMS_PER_LANE; i++) {
     uint d = lane + i * 32;
     if (d < uint(Dim)) {
-      output[q_idx * Dim + d] = (bfloat)(o[i] * inv_l);
+      output[q_idx * Dim + d] = (bfloat)(static_cast<float>(o[i]) * inv_l);
     }
   }
 }
@@ -348,11 +363,12 @@ template <int Dim>
   uint lane = pos.x;
   uint q_idx = pos.y;
 
+  // Spec 042 §7b — softmax fp32 stable, V accumulator fp16.
   float m = -INFINITY;
   float l = 0.0f;
-  float o[DIMS_PER_LANE];
+  half o[DIMS_PER_LANE];
   for (uint i = 0; i < DIMS_PER_LANE; i++)
-    o[i] = 0.0f;
+    o[i] = half(0);
 
   for (uint b = 0; b < uint(num_blocks); b++) {
     uint ml_idx = q_idx * uint(num_blocks) + b;
@@ -369,7 +385,9 @@ template <int Dim>
     for (uint i = 0; i < DIMS_PER_LANE; i++) {
       uint d = lane + i * 32;
       if (d < uint(Dim)) {
-        o[i] = o[i] * exp_old + o_partials[partial_base + d] * exp_block;
+        o[i] = static_cast<half>(
+            static_cast<float>(o[i]) * exp_old +
+            o_partials[partial_base + d] * exp_block);
       }
     }
     l = l * exp_old + block_l * exp_block;
@@ -378,12 +396,14 @@ template <int Dim>
 
   float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
 
-  // Gather into threadgroup memory for rotation matmul
-  threadgroup float shared_out[Dim];
+  // Gather into threadgroup memory for rotation matmul. fp16 storage
+  // halves the bank traffic; the inverse-rotation matmul promotes
+  // half × float = float and accumulates in float.
+  threadgroup half shared_out[Dim];
   for (uint i = 0; i < DIMS_PER_LANE; i++) {
     uint d = lane + i * 32;
     if (d < uint(Dim))
-      shared_out[d] = o[i] * inv_l;
+      shared_out[d] = static_cast<half>(static_cast<float>(o[i]) * inv_l);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -426,9 +446,13 @@ template <int Bits, int Dim, int PackedWidth>
 
   uint kv_head = head_idx / uint(repeat_count);
 
-  float cb[LEVELS];
-  for (uint i = 0; i < LEVELS; i++)
-    cb[i] = codebook[i];
+  // Spec 042 §2 + §7b — cooperative TG codebook hoist as half. Same
+  // pattern as turbo_score above. Per-token codebook lookups inside
+  // the loop hit TG cache instead of per-thread registers.
+  threadgroup half tg_cb[LEVELS];
+  for (uint i = lane; i < LEVELS; i += 32)
+    tg_cb[i] = static_cast<half>(codebook[i]);
+  simdgroup_barrier(mem_flags::mem_threadgroup);
 
   float acc = 0.0f;
   for (uint t = 0; t < uint(token_count); t++) {
@@ -449,7 +473,7 @@ template <int Bits, int Dim, int PackedWidth>
       value |= (packed_ptr[word_idx + 1] << ((uint)Bits - (uint)spill_bits));
     }
     value &= MASK;
-    acc += w * norm_val * cb[value];
+    acc += w * norm_val * tg_cb[value];
   }
 
   output[head_idx * Dim + d] = acc;

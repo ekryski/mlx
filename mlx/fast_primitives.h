@@ -1204,7 +1204,8 @@ class TurboFlashSDPA : public Custom {
       int repeat_count,
       bool has_sinks,
       bool do_causal,
-      int window_size)
+      int window_size,
+      bool has_bias = false)
       : Custom(stream, std::move(fallback)),
         key_bits_(key_bits),
         value_bits_(value_bits),
@@ -1212,7 +1213,8 @@ class TurboFlashSDPA : public Custom {
         repeat_count_(repeat_count),
         has_sinks_(has_sinks),
         do_causal_(do_causal),
-        window_size_(window_size) {}
+        window_size_(window_size),
+        has_bias_(has_bias) {}
 
   void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
       override {
@@ -1233,7 +1235,8 @@ class TurboFlashSDPA : public Custom {
         repeat_count_,
         has_sinks_,
         do_causal_,
-        window_size_);
+        window_size_,
+        has_bias_);
   }
 
  private:
@@ -1244,6 +1247,7 @@ class TurboFlashSDPA : public Custom {
   bool has_sinks_;
   bool do_causal_;
   int window_size_;
+  bool has_bias_;
 };
 
 // Spec 040: Mamba / Mamba 2 selective-SSM step + delta-log capture for
